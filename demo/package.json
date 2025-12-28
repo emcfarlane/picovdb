@@ -1,0 +1,23 @@
+{
+  "name": "webgpu-nanovdb-demo",
+  "module": "index.ts",
+  "type": "module",
+  "devDependencies": {
+    "@webgpu/types": "^0.1.49",
+    "esbuild": "0.27.0",
+    "prettier": "^3.3.3"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "lil-gui": "^0.21.0",
+    "wgpu-matrix": "^3.4.0"
+  },
+  "scripts": {
+    "build": "esbuild index.ts --bundle --outfile=index.js --format=esm --loader:.wgsl=text",
+    "watch": "esbuild index.ts --bundle --outfile=index.js --format=esm --loader:.wgsl=text --watch=forever",
+    "serve": "npx http-server -p 8000 -o -c-1",
+    "dev": "(npm run watch & npm run serve)"
+  }
+}
