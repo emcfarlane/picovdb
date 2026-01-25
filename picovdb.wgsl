@@ -259,7 +259,7 @@ fn picovdbReadAccessorRootGetLevelCountAndCache(
     let rootIndex = picovdbReadAccessorFindUpperIndex(ijk, grid);
     if (rootIndex == -1) {
         // No matching root tile, return background
-        return PicoVDBLevelCount(4u, 0u);
+        return PicoVDBLevelCount(3u, 0u);
     }
     (*acc).upper = u32(rootIndex);
     (*acc).key = ijk;
@@ -293,6 +293,7 @@ struct PicoVDBHDDA {
     tmax: f32,
     voxel: vec3i,
     step: vec3i,
+    inv_dir: vec3f,
     delta: vec3f,
     next: vec3f,
 }
@@ -310,7 +311,6 @@ fn picovdbHDDARayStart(origin: vec3f, tmin: f32, direction: vec3f) -> vec3f {
     return origin + direction * tmin;
 }
 
-// Initialize HDDA for hierarchical grid traversal
 fn picovdbHDDAInit(
     hdda: ptr<function, PicoVDBHDDA>,
     origin: vec3f,
@@ -319,59 +319,26 @@ fn picovdbHDDAInit(
     tmax: f32,
     dim: i32
 ) {
+    let dir_inv = 1.0 / direction;
+    let pos = origin + direction * tmin;
+    let vox = picovdbHDDAPosToVoxel(pos, dim);
+
     (*hdda).dim = dim;
     (*hdda).tmin = tmin;
     (*hdda).tmax = tmax;
+    (*hdda).voxel = vox;
+    (*hdda).inv_dir = dir_inv;
+    (*hdda).step = vec3i(sign(direction));
+    (*hdda).delta = abs(f32(dim) * dir_inv); // Pre-multiply delta by dim
 
-    let pos = picovdbHDDARayStart(origin, tmin, direction);
-    let dir_inv = 1.0 / direction;
+    let boundary = select(vec3f(vox), vec3f(vox + vec3i(dim)), direction > vec3f(0.0));
 
-    (*hdda).voxel = picovdbHDDAPosToVoxel(pos, dim);
-
-    // X axis
-    if (direction.x == 0.0) {
-        (*hdda).next.x = PICOVDB_HDDA_FLOAT_MAX;
-        (*hdda).step.x = 0;
-        (*hdda).delta.x = 0.0;
-    } else if (dir_inv.x > 0.0) {
-        (*hdda).step.x = 1;
-        (*hdda).next.x = (*hdda).tmin + (f32((*hdda).voxel.x) + f32(dim) - pos.x) * dir_inv.x;
-        (*hdda).delta.x = dir_inv.x;
-    } else {
-        (*hdda).step.x = -1;
-        (*hdda).next.x = (*hdda).tmin + (f32((*hdda).voxel.x) - pos.x) * dir_inv.x;
-        (*hdda).delta.x = -dir_inv.x;
-    }
-
-    // Y axis
-    if (direction.y == 0.0) {
-        (*hdda).next.y = PICOVDB_HDDA_FLOAT_MAX;
-        (*hdda).step.y = 0;
-        (*hdda).delta.y = 0.0;
-    } else if (dir_inv.y > 0.0) {
-        (*hdda).step.y = 1;
-        (*hdda).next.y = (*hdda).tmin + (f32((*hdda).voxel.y) + f32(dim) - pos.y) * dir_inv.y;
-        (*hdda).delta.y = dir_inv.y;
-    } else {
-        (*hdda).step.y = -1;
-        (*hdda).next.y = (*hdda).tmin + (f32((*hdda).voxel.y) - pos.y) * dir_inv.y;
-        (*hdda).delta.y = -dir_inv.y;
-    }
-
-    // Z axis
-    if (direction.z == 0.0) {
-        (*hdda).next.z = PICOVDB_HDDA_FLOAT_MAX;
-        (*hdda).step.z = 0;
-        (*hdda).delta.z = 0.0;
-    } else if (dir_inv.z > 0.0) {
-        (*hdda).step.z = 1;
-        (*hdda).next.z = (*hdda).tmin + (f32((*hdda).voxel.z) + f32(dim) - pos.z) * dir_inv.z;
-        (*hdda).delta.z = dir_inv.z;
-    } else {
-        (*hdda).step.z = -1;
-        (*hdda).next.z = (*hdda).tmin + (f32((*hdda).voxel.z) - pos.z) * dir_inv.z;
-        (*hdda).delta.z = -dir_inv.z;
-    }
+    // Safety: handle cases where direction is 0 to avoid NaNs
+    (*hdda).next = select(
+        tmin + (boundary - pos) * dir_inv,
+        vec3f(PICOVDB_HDDA_FLOAT_MAX),
+        direction == vec3f(0.0)
+    );
 }
 
 // Update HDDA to switch hierarchical level
@@ -380,71 +347,42 @@ fn picovdbHDDAUpdate(
     origin: vec3f,
     direction: vec3f,
     dim: i32
-) -> bool {
-    if ((*hdda).dim == dim) {
-        return false;
-    }
+) {
     (*hdda).dim = dim;
+    (*hdda).delta = abs(f32(dim) * (*hdda).inv_dir);
 
-    let pos = picovdbHDDARayStart(origin, (*hdda).tmin, direction);
-    let dir_inv = 1.0 / direction;
+    // Re-calculate position at the exact current tmin plus a safety nudge
+    let eps = max(1e-4f, (*hdda).tmin * 1e-7f);
+    let pos = origin + direction * ((*hdda).tmin + eps);
 
+    // Crucial: Re-mask the voxel to the new dimension
     (*hdda).voxel = picovdbHDDAPosToVoxel(pos, dim);
 
-    if ((*hdda).step.x != 0) {
-        (*hdda).next.x = (*hdda).tmin + (f32((*hdda).voxel.x) - pos.x) * dir_inv.x;
-        if ((*hdda).step.x > 0) {
-            (*hdda).next.x += f32(dim) * dir_inv.x;
-        }
-    }
-    if ((*hdda).step.y != 0) {
-        (*hdda).next.y = (*hdda).tmin + (f32((*hdda).voxel.y) - pos.y) * dir_inv.y;
-        if ((*hdda).step.y > 0) {
-            (*hdda).next.y += f32(dim) * dir_inv.y;
-        }
-    }
-    if ((*hdda).step.z != 0) {
-        (*hdda).next.z = (*hdda).tmin + (f32((*hdda).voxel.z) - pos.z) * dir_inv.z;
-        if ((*hdda).step.z > 0) {
-            (*hdda).next.z += f32(dim) * dir_inv.z;
-        }
-    }
+    // Re-calculate next boundary for the new grid scale
+    let boundary = select(vec3f((*hdda).voxel), vec3f((*hdda).voxel + vec3i(dim)), direction > vec3f(0.0));
+    let t_to_boundary = (boundary - (origin + direction * (*hdda).tmin)) * (*hdda).inv_dir;
 
-    return true;
+    // Ensure the next step is always forward
+    (*hdda).next = (*hdda).tmin + max(t_to_boundary, vec3f(eps));
 }
 
-// Step to next voxel boundary
 fn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {
-    var ret: bool;
-    if ((*hdda).next.x < (*hdda).next.y && (*hdda).next.x < (*hdda).next.z) {
-        // Enforce forward stepping
-        if ((*hdda).next.x <= (*hdda).tmin) {
-            (*hdda).next.x += (*hdda).tmin - 0.999999 * (*hdda).next.x + 1.0e-6;
-        }
+    // Determine which axis has the nearest boundary
+    let next = (*hdda).next;
+    if (next.x < next.y && next.x < next.z) { // X is smallest
         (*hdda).tmin = (*hdda).next.x;
-        (*hdda).next.x += f32((*hdda).dim) * (*hdda).delta.x;
+        (*hdda).next.x += (*hdda).delta.x;
         (*hdda).voxel.x += (*hdda).dim * (*hdda).step.x;
-        ret = (*hdda).tmin <= (*hdda).tmax;
-    } else if ((*hdda).next.y < (*hdda).next.z) {
-        // Enforce forward stepping
-        if ((*hdda).next.y <= (*hdda).tmin) {
-            (*hdda).next.y += (*hdda).tmin - 0.999999 * (*hdda).next.y + 1.0e-6;
-        }
+    } else if (next.y < next.z) { // Y is smallest
         (*hdda).tmin = (*hdda).next.y;
-        (*hdda).next.y += f32((*hdda).dim) * (*hdda).delta.y;
+        (*hdda).next.y += (*hdda).delta.y;
         (*hdda).voxel.y += (*hdda).dim * (*hdda).step.y;
-        ret = (*hdda).tmin <= (*hdda).tmax;
-    } else {
-        // Enforce forward stepping
-        if ((*hdda).next.z <= (*hdda).tmin) {
-            (*hdda).next.z += (*hdda).tmin - 0.999999 * (*hdda).next.z + 1.0e-6;
-        }
+    } else { // Z is smallest
         (*hdda).tmin = (*hdda).next.z;
-        (*hdda).next.z += f32((*hdda).dim) * (*hdda).delta.z;
+        (*hdda).next.z += (*hdda).delta.z;
         (*hdda).voxel.z += (*hdda).dim * (*hdda).step.z;
-        ret = (*hdda).tmin <= (*hdda).tmax;
     }
-    return ret;
+    return (*hdda).tmin <= (*hdda).tmax;
 }
 
 // Clip ray to bounding box
@@ -469,15 +407,12 @@ fn picovdbHDDARayClip(
     return hit;
 }
 
-// Get dimension based on level (for HDDA stepping)
-fn picovdbGetDimForLevel(level: u32) -> i32 {
-    switch (level) {
-        case 0u: { return 1; }      // Leaf (8^3)
-        case 1u: { return 8; }      // Lower (16^3, step by 8)
-        case 2u: { return 128; }    // Upper (32^3, step by 128)
-        default: { return 4096; }   // Root/background
-    }
-}
+// Dimension based on level (for HDDA stepping)
+// Level 0 (Leaf) -> 1
+// Level 1 (Lower) -> 8 (2^3)
+// Level 2 (Upper) -> 128 (2^7)
+// Level 3 (Root) -> 4096 (2^12)
+const picovdbDimForLevel = array(1, 8, 128, 4096);
 
 // Check if voxel is active (count > 1 means has value)
 fn picovdbIsActive(level_count: PicoVDBLevelCount) -> bool {
@@ -501,70 +436,52 @@ fn picovdbHDDAZeroCrossing(
     thit: ptr<function, f32>,
     v: ptr<function, f32>
 ) -> bool {
-    let bbox_minf = vec3f(grid.indexBoundsMin);
-    let bbox_maxf = vec3f(grid.indexBoundsMax + vec3i(1));
-
     var tmin_mut = tmin;
     var tmax_mut = tmax;
-    let hit = picovdbHDDARayClip(bbox_minf, bbox_maxf, origin, &tmin_mut, direction, &tmax_mut);
     
-    if (!hit || tmax_mut > 1.0e20) {
+    // Clip to bounding box
+    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction, &tmax_mut)) {
         return false;
     }
 
-    let pos = picovdbHDDARayStart(origin, tmin_mut, direction);
-    var ijk = picovdbHDDAPosToIjk(pos);
-
-    // Get initial value
-    let result0 = picovdbReadAccessorGetLevelCount(acc, ijk, grid);
-    let v0 = picovdbGetValue(grid, result0.count);
-    let dim = picovdbGetDimForLevel(result0.level);
+    // Get initial hierarchy level
+    let start_pos = origin + direction * tmin_mut;
+    let res0 = picovdbReadAccessorGetLevelCount(acc, vec3i(floor(start_pos)), grid);
+    let v0 = picovdbGetValue(grid, res0.count);
     
     var hdda: PicoVDBHDDA;
-    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, dim);
+    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, picovdbDimForLevel[res0.level]);
 
-    var outer_loop_count = 0;
-    while (picovdbHDDAStep(&hdda) && outer_loop_count < 1000) {
-        outer_loop_count++;
-        
-        let pos_start = picovdbHDDARayStart(origin, hdda.tmin + 1.0001, direction);
-        ijk = picovdbHDDAPosToIjk(pos_start);
-        
-        let result = picovdbReadAccessorGetLevelCount(acc, ijk, grid);
-        let new_dim = picovdbGetDimForLevel(result.level);
-        let updated = picovdbHDDAUpdate(&hdda, origin, direction, new_dim);
-        
-        // Skip if not at leaf level or not active
-        if (hdda.dim > 1 || !picovdbIsActive(result)) {
-            continue;
+    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
+        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
+        let target_dim = picovdbDimForLevel[result.level];
+
+        // If hierarchy changed, update HDDA and re-read
+        if (hdda.dim != target_dim) {
+            picovdbHDDAUpdate(&hdda, origin, direction, target_dim);
+            continue; // Re-evaluate with the new aligned voxel
         }
-        
-        // Inner loop: step through active leaf voxels
-        var inner_loop_count = 0;
-        while (inner_loop_count < 100) {
-            inner_loop_count++;
-            
-            if (!picovdbHDDAStep(&hdda)) {
-                break;
-            }
-            
-            ijk = hdda.voxel;
-            let voxel_result = picovdbReadAccessorGetLevelCount(acc, ijk, grid);
-            
-            if (!picovdbIsActive(voxel_result)) {
-                break;
-            }
-            
-            *v = picovdbGetValue(grid, voxel_result.count);
-            
-            // Check for zero crossing
-            if ((*v) * v0 < 0.0) {
+
+        // Leaf level logic (Surface detection)
+        if (hdda.dim == 1 && picovdbIsActive(result)) {
+            let val = picovdbGetValue(grid, result.count);
+            if (val * v0 < 0.0) {
                 *thit = hdda.tmin;
+                *v = val;
                 return true;
             }
+            // Optional: v0 = val; // Update previous value for continuous crossing
         }
+
+        // Step to next boundary
+        if (!picovdbHDDAStep(&hdda)) { break; }
     }
     return false;
+}
+
+struct PicoVDBStencil {
+    v000: f32, v001: f32, v010: f32, v011: f32,
+    v100: f32, v101: f32, v110: f32, v111: f32,
 }
 
 // Sample 2x2x2 stencil of voxel values around a point
@@ -572,65 +489,54 @@ fn picovdbSampleStencil(
     acc: ptr<function, PicoVDBReadAccessor>,
     grid: PicoVDBGrid,
     ijk: vec3i
-) -> array<array<array<f32, 2>, 2>, 2> {
-    var v: array<array<array<f32, 2>, 2>, 2>;
-    for (var x = 0; x < 2; x++) {
-        for (var y = 0; y < 2; y++) {
-            for (var z = 0; z < 2; z++) {
-                let offset = vec3i(x, y, z);
-                let result = picovdbReadAccessorGetLevelCount(
-                    acc,
-                    ijk + offset,
-                    grid
-                );
-                v[x][y][z] = picovdbGetValue(grid, result.count);
-            }
-        }
-    }
-    return v;
+) -> PicoVDBStencil {
+    var s: PicoVDBStencil;
+    s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 0), grid).count);
+    s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);
+    s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);
+    s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);
+    s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 0), grid).count);
+    s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);
+    s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 0), grid).count);
+    s.v111 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 1), grid).count);
+    return s;
 }
 
 // Compute trilinear gradient from 2x2x2 stencil
-fn picovdbTrilinearGradient(
-    uvw: vec3f,
-    v: array<array<array<f32, 2>, 2>, 2>
-) -> vec3f {
-    // Compute differences along Z axis for all 4 XY corners
-    var D: array<f32, 4>;
-    D[0] = v[0][0][1] - v[0][0][0];
-    D[1] = v[0][1][1] - v[0][1][0];
-    D[2] = v[1][0][1] - v[1][0][0];
-    D[3] = v[1][1][1] - v[1][1][0];
+fn picovdbTrilinearGradient(uvw: vec3f, s: PicoVDBStencil) -> vec3f {
+    // Interpolate values along Z for the four XY columns
+    let v00z = mix(s.v000, s.v001, uvw.z);
+    let v01z = mix(s.v010, s.v011, uvw.z);
+    let v10z = mix(s.v100, s.v101, uvw.z);
+    let v11z = mix(s.v110, s.v111, uvw.z);
 
-    // Z component: interpolate the Z differences
-    let grad_z = mix(mix(D[0], D[1], uvw.y), mix(D[2], D[3], uvw.y), uvw.x);
+    // Interpolate values along Y for the two X slabs
+    let v0yz = mix(v00z, v01z, uvw.y);
+    let v1yz = mix(v10z, v11z, uvw.y);
 
-    // Interpolate along Z to get 4 values at the correct Z position
-    let w = uvw.z;
-    D[0] = v[0][0][0] + D[0] * w;
-    D[1] = v[0][1][0] + D[1] * w;
-    D[2] = v[1][0][0] + D[2] * w;
-    D[3] = v[1][1][0] + D[3] * w;
+    // X Gradient: Difference between the two YZ-interpolated slabs
+    let grad_x = v1yz - v0yz;
 
-    // X component: difference between interpolated X edges
-    let grad_x = mix(D[2], D[3], uvw.y) - mix(D[0], D[1], uvw.y);
+    // Y Gradient: Interpolate the differences along X
+    let grad_y = mix(v01z - v00z, v11z - v10z, uvw.x);
 
-    // Y component: difference between interpolated Y edges
-    let grad_y = mix(D[1] - D[0], D[3] - D[2], uvw.x);
+    // Z Gradient: Interpolate the differences along X and Y
+    let dZ00 = s.v001 - s.v000;
+    let dZ01 = s.v011 - s.v010;
+    let dZ10 = s.v101 - s.v100;
+    let dZ11 = s.v111 - s.v110;
+    let grad_z = mix(mix(dZ00, dZ01, uvw.y), mix(dZ10, dZ11, uvw.y), uvw.x);
 
     return vec3f(grad_x, grad_y, grad_z);
 }
 
 // Trilinear interpolation of a value at position uvw within a voxel stencil
-fn picovdbTrilinearInterpolation(
-    uvw: vec3f,
-    v: array<array<array<f32, 2>, 2>, 2>
-) -> f32 {
+fn picovdbTrilinearInterpolation(uvw: vec3f, s: PicoVDBStencil) -> f32 {
     // Interpolate along Z
-    let v00 = mix(v[0][0][0], v[0][0][1], uvw.z);
-    let v01 = mix(v[0][1][0], v[0][1][1], uvw.z);
-    let v10 = mix(v[1][0][0], v[1][0][1], uvw.z);
-    let v11 = mix(v[1][1][0], v[1][1][1], uvw.z);
+    let v00 = mix(s.v000, s.v001, uvw.z);
+    let v01 = mix(s.v010, s.v011, uvw.z);
+    let v10 = mix(s.v100, s.v101, uvw.z);
+    let v11 = mix(s.v110, s.v111, uvw.z);
     
     // Interpolate along Y
     let v0 = mix(v00, v01, uvw.y);
