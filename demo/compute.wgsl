@@ -72,49 +72,27 @@ fn intersect_ray_aabb_interval(box: AABB, ray: Ray) -> IntersectionInterval {
     return IntersectionInterval(final_t_near, t_far_final, hit_valid);
 }
 
-fn intersect_nanovdb(
+fn intersect_picovdb(
     world_ray: Ray,
-    transform_matrix: mat4x4f,
-    inverse_transform_matrix: mat4x4f,
+    world_to_index: mat4x4f,
+    index_to_world: mat4x4f,
 ) -> RayHit {
     let grid = picovdb_grids[0];
-    let grid_ray = Ray(
-        (transform_matrix * vec4f(world_ray.origin, 1.0)).xyz, 
-        normalize((transform_matrix * vec4f(world_ray.direction, 0.0)).xyz),
-    );
-    let bbox = AABB(
-        vec3f(grid.worldBounds[0], grid.worldBounds[1], grid.worldBounds[2]),
-        vec3f(grid.worldBounds[3], grid.worldBounds[4], grid.worldBounds[5]),
-    );
-    let intersection_bbox = intersect_ray_aabb_interval(bbox, grid_ray);
-    if !intersection_bbox.hit {
-        return RayHit(-1.0, vec3f(0.0)); // Miss - early exit
+
+    // Transform World Ray directly to Index Space
+    // Direction stays unnormalized initially to preserve T-metric scale
+    let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;
+    let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;
+    let idx_dir_len = length(idx_dir_unnorm);
+    let idx_direction = idx_dir_unnorm / idx_dir_len;
+
+    let index_ray = Ray(idx_origin, idx_direction);
+
+    let bbox = AABB(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax));
+    let intersection = intersect_ray_aabb_interval(bbox, index_ray);
+    if !intersection.hit {
+        return RayHit(-1.0, vec3f(0.0));
     }
-
-    // Use map handle to transform grid->index.
-    // Convert array<f32,9> to mat3x3<f32>
-    let index_matf = mat3x3<f32>(
-        grid.gridToIndex[0], grid.gridToIndex[1], grid.gridToIndex[2],
-        grid.gridToIndex[3], grid.gridToIndex[4], grid.gridToIndex[5],
-        grid.gridToIndex[6], grid.gridToIndex[7], grid.gridToIndex[8]
-    );
-    let index_invmatf = mat3x3<f32>(
-        grid.indexToGrid[0], grid.indexToGrid[1], grid.indexToGrid[2],
-        grid.indexToGrid[3], grid.indexToGrid[4], grid.indexToGrid[5],
-        grid.indexToGrid[6], grid.indexToGrid[7], grid.indexToGrid[8]
-    );
-
-
-    // Transform grid ray to index space
-    let index_origin = index_invmatf * grid_ray.origin;
-    let index_direction_unnormalized = index_invmatf * grid_ray.direction;
-    let index_direction = normalize(index_direction_unnormalized);
-    let index_ray = Ray(index_origin, index_direction);
-    
-    // Scale t values from grid space to index space based on direction scaling
-    let direction_scale_factor = length(index_direction_unnormalized);
-    let index_t_near = intersection_bbox.t_near * direction_scale_factor;
-    let index_t_far = intersection_bbox.t_far * direction_scale_factor;
 
     var accessor: PicoVDBReadAccessor;
     picovdbReadAccessorInit(&accessor, 0);
@@ -126,40 +104,32 @@ fn intersect_nanovdb(
         &accessor,
         grid,
         index_ray.origin,
-        index_t_near,
+        intersection.t_near,
         index_ray.direction,
-        index_t_far,
+        intersection.t_far,
         &hit_t_index,
         &hit_value
     );
     if !hit {
-        return RayHit(-1.0, vec3f(0)); // No intersection
+        return RayHit(-1.0, vec3f(0));
     }
 
-    // Hit! Calculate normal using trilinear gradient (in index space)
+    // Calculate World Space Data
     let index_hit_point = index_ray.origin + index_ray.direction * hit_t_index;
-    let grid_hit_point = index_matf * index_hit_point;
-    let world_hit_point = (inverse_transform_matrix * vec4f(grid_hit_point, 1.0)).xyz;
+    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;
+
+    // Distance in world space
     let world_distance = length(world_hit_point - world_ray.origin);
 
-    // Get the base voxel containing the hit point
+    // Normal Calculation (Gradient in Index Space -> World Space)
     let ijk_base = vec3i(floor(index_hit_point));
-
-    // Compute fractional position within the voxel [0,1]
     let uvw = fract(index_hit_point);
-
-    // Sample 2x2x2 stencil around the hit point
     let stencil = picovdbSampleStencil(&accessor, grid, ijk_base);
-
-    // Compute gradient using trilinear interpolation (in index space)
     let index_gradient = picovdbTrilinearGradient(uvw, stencil);
     
-    // Transform gradient from index space to world space
-    // Note: gradients transform with the inverse transpose of the position transformation
-    let grid_gradient = index_matf * index_gradient; // index -> grid
-    let world_gradient = (inverse_transform_matrix * vec4f(grid_gradient, 0.0)).xyz; // grid -> world
-    
-    // Normalize to get the surface normal in world space
+    // Normals transform by the Transpose of the Inverse (World-to-Index)
+    // Or more simply: transform the gradient by the inverse-world matrix
+    let world_gradient = (index_to_world * vec4f(index_gradient, 0.0)).xyz;
     let normal = normalize(world_gradient);
 
     return RayHit(world_distance, normal);
@@ -183,7 +153,7 @@ fn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {
 fn is_in_shadow(point: vec3f, normal: vec3f, light_dir: vec3f, light_distance: f32) -> bool {
     // Offset ray origin along surface normal to avoid self-intersection
     let shadow_ray = Ray(point + normal * 0.01, light_dir);
-    let shadow_hit = intersect_nanovdb(
+    let shadow_hit = intersect_picovdb(
         shadow_ray,
         input.transform_matrix,
         input.transform_inverse_matrix,
@@ -195,7 +165,7 @@ fn raymarch_scene_graph(ray: Ray) -> vec3f {
     let ground_y = -2.0;
     
     // Check volume intersection
-    let volume_hit = intersect_nanovdb(
+    let volume_hit = intersect_picovdb(
         ray,
         input.transform_matrix,
         input.transform_inverse_matrix,

@@ -17,21 +17,18 @@ struct PicoVDBFileHeader {
 }
 
 struct PicoVDBGrid {
-  gridIndex: u32,         // This grid's index (4 bytes)
-  upperStart: u32,        // Index into uppers array (= root index) (4 bytes)
-  lowerStart: u32,        // Index into lowers array (4 bytes)
-  leafStart: u32,         // Index into leaves array (4 bytes)
-  dataStart: u32,         // 16-byte index into data buffer (4 bytes)
-  dataElemCount: u32,     // Number of data elements for this grid (4 bytes)
-  gridType: u32,          // GRID_TYPE_SDF_FLOAT=1, GRID_TYPE_SDF_UINT8=2 (4 bytes)
+  gridIndex: u32,     // This grid's index (4 bytes)
+  upperStart: u32,    // Index into uppers array (= root index) (4 bytes)
+  lowerStart: u32,    // Index into lowers array (4 bytes)
+  leafStart: u32,     // Index into leaves array (4 bytes)
+  dataStart: u32,     // 16-byte index into data buffer (4 bytes)
+  dataElemCount: u32, // Number of data elements for this grid (4 bytes)
+  gridType: u32,      // GRID_TYPE_SDF_FLOAT=1, GRID_TYPE_SDF_UINT8=2 (4 bytes)
   _pad1: u32,
-
-  worldBounds: array<f32,6>, // World space bounding box (24 bytes)
-  indexBounds: array<i32,6>, // Index space bounding box (24 bytes)
-  gridToIndex: array<f32,9>, // World-to-index transform (36 bytes)
-  indexToGrid: array<f32,9>, // Index-to-world transform (36 bytes)
-
-  _pad: array<u32,2>,        // Padding to 160 bytes (8 bytes)
+  indexBoundsMin: vec3i, // Index min (12 bytes)
+  _pad2: u32,
+  indexBoundsMax: vec3i, // Index min (12 bytes)
+  _pad3: u32,
 }
 
 const GRID_TYPE_SDF_FLOAT = 1;
@@ -503,10 +500,8 @@ fn picovdbHDDAZeroCrossing(
     thit: ptr<function, f32>,
     v: ptr<function, f32>
 ) -> bool {
-    let bbox_min = vec3i(grid.indexBounds[0], grid.indexBounds[1], grid.indexBounds[2]);
-    let bbox_max = vec3i(grid.indexBounds[3], grid.indexBounds[4], grid.indexBounds[5]);
-    let bbox_minf = vec3f(bbox_min);
-    let bbox_maxf = vec3f(bbox_max + vec3i(1));
+    let bbox_minf = vec3f(grid.indexBoundsMin);
+    let bbox_maxf = vec3f(grid.indexBoundsMax + vec3i(1));
 
     var tmin_mut = tmin;
     var tmax_mut = tmax;

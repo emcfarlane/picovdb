@@ -152,12 +152,13 @@ fn convertNanoVDBToPicoVDB(allocator: std.mem.Allocator, buffer: []const u8, pic
     // Calculate total active voxels we extracted
     const total_extracted_voxels = picovdb_file.data_buffer.items.len / 4; // 4 bytes per float
 
-    std.debug.print("Conversion complete: {} grids, {} roots, {} uppers, {} lowers, {} leaves\n", .{
+    std.debug.print("Conversion complete: {} grids, {} roots, {} uppers, {} lowers, {} leaves, {} data\n", .{
         picovdb_file.grids.items.len,
         picovdb_file.roots.items.len,
         picovdb_file.uppers.items.len,
         picovdb_file.lowers.items.len,
         picovdb_file.leaves.items.len,
+        picovdb_file.data_buffer.items.len,
     });
     std.debug.print("Total active voxels extracted: {} (vs NanoVDB reported: varies by grid)\n", .{total_extracted_voxels});
 }
@@ -463,19 +464,6 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
         return error.VoxelCountOverflow;
     };
 
-    // Extract transform matrices from NanoVDB map (3x3 matrices)
-    const map = &grid_ptr.map;
-
-    // Convert world bounding box from doubles to float32s
-    const world_bounds = [6]f32{
-        @floatCast(grid_ptr.world_bbox[0]), // min.x
-        @floatCast(grid_ptr.world_bbox[1]), // min.y
-        @floatCast(grid_ptr.world_bbox[2]), // min.z
-        @floatCast(grid_ptr.world_bbox[3]), // max.x
-        @floatCast(grid_ptr.world_bbox[4]), // max.y
-        @floatCast(grid_ptr.world_bbox[5]), // max.z
-    };
-
     const tree_handle = c.pnanovdb_tree_handle_t{ .address = c.pnanovdb_address_t{ .byte_offset = tree_offset } };
     const pnanovdb_buf = c.pnanovdb_buf_t{
         .data = @ptrCast(@alignCast(grid_buffer.ptr)),
@@ -485,14 +473,6 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
 
     const index_bbox_min = c.pnanovdb_root_get_bbox_min(pnanovdb_buf, root_handle);
     const index_bbox_max = c.pnanovdb_root_get_bbox_max(pnanovdb_buf, root_handle);
-    const index_bounds = [6]i32{
-        @intCast(index_bbox_min.x), // min.x
-        @intCast(index_bbox_min.y), // min.y
-        @intCast(index_bbox_min.z), // min.z
-        @intCast(index_bbox_max.x), // max.x
-        @intCast(index_bbox_max.y), // max.y
-        @intCast(index_bbox_max.z), // max.z
-    };
 
     // Calculate data_start in 16-byte units (current data buffer length / 16)
     const data_start_bytes = picovdb_file.data_buffer.items.len;
@@ -508,11 +488,18 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
         .data_elem_count = 0, // Will be set after conversion
         .grid_type = picovdb.GRID_TYPE_SDF_FLOAT, // Assume float grid for now
         ._pad1 = 0,
-        .grid_to_index = map.matf,
-        .index_to_grid = map.invmatf,
-        .world_bounds = world_bounds,
-        .index_bounds = index_bounds,
-        ._pad = [2]u32{ 0, 0 },
+        .index_bounds_min = [3]i32{
+            @intCast(index_bbox_min.x), // min.x
+            @intCast(index_bbox_min.y), // min.y
+            @intCast(index_bbox_min.z), // min.z
+        },
+        ._pad2 = 0,
+        .index_bounds_max = [3]i32{
+            @intCast(index_bbox_max.x), // max.x
+            @intCast(index_bbox_max.y), // max.y
+            @intCast(index_bbox_max.z), // max.z
+        },
+        ._pad3 = 0,
     };
 
     try convertRootTiles(allocator, pnanovdb_buf, tree_handle, picovdb_file, &picovdb_grid);
@@ -532,9 +519,7 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
     std.debug.print("  Grid size: {} bytes\n", .{grid_ptr.grid_size});
     std.debug.print("  Voxel count: {}\n", .{voxel_count});
     std.debug.print("  Data buffer size: {} bytes, grid data_start: {} (16B units), data_elem_count: {}\n", .{ picovdb_file.data_buffer.items.len, picovdb_grid.data_start, picovdb_grid.data_elem_count });
-    std.debug.print("  World bbox: [{:.3}, {:.3}, {:.3}] to [{:.3}, {:.3}, {:.3}]\n", .{ world_bounds[0], world_bounds[1], world_bounds[2], world_bounds[3], world_bounds[4], world_bounds[5] });
-    std.debug.print("  Index bbox: [{:.3}, {:.3}, {:.3}] to [{:.3}, {:.3}, {:.3}]\n", .{ index_bounds[0], index_bounds[1], index_bounds[2], index_bounds[3], index_bounds[4], index_bounds[5] });
-    std.debug.print("  Transform matrix: [{:.3}, {:.3}, {:.3}] [{:.3}, {:.3}, {:.3}] [{:.3}, {:.3}, {:.3}]\n", .{ map.matf[0], map.matf[1], map.matf[2], map.matf[3], map.matf[4], map.matf[5], map.matf[6], map.matf[7], map.matf[8] });
+    std.debug.print("  Index bbox: [{:.3}, {:.3}, {:.3}] to [{:.3}, {:.3}, {:.3}]\n", .{ index_bbox_min.x, index_bbox_min.y, index_bbox_min.z, index_bbox_max.x, index_bbox_max.y, index_bbox_max.z });
 
     // Add grid to PicoVDB file
     try picovdb_file.grids.append(allocator, picovdb_grid);
@@ -580,7 +565,6 @@ fn writePicoVDBFile(dst_path: []const u8, picovdb_file: *picovdb.PicoVDBFileMuta
     picovdb_file.header.lower_count = @intCast(picovdb_file.lowers.items.len);
     picovdb_file.header.leaf_count = @intCast(picovdb_file.leaves.items.len);
     picovdb_file.header.data_count = @intCast(data_size_padded / 16); // 16-byte unit
-    std.debug.print("HEADER {}", .{picovdb_file.header});
 
     // Write PicoVDB file header
     const header_bytes = std.mem.asBytes(&picovdb_file.header);
@@ -643,27 +627,12 @@ test "basic picovdb structures" {
         .data_elem_count = 0,
         .grid_type = picovdb.GRID_TYPE_SDF_FLOAT,
         ._pad1 = 0,
-        .grid_to_index = [9]f32{
-            1, 0, 0,
-            0, 1, 0,
-            0, 0, 1,
-        },
-        .index_to_grid = [9]f32{
-            1, 0, 0,
-            0, 1, 0,
-            0, 0, 1,
-        },
-        .world_bounds = [6]f32{
-            0, 0, 0,
-            1, 1, 1,
-        },
-        .index_bounds = [6]i32{
-            0, 0, 0,
-            8, 8, 8,
-        },
-        ._pad = [2]u32{ 0, 0 },
+        .index_bounds_min = [3]i32{ 0, 0, 0 },
+        ._pad2 = 0,
+        .index_bounds_max = [3]i32{ 8, 8, 8 },
+        ._pad3 = 0,
     };
-    try std.testing.expectEqual(@as(usize, 160), @sizeOf(picovdb.PicoVDBGrid));
+    try std.testing.expectEqual(@as(usize, 64), @sizeOf(picovdb.PicoVDBGrid));
     try std.testing.expectEqual(@as(u32, 0), grid.grid_index);
 
     const accessor = picovdb.PicoVDBReadAccessor.init(0);

@@ -28,7 +28,7 @@ pub const PicoVDBFileHeader = extern struct {
 pub const GRID_TYPE_SDF_FLOAT = 1;
 pub const GRID_TYPE_SDF_UINT8 = 2;
 
-// Grid header (160 bytes)
+// Grid header (64 bytes)
 pub const PicoVDBGrid = extern struct {
     grid_index: u32, // This grid's index (4 bytes)
     upper_start: u32, // Index into uppers array (= root index) (4 bytes)
@@ -38,11 +38,10 @@ pub const PicoVDBGrid = extern struct {
     data_elem_count: u32, // Number of data elements for this grid (4 bytes)
     grid_type: u32, // GRID_TYPE_SDF_FLOAT=1, GRID_TYPE_SDF_UINT8=2 (4 bytes)
     _pad1: u32,
-    world_bounds: [6]f32, // World space bounding box (24 bytes)
-    index_bounds: [6]i32, // Index space bounding box (24 bytes)
-    grid_to_index: [9]f32, // World-to-index transform matrix (36 bytes)
-    index_to_grid: [9]f32, // Index-to-world transform matrix (36 bytes)
-    _pad: [2]u32, // Padding to 160 bytes (4 bytes)
+    index_bounds_min: [3]i32, // Index spaac bounding box min (12 bytes)
+    _pad2: u32,
+    index_bounds_max: [3]i32, // Index space bounding box max (12 bytes)
+    _pad3: u32, // Padding to 64 bytes (4 bytes)
 };
 
 // Root tile (8 bytes)

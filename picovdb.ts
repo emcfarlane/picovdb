@@ -8,7 +8,7 @@ export const GRID_TYPE_SDF_FLOAT = 1;
 export const GRID_TYPE_SDF_UINT8 = 2;
 
 export const PICOVDB_FILE_HEADER_SIZE = 32;
-export const PICOVDB_GRID_SIZE = 160;
+export const PICOVDB_GRID_SIZE = 64;
 export const PICOVDB_ROOT_SIZE = 8;
 export const PICOVDB_NODE_MASK_SIZE = 16;
 export const PICOVDB_LEAF_MASK_SIZE = 12;
@@ -35,10 +35,8 @@ export interface PicoVDBGrid {
   dataStart: number;
   dataElemCount: number;
   gridType: number;
-  worldBounds: Float32Array, // 6 elements (min,max)
-  indexBounds: Int32Array, // 6 elements (min,max)
-  gridToIndex: Float32Array; // 9 elements
-  indexToGrid: Float32Array; // 9 elements
+  indexBoundsMin: Int32Array, // 3 elements (min)
+  indexBoundsMax: Int32Array, // 6 elements (max)
 }
 
 export interface PicoVDBRoot {
@@ -155,10 +153,8 @@ export class PicoVDBFile {
       dataStart: this.view.getUint32(offset + 16, true),
       dataElemCount: this.view.getUint32(offset + 20, true),
       gridType: this.view.getUint32(offset + 24, true),
-      worldBounds: new Float32Array(this.buffer, offset + 32, 6),
-      indexBounds: new Int32Array(this.buffer, offset + 56, 6),
-      gridToIndex: new Float32Array(this.buffer, offset + 80, 9),
-      indexToGrid: new Float32Array(this.buffer, offset + 116, 9),
+      indexBoundsMin: new Int32Array(this.buffer, offset + 32, 3),
+      indexBoundsMax: new Int32Array(this.buffer, offset + 48, 3),
     };
   }
 

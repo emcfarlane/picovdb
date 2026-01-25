@@ -325,8 +325,8 @@ InputViews.fov_scale[0] = fovScaled;
 function updateTransformMatrices() {
   // Create transformation matrix (scale + translation + rotation)
   const transformMatrix = mat4.identity();
-  mat4.translation(vec3.create(-2, 12, 0), transformMatrix);
-  mat4.scale(transformMatrix, vec3.create(6, 6, 6), transformMatrix);
+  mat4.translation(vec3.create(-40, 240, 0), transformMatrix);
+  mat4.scale(transformMatrix, vec3.create(120, 120, 120), transformMatrix);
 
   // Apply Y-axis rotation from GUI
   const rotationRadians = (controls.bunnyRotation * Math.PI) / 180;
@@ -350,17 +350,10 @@ rotationController.onChange(() => {
 const sizeMB = (picoVDBFile.getSize() / 1024 / 1024).toFixed(1);
 const grid = picoVDBFile.getGrid(0);
 const bboxSize = [
-  (grid.indexBounds[3] - grid.indexBounds[0]),
-  (grid.indexBounds[4] - grid.indexBounds[1]),
-  (grid.indexBounds[5] - grid.indexBounds[2])
-];
-console.log('World BBox (f64→f32):');
-console.log(`  : [${grid.worldBounds[0]}, ${grid.worldBounds[1]}, ${grid.worldBounds[2]}]`);
-console.log(`  : [${grid.worldBounds[3]}, ${grid.worldBounds[4]}, ${grid.worldBounds[5]}]`);
-console.log('Index BBox:');
-console.log(`  : [${grid.indexBounds[0]}, ${grid.indexBounds[1]}, ${grid.indexBounds[2]}]`);
-console.log(`  : [${grid.indexBounds[3]}, ${grid.indexBounds[4]}, ${grid.indexBounds[5]}]`);
-
+  (grid.indexBoundsMax[0] - grid.indexBoundsMin[0]),
+  (grid.indexBoundsMax[1] - grid.indexBoundsMin[1]),
+  (grid.indexBoundsMax[2] - grid.indexBoundsMin[2])
+]
 infoTextElement.textContent = `PicoVDB
 bunny.pvdb ${sizeMB}MB
 Grid: ${bboxSize[0]} × ${bboxSize[1]} × ${bboxSize[2]} units
