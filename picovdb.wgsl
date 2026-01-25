@@ -82,14 +82,6 @@ struct PicoVDBReadAccessor {
   _pad: u32,
 }
 
-// Rank query implementation
-// Returns the number of set bits preceding the specified bit
-fn picovdbRankQuery(value: u32, count: u32, bit_index: u32) -> u32 {
-    let bit_mask = (1u << bit_index) - 1u;
-    let word_rank = countOneBits(value & bit_mask);
-    return count + word_rank;
-}
-
 const PICOVDB_INVALID_INDEX: u32 = 0xFFFFFFFFu;
 
 fn picovdbReadAccessorInit(acc: ptr<function, PicoVDBReadAccessor>, grid: u32) {
@@ -103,27 +95,27 @@ fn picovdbReadAccessorInit(acc: ptr<function, PicoVDBReadAccessor>, grid: u32) {
 
 fn picovdbReadAccessorIsCachedLeaf(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {
     let addr = (*acc).leaf;
-    let is_cached = (addr != PICOVDB_INVALID_INDEX) && ((dirty & ~i32((1u << 3u) - 1u)) == 0);
+    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0x7i) == 0; // Leaf is 8x8x8 (bits 0-2)
     (*acc).leaf = select(PICOVDB_INVALID_INDEX, addr, is_cached);
     return is_cached;
 }
 
 fn picovdbReadAccessorIsCachedLower(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {
     let addr = (*acc).lower;
-    let is_cached = (addr != PICOVDB_INVALID_INDEX) && ((dirty & ~i32((1u << 7u) - 1u)) == 0);
+    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0x7Fi) == 0; // Lower is 128x128x128 (bits 0-6)
     (*acc).lower = select(PICOVDB_INVALID_INDEX, addr, is_cached);
     return is_cached;
 }
 
 fn picovdbReadAccessorIsCachedUpper(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {
     let addr = (*acc).upper;
-    let is_cached = (addr != PICOVDB_INVALID_INDEX) && ((dirty & ~i32((1u << 12u) - 1u)) == 0);
+    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0xFFFi) == 0; // Upper is 4096x4096x4096 (bits 0-11)
     (*acc).upper = select(PICOVDB_INVALID_INDEX, addr, is_cached);
     return is_cached;
 }
 
 fn picovdbReadAccessorComputeDirty(acc: ptr<function, PicoVDBReadAccessor>, ijk: vec3i) -> i32 {
-    return ((ijk.x ^ (*acc).key.x) | (ijk.y ^ (*acc).key.y) | (ijk.z ^ (*acc).key.z));
+    return (ijk.x ^ (*acc).key.x) | (ijk.y ^ (*acc).key.y) | (ijk.z ^ (*acc).key.z);
 }
 
 fn picovdbCoordToKey(ijk: vec3i) -> vec2u {
@@ -137,16 +129,23 @@ fn picovdbCoordToKey(ijk: vec3i) -> vec2u {
 }
 
 fn picovdbUpperCoordToOffset(ijk: vec3i) -> u32 {
-    return (((u32(ijk.x) & 4095u) >> 7u) << 10u) + (((u32(ijk.y) & 4095u) >> 7u) << 5u) + ((u32(ijk.z) & 4095u) >> 7u);
+    return (((u32(ijk.x) & 0xFFFu) >> 7u) << 10u) |
+           (((u32(ijk.y) & 0xFFFu) >> 7u) << 5u)  |
+            ((u32(ijk.z) & 0xFFFu) >> 7u);
 }
 
 fn picovdbLowerCoordToOffset(ijk: vec3i) -> u32 {
-    return (((u32(ijk.x) & 127u) >> 3u) << (8u)) + (((u32(ijk.y) & 127u) >> 3u) << (4u)) + ((u32(ijk.z) & 127u) >> 3u);
+    return (((u32(ijk.x) & 0x7Fu) >> 3u) << 8u) |
+           (((u32(ijk.y) & 0x7Fu) >> 3u) << 4u) |
+            ((u32(ijk.z) & 0x7Fu) >> 3u);
 }
 
 fn picovdbLeafCoordToOffset(ijk: vec3i) -> u32 {
-    return (((u32(ijk.x) & 7u) << 6u) + ((u32(ijk.y) & 7u) << 3u) + (u32(ijk.z) & 7u));
+    return ((u32(ijk.x) & 0x7u) << 6u) |
+           ((u32(ijk.y) & 0x7u) << 3u) |
+            (u32(ijk.z) & 0x7u);
 }
+
 
 // Find root/upper index for coordinate within grid bounds.
 // Roots are 1:1 with uppers, so the returned index works for both.
@@ -170,83 +169,85 @@ fn picovdbReadAccessorFindUpperIndex(
     return -1; // Not found
 }
 
-// Leaf accessor - only 1 branch (no children on leaves)
 fn picovdbReadAccessorLeafGetLevelCountAndCache(
     acc: ptr<function, PicoVDBReadAccessor>,
     ijk: vec3i,
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelCount {
     let n = picovdbLeafCoordToOffset(ijk);
-    let word_index = n / 32u;
-    let bit_index = n % 32u;
+    let word_index = n >> 5u; // Fast divide by 32
+    let bit_index = n & 31u; // Fast modulo 32
     let mask = picovdb_leaves[grid.leafStart + (*acc).leaf].mask[word_index];
 
-    let isValue = ((mask.value >> bit_index) & 1u) != 0u;
-    let isInside = ((mask.inside >> bit_index) & 1u) != 0u;
-
-    if (isValue) {
-        (*acc).key = ijk;
-        // Leaf nodes use value directly (no children, so no inside && value case)
-        let value_index = picovdbRankQuery(mask.value, mask.valueOffset, bit_index);
-        return PicoVDBLevelCount(0u, value_index);
-    }
-    return PicoVDBLevelCount(0u, u32(isInside));
+    let bit_at_pos = 1u << bit_index;
+    let is_value = (mask.value & bit_at_pos) != 0u;
+    let is_inside = (mask.inside & bit_at_pos) != 0u;
+    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
+    let count = select(
+        u32(is_inside),
+        mask.valueOffset + countOneBits(preceding_bits),
+        is_value,
+    );
+    (*acc).key = ijk;
+    return PicoVDBLevelCount(0u, count);
 }
 
-// Lower accessor - 2 branches (child, value)
 fn picovdbReadAccessorLowerGetLevelCountAndCache(
     acc: ptr<function, PicoVDBReadAccessor>,
     ijk: vec3i,
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelCount {
     let n = picovdbLowerCoordToOffset(ijk);
-    let word_index = n / 32u;
-    let bit_index = n % 32u;
+    let word_index = n >> 5u; // Fast divide by 32
+    let bit_index = n & 31u; // Fast modulo 32
     let mask = picovdb_lowers[grid.lowerStart + (*acc).lower].mask[word_index];
 
-    let isValue = ((mask.value >> bit_index) & 1u) != 0u;
-    let isInside = ((mask.inside >> bit_index) & 1u) != 0u;
+    let bit_at_pos = 1u << bit_index;
+    let is_value = (mask.value & bit_at_pos) != 0u;
+    let is_inside = (mask.inside & bit_at_pos) != 0u;
 
-    if (isValue && isInside) {
-        let childMask = mask.value & mask.inside;
-        (*acc).leaf = picovdbRankQuery(childMask, mask.childOffset, bit_index);
+    if (is_value && is_inside) {
+        let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
+        (*acc).leaf = mask.childOffset + countOneBits(preceding_bits);
         (*acc).key = ijk;
         return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);
     }
-    if (isValue) {
-        let valueMask = mask.value & ~mask.inside;
-        let value_index = picovdbRankQuery(valueMask, mask.valueOffset, bit_index);
-        return PicoVDBLevelCount(1u, value_index);
-    }
-    return PicoVDBLevelCount(1u, u32(isInside));
+    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
+    let count = select(
+        u32(is_inside),
+        mask.valueOffset + countOneBits(preceding_bits),
+        is_value,
+    );
+    return PicoVDBLevelCount(1u, count);
 }
 
-// Upper accessor - 2 branches (child, value)
 fn picovdbReadAccessorUpperGetLevelCountAndCache(
     acc: ptr<function, PicoVDBReadAccessor>,
     ijk: vec3i,
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelCount {
     let n = picovdbUpperCoordToOffset(ijk);
-    let word_index = n / 32u;
-    let bit_index = n % 32u;
+    let word_index = n >> 5u; // Fast divide by 32
+    let bit_index = n & 31u; // Fast modulo 32
     let mask = picovdb_uppers[grid.upperStart + (*acc).upper].mask[word_index];
 
-    let isValue = ((mask.value >> bit_index) & 1u) != 0u;
-    let isInside = ((mask.inside >> bit_index) & 1u) != 0u;
+    let bit_at_pos = 1u << bit_index;
+    let is_value = (mask.value & bit_at_pos) != 0u;
+    let is_inside = (mask.inside & bit_at_pos) != 0u;
 
-    if (isValue && isInside) {
-        let childMask = mask.value & mask.inside;
-        (*acc).lower = picovdbRankQuery(childMask, mask.childOffset, bit_index);
+    if (is_value && is_inside) {
+        let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
+        (*acc).lower = mask.childOffset + countOneBits(preceding_bits);
         (*acc).key = ijk;
         return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);
     }
-    if (isValue) {
-        let valueMask = mask.value & ~mask.inside;
-        let value_index = picovdbRankQuery(valueMask, mask.valueOffset, bit_index);
-        return PicoVDBLevelCount(2u, value_index);
-    }
-    return PicoVDBLevelCount(2u, u32(isInside));
+    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
+    let count = select(
+        u32(is_inside),
+        mask.valueOffset + countOneBits(preceding_bits),
+        is_value,
+    );
+    return PicoVDBLevelCount(2u, count);
 }
 
 // Get level and count from root and update cache
