@@ -13,19 +13,15 @@ pub const AddressAndLevel = struct {
     level: u32, // Tree level (0=leaf, 1=lower, 2=upper, 3=root tile, 4=background)
 };
 
-// File header (48 bytes)
+// File header (32 bytes)
 pub const PicoVDBFileHeader = extern struct {
     magic: [2]u32, // 'PicoVDB0' little endian (8 bytes)
-    checksum: u32, // File checksum (4 bytes)
     version: u32, // Format version (4 bytes)
     grid_count: u32, // Number of grids (4 bytes)
-    root_count: u32, // Number of root tiles (4 bytes)
-    upper_count: u32, // Number of upper nodes (4 bytes)
-    lower_count: u32, // Number of lower nodes (4 bytes)
-    leaf_count: u32, // Number of leaf nodes (4 bytes)
-    data_count: u32, // Data buffer size (4 bytes)
-    voxel_count: u32, // Total active voxel count (4 bytes)
-    name_count: u32, // Name buffer size (4 bytes)
+    upper_count: u32, // Total upper nodes (= root count) (4 bytes)
+    lower_count: u32, // Total lower nodes (4 bytes)
+    leaf_count: u32, // Total leaf nodes (4 bytes)
+    data_count: u32, // Total data buffer size in 16-byte units (4 bytes)
 };
 
 // Grid constants
@@ -34,114 +30,114 @@ pub const GRID_TYPE_SDF_UINT8 = 2;
 
 // Grid header (160 bytes)
 pub const PicoVDBGrid = extern struct {
-    matf: [9]f32, // Grid to index transform matrix (36 bytes)
-    matfi: [9]f32, // Index to grid transform matrix (36 bytes)
-    world_bbox: [6]f32, // World bounding box min.x,y,z, max.x,y,z (24 bytes)
-    index_bbox: [6]i32, // Index bounding box min.x,y,z, max.x,y,z (24 bytes)
-    grid_index: u32, // Grid index in file (4 bytes)
-    root_index: u32, // Index into roots array (4 bytes)
-    upper_index: u32, // Index into uppers array (4 bytes)
-    lower_index: u32, // Index into lowers array (4 bytes)
-    leaf_index: u32, // Index into leaves array (4 bytes)
-    data_index: u32, // Index into data buffer (4 bytes)
-    grid_type: u32, // Grid data type (4 bytes)
-    name_index: u32, // Index into name buffer (4 bytes)
-    name_size_bytes: u32, // Size of grid name in bytes (4 bytes)
-    _pad: u32, // Padding to 160 bytes (4 bytes)
+    grid_index: u32, // This grid's index (4 bytes)
+    upper_start: u32, // Index into uppers array (= root index) (4 bytes)
+    lower_start: u32, // Index into lowers array (4 bytes)
+    leaf_start: u32, // Index into leaves array (4 bytes)
+    data_start: u32, // 16-byte index into data buffer (4 bytes)
+    data_elem_count: u32, // Number of data elements for this grid (4 bytes)
+    grid_type: u32, // GRID_TYPE_SDF_FLOAT=1, GRID_TYPE_SDF_UINT8=2 (4 bytes)
+    _pad1: u32,
+    world_bounds: [6]f32, // World space bounding box (24 bytes)
+    index_bounds: [6]i32, // Index space bounding box (24 bytes)
+    grid_to_index: [9]f32, // World-to-index transform matrix (36 bytes)
+    index_to_grid: [9]f32, // Index-to-world transform matrix (36 bytes)
+    _pad: [2]u32, // Padding to 160 bytes (4 bytes)
 };
 
-// Root tile (16 bytes)
+// Root tile (8 bytes)
+// Always stored as an even count for alignment to 16 bytes.
 pub const PicoVDBRoot = extern struct {
     key: [2]u32, // 64-bit coordinate key (8 bytes)
-    state: u32, // Tile state/value (4 bytes)
-    _pad: u32, // Padding (4 bytes)
 };
 
-// Node mask structure (20 bytes)
+// Node mask structure (16 bytes)
+// Encoding: inside=0,value=0 -> outside implicit (background at index 0)
+//           inside=0,value=1 -> stored value (explicit tile)
+//           inside=1,value=0 -> inside implicit (inside value at index 1)
+//           inside=1,value=1 -> child node reference
 pub const PicoVDBNodeMask = extern struct {
-    value: u32, // Value mask bits (4 bytes)
-    value_count: u32, // Cumulative count of values up to this word (4 bytes)
-    child: u32, // Child mask bits (4 bytes)
-    child_count: u32, // Cumulative count of childs up to this word (4 bytes)
     inside: u32, // Inside mask bits (4 bytes)
+    value: u32, // Value mask bits (4 bytes)
+    value_offset: u32, // Prefix sum offset of values (4 bytes)
+    child_offset: u32, // Prefix sum offset of children (4 bytes)
 
-    pub inline fn hasValue(self: PicoVDBNodeMask, index: u5) bool {
+    pub inline fn isValue(self: PicoVDBNodeMask, index: u5) bool {
         return (self.value >> index) & 1 != 0;
     }
-    pub inline fn hasChild(self: PicoVDBNodeMask, index: u5) bool {
-        return (self.child >> index) & 1 != 0;
-    }
-    pub inline fn hasInside(self: PicoVDBNodeMask, index: u5) bool {
+    pub inline fn isInside(self: PicoVDBNodeMask, index: u5) bool {
         return (self.inside >> index) & 1 != 0;
     }
     pub inline fn valueIndex(self: PicoVDBNodeMask, index: u5) u32 {
-        return rankQuery(self.value, self.value_count, index);
+        const value_mask = self.value & ~self.inside;
+        return rankQuery(value_mask, self.value_offset, index);
     }
     pub inline fn childIndex(self: PicoVDBNodeMask, index: u5) u32 {
-        return rankQuery(self.child, self.child_count, index);
+        const child_mask = self.value & self.inside;
+        return rankQuery(child_mask, self.child_offset, index);
     }
 };
 
 // Leaf mask structure (12 bytes)
+// Encoding: inside=0,value=0 -> outside implicit (background at index 0)
+//           inside=0,value=1 -> stored value (explicit tile)
+//           inside=1,value=0 -> inside implicit (inside value at index 1)
+// Note: inside=1,value=1 is not valid for leaves (no children)
 pub const PicoVDBLeafMask = extern struct {
-    value: u32, // Value mask bits (4 bytes)
-    value_count: u32, // Cumulative count of values up to this word (4 bytes)
     inside: u32, // Inside mask bits (4 bytes)
+    value: u32, // Value mask bits (4 bytes)
+    value_offset: u32, // Prefix sum offset of values (4 bytes)
 
-    pub inline fn hasValue(self: PicoVDBLeafMask, index: u5) bool {
+    pub inline fn isValue(self: PicoVDBLeafMask, index: u5) bool {
         return (self.value >> index) & 1 != 0;
     }
-    pub inline fn hasInside(self: PicoVDBLeafMask, index: u5) bool {
+    pub inline fn isInside(self: PicoVDBLeafMask, index: u5) bool {
         return (self.inside >> index) & 1 != 0;
     }
     pub inline fn valueIndex(self: PicoVDBLeafMask, index: u5) u32 {
-        return rankQuery(self.value, self.value_count, index);
+        return rankQuery(self.value, self.value_offset, index);
     }
 };
 
-// Upper internal node (20512 bytes)
+// Upper internal node (16384 bytes = 1024 * 16)
 pub const PicoVDBUpper = extern struct {
-    index_bbox: [6]i32, // Node bounding box (24 bytes)
-    mask: [1024]PicoVDBNodeMask, // Interleaved value/child masks with counts (20480 bytes)
-    _pad: [2]u32, // Padding (8 bytes)
+    mask: [1024]PicoVDBNodeMask,
 };
 
-// Lower internal node (2592 bytes)
+// Lower internal node (2048 bytes = 128 * 16)
 pub const PicoVDBLower = extern struct {
-    index_bbox: [6]i32, // Node bounding box (24 bytes)
-    mask: [128]PicoVDBNodeMask, // Interleaved value/child masks with counts (2560 bytes)
-    _pad: [2]u32, // Padding (8 bytes)
+    mask: [128]PicoVDBNodeMask,
 };
 
-// Leaf node (224 bytes)
+// Leaf node (192 bytes = 16 * 12)
 pub const PicoVDBLeaf = extern struct {
-    index_bbox: [6]i32, // Node bounding box (24 bytes)
-    mask: [16]PicoVDBLeafMask, // Interleaved value masks with counts (192 bytes)
-    _pad: [2]u32, // Padding (8 bytes)
+    mask: [16]PicoVDBLeafMask,
 };
 
 // Read accessor (32 bytes)
 pub const PicoVDBReadAccessor = extern struct {
     key: [3]i32, // Current coordinate key (12 bytes)
-    leaf: u32, // Leaf node index (4 bytes)
-    lower: u32, // Lower node index (4 bytes)
+    grid: u32, // Grid index (4 bytes)
     upper: u32, // Upper node index (4 bytes)
-    _pad: [2]u32, // Padding to 32 bytes (8 bytes)
+    lower: u32, // Lower node index (4 bytes)
+    leaf: u32, // Leaf node index (4 bytes)
+    _pad: u32, // Padding to 32 bytes (4 bytes)
 
     const LevelCount = struct {
         // Level of value found.
         level: u32,
-        // Count offset. 0 means no active values (background).
+        // Count offset. 0 = background, 1 = inside implicit.
         count: u32,
     };
 
-    pub fn init(root_index: u32) PicoVDBReadAccessor {
+    pub fn init(grid: u32) PicoVDBReadAccessor {
         return PicoVDBReadAccessor{
             .key = [3]i32{ 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF },
-            .leaf = std.math.maxInt(u32),
+            .grid = grid,
+            .upper = std.math.maxInt(u32),
             .lower = std.math.maxInt(u32),
-            .upper = root_index,
-            ._pad = [2]u32{ 0, 0 },
+            .leaf = std.math.maxInt(u32),
+            ._pad = 0,
         };
     }
 
@@ -171,14 +167,15 @@ pub const PicoVDBReadAccessor = extern struct {
         return ((ijk[0] ^ self.key[0]) | (ijk[1] ^ self.key[1]) | (ijk[2] ^ self.key[2]));
     }
 
-    // Find root index for coordinate within current grid bounds
-    fn findRootIndex(ijk: [3]i32, grid: *const PicoVDBGrid, picovdb_file: *const PicoVDBFile) ?u32 {
+    // Find upper/root index for coordinate within current grid bounds.
+    // Roots are 1:1 with uppers, so the returned index works for both.
+    fn findUpperIndex(ijk: [3]i32, grid: *const PicoVDBGrid, picovdb_file: *const PicoVDBFile) ?u32 {
         const coord_key = coordToKey(ijk);
 
         // Determine bounds for this grid's root tiles
-        const start_index = grid.root_index;
+        const start_index = grid.upper_start;
         const end_index = if (grid.grid_index + 1 < picovdb_file.grids.len)
-            picovdb_file.grids[grid.grid_index + 1].root_index
+            picovdb_file.grids[grid.grid_index + 1].upper_start
         else
             @as(u32, @intCast(picovdb_file.roots.len));
 
@@ -193,83 +190,84 @@ pub const PicoVDBReadAccessor = extern struct {
         return null; // No matching root tile found
     }
 
-    // Get level and count from leaf node and update cache
+    // Get level and count from leaf node and update cache - 1 branch (no children)
     fn leafGetLevelCountAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
     ) LevelCount {
-        const leaf = &picovdb_file.leaves[grid.leaf_index + self.leaf];
+        const leaf = &picovdb_file.leaves[grid.leaf_start + self.leaf];
         const n = leafCoordToOffset(ijk);
         const word_index = n / 32;
-        const bit_index = n % 32;
+        const bit_index: u5 = @intCast(n % 32);
         const mask = &leaf.mask[word_index];
-        if (mask.hasValue(@intCast(bit_index))) {
+
+        const is_value = mask.isValue(bit_index);
+        const is_inside = mask.isInside(bit_index);
+
+        if (is_value) {
             self.key = ijk;
-            const value_index = mask.valueIndex(@intCast(bit_index));
+            const value_index = mask.valueIndex(bit_index);
             return LevelCount{ .level = 0, .count = value_index };
         }
-        if (mask.hasInside(@intCast(bit_index))) {
-            return LevelCount{ .level = 0, .count = 1 };
-        }
-        return LevelCount{ .level = 0, .count = 0 };
+        return LevelCount{ .level = 0, .count = @intFromBool(is_inside) };
     }
 
-    // Get value and level from lower node and update cache
+    // Get value and level from lower node and update cache - 2 branches (child, value)
     fn lowerGetLevelCountAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
     ) LevelCount {
-        const lower = &picovdb_file.lowers[grid.lower_index + self.lower];
+        const lower = &picovdb_file.lowers[grid.lower_start + self.lower];
         const n = lowerCoordToOffset(ijk);
         const word_index = n / 32;
-        const bit_index = n % 32;
+        const bit_index: u5 = @intCast(n % 32);
         const mask = &lower.mask[word_index];
-        if (mask.hasChild(@intCast(bit_index))) {
-            self.leaf = mask.childIndex(@intCast(bit_index));
+
+        const is_value = mask.isValue(bit_index);
+        const is_inside = mask.isInside(bit_index);
+
+        if (is_value and is_inside) {
+            self.leaf = mask.childIndex(bit_index);
             self.key = ijk;
             return self.leafGetLevelCountAndCache(ijk, grid, picovdb_file);
         }
-        if (mask.hasValue(@intCast(bit_index))) {
-            const value_index = mask.valueIndex(@intCast(bit_index));
+        if (is_value) {
+            const value_index = mask.valueIndex(bit_index);
             return LevelCount{ .level = 1, .count = value_index };
         }
-        // No active value at this level, return background 1 for inside.
-        if (mask.hasInside(@intCast(bit_index))) {
-            return LevelCount{ .level = 1, .count = 1 };
-        }
-        return LevelCount{ .level = 1, .count = 0 };
+        return LevelCount{ .level = 1, .count = @intFromBool(is_inside) };
     }
 
-    // Get level and count from upper node and update cache
+    // Get level and count from upper node and update cache - 2 branches (child, value)
     fn upperGetLevelCountAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
     ) LevelCount {
-        const upper = &picovdb_file.uppers[grid.upper_index + self.upper];
+        const upper = &picovdb_file.uppers[grid.upper_start + self.upper];
         const n = upperCoordToOffset(ijk);
         const word_index = n / 32;
-        const bit_index = n % 32;
+        const bit_index: u5 = @intCast(n % 32);
         const mask = &upper.mask[word_index];
-        if (mask.hasChild(@intCast(bit_index))) {
-            self.lower = mask.childIndex(@intCast(bit_index));
+
+        const is_value = mask.isValue(bit_index);
+        const is_inside = mask.isInside(bit_index);
+
+        if (is_value and is_inside) {
+            self.lower = mask.childIndex(bit_index);
             self.key = ijk;
             return self.lowerGetLevelCountAndCache(ijk, grid, picovdb_file);
         }
-        if (mask.hasValue(@intCast(bit_index))) {
-            const value_index = mask.valueIndex(@intCast(bit_index));
+        if (is_value) {
+            const value_index = mask.valueIndex(bit_index);
             return LevelCount{ .level = 2, .count = value_index };
         }
-        // No active value at this level, return background
-        if (mask.hasInside(@intCast(bit_index))) {
-            return LevelCount{ .level = 2, .count = 1 };
-        }
-        return LevelCount{ .level = 2, .count = 0 };
+        return LevelCount{ .level = 2, .count = @intFromBool(is_inside) };
     }
 
     fn rootGetLevelCountAndCache(
@@ -278,15 +276,13 @@ pub const PicoVDBReadAccessor = extern struct {
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
     ) LevelCount {
-        const root_index = findRootIndex(ijk, grid, picovdb_file);
-        if (root_index == null) {
+        const upper_index = findUpperIndex(ijk, grid, picovdb_file);
+        if (upper_index == null) {
             // No matching root tile, return background value
             return LevelCount{ .level = 4, .count = 0 };
         }
-        // const root = &picovdb_file.roots.items[root_index.?];
-        // Root tiles with children should traverse to upper nodes
-        // For now, always traverse since we know we have upper node data
-        self.upper = root_index.?;
+        // Roots are 1:1 with uppers, so upper_index works for both
+        self.upper = upper_index.?;
         self.key = ijk;
         return self.upperGetLevelCountAndCache(ijk, grid, picovdb_file);
     }
@@ -311,7 +307,8 @@ pub fn getGridFloat(
     index: u32,
 ) f32 {
     const data_ptr: [*]const f32 = @ptrCast(@alignCast(picovdb_file.data_buffer.ptr));
-    return data_ptr[grid.data_index / 4 + index]; // grid.data_index is in bytes, convert to f32 index
+    // data_start is in 16-byte units, multiply by 4 to get f32 index (16 bytes = 4 f32s)
+    return data_ptr[grid.data_start * 4 + index];
 }
 
 // Mutable container for building PicoVDB data
@@ -347,16 +344,20 @@ pub const PicoVDBFileMutable = struct {
 
     // encode to read-only serialized buffer
     pub fn encode(self: *const PicoVDBFileMutable, allocator: std.mem.Allocator) ![]align(4) const u8 {
-        // Calculate total buffer size
+        // Calculate sizes with padding
+        const root_count = self.roots.items.len;
+        const root_count_padded = if (root_count % 2 == 1) root_count + 1 else root_count;
+        const data_size = self.data_buffer.items.len;
+        const data_size_padded = std.mem.alignForward(usize, data_size, 16);
+
         const header_size = @sizeOf(PicoVDBFileHeader);
         const grids_size = self.grids.items.len * @sizeOf(PicoVDBGrid);
-        const roots_size = self.roots.items.len * @sizeOf(PicoVDBRoot);
+        const roots_size_padded = root_count_padded * @sizeOf(PicoVDBRoot);
         const uppers_size = self.uppers.items.len * @sizeOf(PicoVDBUpper);
         const lowers_size = self.lowers.items.len * @sizeOf(PicoVDBLower);
         const leaves_size = self.leaves.items.len * @sizeOf(PicoVDBLeaf);
-        const data_size = self.data_buffer.items.len;
 
-        const total_size = header_size + grids_size + roots_size + uppers_size + lowers_size + leaves_size + data_size;
+        const total_size = header_size + grids_size + roots_size_padded + uppers_size + lowers_size + leaves_size + data_size_padded;
 
         // Allocate aligned buffer
         const buffer = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(16), total_size);
@@ -368,11 +369,10 @@ pub const PicoVDBFileMutable = struct {
         var header = self.header;
         header.magic = PICOVDB_MAGIC;
         header.grid_count = @intCast(self.grids.items.len);
-        header.root_count = @intCast(self.roots.items.len);
         header.upper_count = @intCast(self.uppers.items.len);
         header.lower_count = @intCast(self.lowers.items.len);
         header.leaf_count = @intCast(self.leaves.items.len);
-        header.data_count = @intCast(self.data_buffer.items.len);
+        header.data_count = @intCast(data_size_padded / 16); // 16-byte units
 
         // Copy header
         @memcpy(buffer[offset .. offset + header_size], std.mem.asBytes(&header));
@@ -382,9 +382,15 @@ pub const PicoVDBFileMutable = struct {
         @memcpy(buffer[offset .. offset + grids_size], std.mem.sliceAsBytes(self.grids.items));
         offset += grids_size;
 
-        // Copy roots
-        @memcpy(buffer[offset .. offset + roots_size], std.mem.sliceAsBytes(self.roots.items));
-        offset += roots_size;
+        // Copy roots (with padding for 16-byte alignment)
+        const actual_roots_size = root_count * @sizeOf(PicoVDBRoot);
+        @memcpy(buffer[offset .. offset + actual_roots_size], std.mem.sliceAsBytes(self.roots.items));
+        offset += actual_roots_size;
+        if (root_count % 2 == 1) {
+            const padding_root = PicoVDBRoot{ .key = [2]u32{ 0, 0 } };
+            @memcpy(buffer[offset .. offset + @sizeOf(PicoVDBRoot)], std.mem.asBytes(&padding_root));
+            offset += @sizeOf(PicoVDBRoot);
+        }
 
         // Copy uppers
         @memcpy(buffer[offset .. offset + uppers_size], std.mem.sliceAsBytes(self.uppers.items));
@@ -398,8 +404,13 @@ pub const PicoVDBFileMutable = struct {
         @memcpy(buffer[offset .. offset + leaves_size], std.mem.sliceAsBytes(self.leaves.items));
         offset += leaves_size;
 
-        // Copy data buffer
+        // Copy data buffer (with padding)
         @memcpy(buffer[offset .. offset + data_size], self.data_buffer.items);
+        offset += data_size;
+        const data_padding = data_size_padded - data_size;
+        if (data_padding > 0) {
+            @memset(buffer[offset .. offset + data_padding], 0);
+        }
 
         return buffer;
     }
@@ -431,24 +442,24 @@ pub const PicoVDBFile = struct {
 
         var offset: usize = @sizeOf(PicoVDBFileHeader);
 
-        // Parse grids - trust file layout, no alignment padding
+        // Parse grids
         const grids_bytes = header.grid_count * @sizeOf(PicoVDBGrid);
         if (offset + grids_bytes > buffer.len) return error.BufferTooSmall;
-
-        // Assert that offset is naturally aligned (for debugging)
         std.debug.assert(offset % @alignOf(PicoVDBGrid) == 0);
 
         const grids_slice: []align(@alignOf(PicoVDBGrid)) const u8 = @alignCast(buffer[offset .. offset + grids_bytes]);
         const grids: []const PicoVDBGrid = std.mem.bytesAsSlice(PicoVDBGrid, grids_slice);
         offset += grids_bytes;
 
-        // Parse roots
-        const roots_bytes = header.root_count * @sizeOf(PicoVDBRoot);
+        // Parse roots (upper_count = root_count, padded to even for 16-byte alignment)
+        const root_count_padded = if (header.upper_count % 2 == 1) header.upper_count + 1 else header.upper_count;
+        const roots_bytes = root_count_padded * @sizeOf(PicoVDBRoot);
         if (offset + roots_bytes > buffer.len) return error.BufferTooSmall;
         std.debug.assert(offset % @alignOf(PicoVDBRoot) == 0);
 
         const roots_slice: []align(@alignOf(PicoVDBRoot)) const u8 = @alignCast(buffer[offset .. offset + roots_bytes]);
-        const roots: []const PicoVDBRoot = std.mem.bytesAsSlice(PicoVDBRoot, roots_slice);
+        const roots_all: []const PicoVDBRoot = std.mem.bytesAsSlice(PicoVDBRoot, roots_slice);
+        const roots = roots_all[0..header.upper_count]; // Exclude padding root
         offset += roots_bytes;
 
         // Parse uppers
@@ -478,9 +489,10 @@ pub const PicoVDBFile = struct {
         const leaves: []const PicoVDBLeaf = std.mem.bytesAsSlice(PicoVDBLeaf, leaves_slice);
         offset += leaves_bytes;
 
-        // Parse data (no alignment needed for u8)
-        if (offset + header.data_count > buffer.len) return error.BufferTooSmall;
-        const data_buffer = buffer[offset .. offset + header.data_count];
+        // Parse data (data_count is in 16-byte units)
+        const data_size_bytes = header.data_count * 16;
+        if (offset + data_size_bytes > buffer.len) return error.BufferTooSmall;
+        const data_buffer = buffer[offset .. offset + data_size_bytes];
 
         return PicoVDBFile{
             .header = header,
@@ -496,7 +508,8 @@ pub const PicoVDBFile = struct {
     // Get float value from data buffer
     pub fn getGridFloat(self: *const PicoVDBFile, grid: *const PicoVDBGrid, index: u32) f32 {
         const data_ptr: [*]const f32 = @ptrCast(@alignCast(self.data_buffer.ptr));
-        return data_ptr[grid.data_index / 4 + index]; // grid.data_index is in bytes, convert to f32 index
+        // data_start is in 16-byte units, multiply by 4 to get f32 index (16 bytes = 4 f32s)
+        return data_ptr[grid.data_start * 4 + index];
     }
 
     // Access grid by index

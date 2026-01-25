@@ -6,20 +6,22 @@ test {
     std.testing.refAllDecls(@import("picovdb.zig"));
 }
 
+const picovdb = @import("picovdb.zig");
+
 // Re-export PicoVDB structures from picovdb.zig
-pub const PicoVDBGrid = @import("picovdb.zig").PicoVDBGrid;
-pub const PicoVDBRoot = @import("picovdb.zig").PicoVDBRoot;
-pub const PicoVDBUpper = @import("picovdb.zig").PicoVDBUpper;
-pub const PicoVDBLower = @import("picovdb.zig").PicoVDBLower;
-pub const PicoVDBLeaf = @import("picovdb.zig").PicoVDBLeaf;
-pub const PicoVDBReadAccessor = @import("picovdb.zig").PicoVDBReadAccessor;
-pub const PicoVDBNodeMask = @import("picovdb.zig").PicoVDBNodeMask;
-pub const PicoVDBLeafMask = @import("picovdb.zig").PicoVDBLeafMask;
-pub const PicoVDBFile = @import("picovdb.zig").PicoVDBFile;
-pub const PicoVDBFileMutable = @import("picovdb.zig").PicoVDBFileMutable;
-pub const coordToKey = @import("picovdb.zig").coordToKey;
-pub const getGridFloat = @import("picovdb.zig").getGridFloat;
+pub const PicoVDBGrid = picovdb.PicoVDBGrid;
+pub const PicoVDBRoot = picovdb.PicoVDBRoot;
+pub const PicoVDBUpper = picovdb.PicoVDBUpper;
+pub const PicoVDBLower = picovdb.PicoVDBLower;
+pub const PicoVDBLeaf = picovdb.PicoVDBLeaf;
+pub const PicoVDBReadAccessor = picovdb.PicoVDBReadAccessor;
+pub const PicoVDBNodeMask = picovdb.PicoVDBNodeMask;
+pub const PicoVDBLeafMask = picovdb.PicoVDBLeafMask;
+pub const PicoVDBFile = picovdb.PicoVDBFile;
+pub const PicoVDBFileMutable = picovdb.PicoVDBFileMutable;
+pub const coordToKey = picovdb.coordToKey;
+pub const getGridFloat = picovdb.getGridFloat;
 
 // Grid type constants
-pub const GRID_TYPE_SDF_FLOAT = @import("picovdb.zig").GRID_TYPE_SDF_FLOAT;
-pub const GRID_TYPE_SDF_UINT8 = @import("picovdb.zig").GRID_TYPE_SDF_UINT8;
+pub const GRID_TYPE_SDF_FLOAT = picovdb.GRID_TYPE_SDF_FLOAT;
+pub const GRID_TYPE_SDF_UINT8 = picovdb.GRID_TYPE_SDF_UINT8;

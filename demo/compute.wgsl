@@ -83,8 +83,8 @@ fn intersect_nanovdb(
         normalize((transform_matrix * vec4f(world_ray.direction, 0.0)).xyz),
     );
     let bbox = AABB(
-        vec3f(grid.worldBBox[0], grid.worldBBox[1], grid.worldBBox[2]),
-        vec3f(grid.worldBBox[3], grid.worldBBox[4], grid.worldBBox[5]), 
+        vec3f(grid.worldBounds[0], grid.worldBounds[1], grid.worldBounds[2]),
+        vec3f(grid.worldBounds[3], grid.worldBounds[4], grid.worldBounds[5]),
     );
     let intersection_bbox = intersect_ray_aabb_interval(bbox, grid_ray);
     if !intersection_bbox.hit {
@@ -103,6 +103,8 @@ fn intersect_nanovdb(
         grid.indexToGrid[3], grid.indexToGrid[4], grid.indexToGrid[5],
         grid.indexToGrid[6], grid.indexToGrid[7], grid.indexToGrid[8]
     );
+
+
     // Transform grid ray to index space
     let index_origin = index_invmatf * grid_ray.origin;
     let index_direction_unnormalized = index_invmatf * grid_ray.direction;
@@ -115,7 +117,7 @@ fn intersect_nanovdb(
     let index_t_far = intersection_bbox.t_far * direction_scale_factor;
 
     var accessor: PicoVDBReadAccessor;
-    picovdbReadAccessorInit(&accessor);
+    picovdbReadAccessorInit(&accessor, 0);
 
     // Use HDDA zero crossing detection (all parameters in index space)
     var hit_t_index: f32;

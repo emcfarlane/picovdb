@@ -350,21 +350,21 @@ rotationController.onChange(() => {
 const sizeMB = (picoVDBFile.getSize() / 1024 / 1024).toFixed(1);
 const grid = picoVDBFile.getGrid(0);
 const bboxSize = [
-  (grid.indexBBox[3] - grid.indexBBox[0]),
-  (grid.indexBBox[4] - grid.indexBBox[1]),
-  (grid.indexBBox[5] - grid.indexBBox[2])
+  (grid.indexBounds[3] - grid.indexBounds[0]),
+  (grid.indexBounds[4] - grid.indexBounds[1]),
+  (grid.indexBounds[5] - grid.indexBounds[2])
 ];
 console.log('World BBox (f64→f32):');
-console.log(`  Min: [${grid.worldBBox[0]}, ${grid.worldBBox[1]}, ${grid.worldBBox[2]}]`);
-console.log(`  Max: [${grid.worldBBox[3]}, ${grid.worldBBox[4]}, ${grid.worldBBox[5]}]`);
+console.log(`  : [${grid.worldBounds[0]}, ${grid.worldBounds[1]}, ${grid.worldBounds[2]}]`);
+console.log(`  : [${grid.worldBounds[3]}, ${grid.worldBounds[4]}, ${grid.worldBounds[5]}]`);
 console.log('Index BBox:');
-console.log(`  Min: [${grid.indexBBox[0]}, ${grid.indexBBox[1]}, ${grid.indexBBox[2]}]`);
-console.log(`  Max: [${grid.indexBBox[3]}, ${grid.indexBBox[4]}, ${grid.indexBBox[5]}]`);
+console.log(`  : [${grid.indexBounds[0]}, ${grid.indexBounds[1]}, ${grid.indexBounds[2]}]`);
+console.log(`  : [${grid.indexBounds[3]}, ${grid.indexBounds[4]}, ${grid.indexBounds[5]}]`);
 
 infoTextElement.textContent = `PicoVDB
-bunny.nvdb ${sizeMB}MB
+bunny.pvdb ${sizeMB}MB
 Grid: ${bboxSize[0]} × ${bboxSize[1]} × ${bboxSize[2]} units
-Voxels: ${(picoVDBFile.header?.dataCount / 4) - 2}`;
+Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime: number) {
   // Update time delta
   InputViews.time_delta[0] = deltaTime;

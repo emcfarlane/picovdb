@@ -53,12 +53,11 @@ export async function loadPicoVDB(url: string): Promise<PicoVDBFile> {
   console.log(`  Magic: [0x${picoFile.header.magic[0].toString(16)}, 0x${picoFile.header.magic[1].toString(16)}]`);
   console.log(`  Version: ${picoFile.header.version}`);
   console.log(`  Grid Count: ${picoFile.header.gridCount}`);
-  console.log(`  Root Count: ${picoFile.header.rootCount}`);
   console.log(`  Upper Count: ${picoFile.header.upperCount}`);
   console.log(`  Lower Count: ${picoFile.header.lowerCount}`);
   console.log(`  Leaf Count: ${picoFile.header.leafCount}`);
   console.log(`  Data Count: ${picoFile.header.dataCount} bytes`);
-  console.log(`  Voxel Count: ${picoFile.header.voxelCount}`);
+  console.log(`  Voxel Count: ${picoFile.getVoxelCount()}`);
   if (picoFile.header.gridCount === 0) {
     throw new Error('PicoVDB file contains no grids');
   }
