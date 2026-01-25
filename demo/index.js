@@ -3504,10 +3504,701 @@ var {
 var blit_default = "struct VertexInput {\n    @location(0) position: vec2f,\n}\n\nstruct VertexOutput {\n    @builtin(position) pos: vec4f,\n    @location(0) uv: vec2f,\n}\n\nstruct FragmentInput {\n    @location(0) uv: vec2f,\n}\n\n@group(0) @binding(0) var raytracedTexture: texture_2d<f32>;\n@group(0) @binding(1) var textureSampler: sampler;\n\n@vertex\nfn vertexMain(input: VertexInput) -> VertexOutput {\n    // Convert from [-1,1] to [0,1] for UV coordinates\n    let uv = input.position * 0.5 + 0.5;\n    return VertexOutput(\n        vec4f(input.position, 0.0, 1.0),\n        uv\n    );\n}\n\n@fragment\nfn fragmentMain(\n    input: FragmentInput,\n) -> @location(0) vec4f {\n    let color = textureSample(raytracedTexture, textureSampler, input.uv);\n    // GPU hardware handles filtering and edge cases automatically\n    return color;\n}\n";
 
 // compute.wgsl
-var compute_default = 'struct Input {\n    camera_matrix: mat4x4f,\n    fov_scale: f32, // tan(fov * 0.5)\n    time_delta: f32,\n    _pad: vec2u,\n    transform_matrix: mat4x4f,\n    transform_inverse_matrix: mat4x4f,\n}\n\n@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;\n@group(0) @binding(1) var<uniform> input: Input;\n@group(0) @binding(2) var<storage> picovdb_grids: array<PicoVDBGrid>;\n@group(0) @binding(3) var<storage> picovdb_roots: array<PicoVDBRoot>;\n@group(0) @binding(4) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n@group(0) @binding(5) var<storage> picovdb_lowers: array<PicoVDBLower>;\n@group(0) @binding(6) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n@group(0) @binding(7) var<storage> picovdb_buffer: array<u32>;\n\nstruct RayHit {\n    distance: f32,\n    normal: vec3f,\n}\n\n// Define a structure for an Axis-Aligned Bounding Box (AABB)\nstruct AABB {\n    min_bounds: vec3<f32>,\n    max_bounds: vec3<f32>,\n};\n\n\n// Define a structure to hold the intersection results\nstruct IntersectionInterval {\n    // The parametric distance to the nearest intersection point\n    t_near: f32,\n    // The parametric distance to the farthest intersection point\n    t_far: f32,\n    // True if a valid intersection occurs in front of the ray origin\n    hit: bool,\n};\n\n/**\n * Checks if a ray intersects an AABB and returns the min/max distances.\n *\n * @param box The AABB to check for intersection.\n * @param ray The ray used for intersection testing.\n * @returns An IntersectionInterval structure with hit status and distances.\n */\nfn intersect_ray_aabb_interval(box: AABB, ray: Ray) -> IntersectionInterval {\n    // Calculate intersection distances for the x, y, and z slabs\n    let ray_inv_direction = 1.0 / ray.direction; // TODO: precompute?\n    let t0 = (box.min_bounds - ray.origin) * ray_inv_direction;\n    let t1 = (box.max_bounds - ray.origin) * ray_inv_direction;\n\n    // Order the distances for each axis to get t_min and t_max for each slab\n    let t_min_xyz = min(t0, t1);\n    let t_max_xyz = max(t0, t1);\n\n    // Find the maximum of all near intersections (t_near) and the minimum of all far intersections (t_far)\n    let t_near_final = max(max(t_min_xyz.x, t_min_xyz.y), t_min_xyz.z);\n    let t_far_final = min(min(t_max_xyz.x, t_max_xyz.y), t_max_xyz.z);\n\n    // Check for a valid intersection:\n    // 1. The near point must be less than or equal to the far point (intervals overlap).\n    // 2. The far point must not be behind the ray origin (t_far_final >= 0.0).\n    let hit_valid = t_near_final <= t_far_final && t_far_final >= 0.0;\n\n    // If a hit occurred, ensure t_near_final is >= 0 if we only care about hits in front of the origin.\n    // If the origin is inside the box, t_near_final might be negative, \n    // but the intersection technically starts "at the origin" (t=0) for visual rendering purposes.\n    let final_t_near = max(0.0, t_near_final);\n\n    return IntersectionInterval(final_t_near, t_far_final, hit_valid);\n}\n\nfn intersect_picovdb(\n    world_ray: Ray,\n    world_to_index: mat4x4f,\n    index_to_world: mat4x4f,\n) -> RayHit {\n    let grid = picovdb_grids[0];\n\n    // Transform World Ray directly to Index Space\n    // Direction stays unnormalized initially to preserve T-metric scale\n    let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;\n    let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;\n    let idx_dir_len = length(idx_dir_unnorm);\n    let idx_direction = idx_dir_unnorm / idx_dir_len;\n\n    let index_ray = Ray(idx_origin, idx_direction);\n\n    let bbox = AABB(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax));\n    let intersection = intersect_ray_aabb_interval(bbox, index_ray);\n    if !intersection.hit {\n        return RayHit(-1.0, vec3f(0.0));\n    }\n\n    var accessor: PicoVDBReadAccessor;\n    picovdbReadAccessorInit(&accessor, 0);\n\n    // Use HDDA zero crossing detection (all parameters in index space)\n    var hit_t_index: f32;\n    var hit_value: f32;\n     let hit = picovdbHDDAZeroCrossing(\n        &accessor,\n        grid,\n        index_ray.origin,\n        intersection.t_near,\n        index_ray.direction,\n        intersection.t_far,\n        &hit_t_index,\n        &hit_value\n    );\n    if !hit {\n        return RayHit(-1.0, vec3f(0));\n    }\n\n    // Calculate World Space Data\n    let index_hit_point = index_ray.origin + index_ray.direction * hit_t_index;\n    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;\n\n    // Distance in world space\n    let world_distance = length(world_hit_point - world_ray.origin);\n\n    // Normal Calculation (Gradient in Index Space -> World Space)\n    let ijk_base = vec3i(floor(index_hit_point));\n    let uvw = fract(index_hit_point);\n    let stencil = picovdbSampleStencil(&accessor, grid, ijk_base);\n    let index_gradient = picovdbTrilinearGradient(uvw, stencil);\n    \n    // Normals transform by the Transpose of the Inverse (World-to-Index)\n    // Or more simply: transform the gradient by the inverse-world matrix\n    let world_gradient = (index_to_world * vec4f(index_gradient, 0.0)).xyz;\n    let normal = normalize(world_gradient);\n\n    return RayHit(world_distance, normal);\n}\n\nstruct Ray {\n    origin: vec3f,\n    direction: vec3f,\n}\n\n// Ground plane intersection (only visible from above)\nfn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {\n    if ray.direction.y >= 0.0 || abs(ray.direction.y) < 0.001 {\n        return -1.0;\n    }\n    let t = (plane_y - ray.origin.y) / ray.direction.y;\n    return select(-1.0, t, t > 0.001);\n}\n\n// Shadow ray test\nfn is_in_shadow(point: vec3f, normal: vec3f, light_dir: vec3f, light_distance: f32) -> bool {\n    // Offset ray origin along surface normal to avoid self-intersection\n    let shadow_ray = Ray(point + normal * 0.01, light_dir);\n    let shadow_hit = intersect_picovdb(\n        shadow_ray,\n        input.transform_matrix,\n        input.transform_inverse_matrix,\n    );\n    return shadow_hit.distance > 0.0 && shadow_hit.distance < light_distance;\n}\n\nfn raymarch_scene_graph(ray: Ray) -> vec3f {\n    let ground_y = -2.0;\n    \n    // Check volume intersection\n    let volume_hit = intersect_picovdb(\n        ray,\n        input.transform_matrix,\n        input.transform_inverse_matrix,\n    );\n    \n    // Check ground plane intersection  \n    let ground_t = intersect_ground_plane(ray, ground_y);\n    \n    let light_pos = vec3f(20.0, 30.0, 10.0);\n    let ambient = vec3f(0.15);\n    \n    // Determine closest hit\n    var closest_t = 10000.0;\n    var hit_volume = false;\n    var hit_ground = false;\n    \n    if volume_hit.distance > 0.0 && volume_hit.distance < closest_t {\n        closest_t = volume_hit.distance;\n        hit_volume = true;\n    }\n    \n    if ground_t > 0.0 && ground_t < closest_t {\n        closest_t = ground_t;\n        hit_ground = true;\n        hit_volume = false;\n    }\n    \n    if hit_volume {\n        // Blue bunny material\n        let hit_point = ray.origin + ray.direction * volume_hit.distance;\n        let light_dir = normalize(light_pos - hit_point);\n        let light_distance = length(light_pos - hit_point);\n        \n        // Diffuse lighting\n        let diffuse = max(dot(volume_hit.normal, light_dir), 0.0);\n        \n        // Shadow test\n        let shadow_factor = select(1.0, 0.3, is_in_shadow(hit_point, volume_hit.normal, light_dir, light_distance));\n        \n        // Blue bunny color\n        let base_color = vec3f(0.2, 0.5, 1.0);\n        return base_color * (ambient + diffuse * shadow_factor * 0.8);\n        \n    } else if hit_ground {\n        // Shadow-only ground plane\n        let hit_point = ray.origin + ray.direction * ground_t;\n        let ground_normal = vec3f(0.0, 1.0, 0.0);\n        let light_dir = normalize(light_pos - hit_point);\n        let light_distance = length(light_pos - hit_point);\n        \n        // Distance fade from center\n        let distance_from_center = length(hit_point.xz);\n        let fade_radius = 30.0;\n        let fade_factor = 1.0 - smoothstep(fade_radius - 10.0, fade_radius, distance_from_center);\n        \n        // If completely faded, return background\n        if fade_factor <= 0.001 {\n            return vec3f(0.95, 0.95, 1.0);\n        }\n        \n        // Shadow test - only show ground if in shadow\n        let in_shadow = is_in_shadow(hit_point, ground_normal, light_dir, light_distance);\n        \n        if in_shadow {\n            // Dark shadow color\n            let shadow_color = vec3f(0.3, 0.3, 0.35);\n            let background_color = vec3f(0.95, 0.95, 1.0);\n            return mix(background_color, shadow_color, fade_factor * 0.7);\n        }\n    }\n    return vec3f(0.95, 0.95, 1.0); // Background color\n}\n\n\nfn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {\n    // Convert to normalized coordinates [-1, 1]\n    let uv = (screen_coord / screen_size) * 2.0 - 1.0;\n    \n    // Calculate aspect ratio\n    let aspect_ratio = screen_size.x / screen_size.y;\n\n    // Extract camera basis vectors from view matrix\n    let right: vec3f = input.camera_matrix[0].xyz;\n    let up: vec3f = input.camera_matrix[1].xyz;\n    let forward: vec3f = -input.camera_matrix[2].xyz;\n\n    // Extract camera position\n    let camera_pos: vec3f = input.camera_matrix[3].xyz;\n    \n    // Calculate ray direction\n    let ray_direction = normalize(\n        forward + uv.x * right * aspect_ratio * input.fov_scale + uv.y * up * input.fov_scale\n    );\n    return Ray(camera_pos, ray_direction);\n}\n\n@compute @workgroup_size(16, 16)\nfn computeMain(@builtin(global_invocation_id) global_id: vec3u) {\n    let screen_size = textureDimensions(outputTexture);\n    \n    // Early exit for out-of-bounds threads\n    if global_id.x >= screen_size.x || global_id.y >= screen_size.y {\n        return;\n    }\n\n    // Generate ray\n    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5, vec2f(screen_size));\n    \n    // Raymarching using scene graph\n    let color = raymarch_scene_graph(ray);\n    \n    // Write result\n    textureStore(outputTexture, global_id.xy, vec4f(color, 1.0));\n}\n';
+var compute_default = "struct Input {\n    camera_matrix: mat4x4f,\n    fov_scale: f32, // tan(fov * 0.5)\n    time_delta: f32,\n    _pad: vec2u,\n    transform_matrix: mat4x4f,\n    transform_inverse_matrix: mat4x4f,\n}\n\n@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;\n@group(0) @binding(1) var<uniform> input: Input;\n@group(0) @binding(2) var<storage> picovdb_grids: array<PicoVDBGrid>;\n@group(0) @binding(3) var<storage> picovdb_roots: array<PicoVDBRoot>;\n@group(0) @binding(4) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n@group(0) @binding(5) var<storage> picovdb_lowers: array<PicoVDBLower>;\n@group(0) @binding(6) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n@group(0) @binding(7) var<storage> picovdb_buffer: array<u32>;\n\nstruct RayHit {\n    distance: f32,\n    normal: vec3f,\n}\n\nfn intersect_picovdb(\n    world_ray: Ray,\n    world_to_index: mat4x4f,\n    index_to_world: mat4x4f,\n) -> RayHit {\n    let grid = picovdb_grids[0];\n    let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;\n    let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;\n    let idx_dir_len = length(idx_dir_unnorm);\n    let idx_direction = idx_dir_unnorm / idx_dir_len;\n\n    let index_ray = Ray(idx_origin, idx_direction);\n    let tmin = 0.0;\n    let tmax = 10000.0; // TODO: set max world clip distance.\n\n    var accessor: PicoVDBReadAccessor;\n    picovdbReadAccessorInit(&accessor, 0);\n\n    // Inside Check (Works even if camera is in background space)\n    let start_val = picovdbSampleTrilinear(&accessor, grid, idx_origin);\n    if start_val < 0.0 {\n        return RayHit(0.01, -world_ray.direction);\n    }\n\n    var hit_t_idx: f32;\n    var hit_v: f32;\n    let hit = picovdbHDDAZeroCrossing(\n        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, &hit_t_idx, &hit_v,\n    );\n    if !hit { return RayHit(-1.0, vec3f(0)); }\n\n    let index_hit_point = index_ray.origin + index_ray.direction * hit_t_idx;\n    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;\n    let world_distance = length(world_hit_point - world_ray.origin);\n\n    let stencil = picovdbSampleStencil(&accessor, grid, vec3i(floor(index_hit_point)));\n    let index_gradient = picovdbTrilinearGradient(fract(index_hit_point), stencil);\n    let normal = normalize((index_to_world * vec4f(index_gradient, 0.0)).xyz);\n\n    return RayHit(world_distance, normal);\n}\n\nstruct Ray {\n    origin: vec3f,\n    direction: vec3f,\n}\n\n// Ground plane intersection (only visible from above)\nfn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {\n    if ray.direction.y >= 0.0 || abs(ray.direction.y) < 0.001 {\n        return -1.0;\n    }\n    let t = (plane_y - ray.origin.y) / ray.direction.y;\n    return select(-1.0, t, t > 0.001);\n}\n\nfn raymarch_scene_graph(ray: Ray) -> vec3f {\n    let volume_hit = intersect_picovdb(ray, input.transform_matrix, input.transform_inverse_matrix);\n    let ground_t = intersect_ground_plane(ray, -2.0);\n    \n    let background = vec3f(0.95, 0.95, 1.0);\n    let light_pos = vec3f(20.0, 30.0, 10.0);\n\n    // Determine primary hit\n    var t = 1e6f;\n    var is_volume = false;\n    if volume_hit.distance > 0.0 { t = volume_hit.distance; is_volume = true; }\n    if ground_t > 0.0 && ground_t < t { t = ground_t; is_volume = false; }\n\n    if t > 1e5f { return background; }\n\n    let hit_point = ray.origin + ray.direction * t;\n    let light_vec = light_pos - hit_point;\n    let light_dir = normalize(light_vec);\n    let light_dist = length(light_vec);\n\n    if is_volume {\n        let diffuse = max(dot(volume_hit.normal, light_dir), 0.0);\n        \n        // Use the optimized occlusion check for shadows\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + volume_hit.normal * 0.1, 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let shadow = select(1.0, 0.3, in_shadow);\n        return vec3f(0.2, 0.5, 1.0) * (0.15 + diffuse * shadow * 0.8);\n    } else {\n        // Simple ground shadow\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + vec3f(0, 0.1, 0), 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let fade = 1.0 - smoothstep(20.0, 30.0, length(hit_point.xz));\n        return mix(background, vec3f(0.3), select(0.0, fade * 0.7, in_shadow));\n    }\n}\n\nfn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {\n    // Convert to normalized coordinates [-1, 1]\n    let uv = (screen_coord / screen_size) * 2.0 - 1.0;\n    \n    // Calculate aspect ratio\n    let aspect_ratio = screen_size.x / screen_size.y;\n\n    // Extract camera basis vectors from view matrix\n    let right: vec3f = input.camera_matrix[0].xyz;\n    let up: vec3f = input.camera_matrix[1].xyz;\n    let forward: vec3f = -input.camera_matrix[2].xyz;\n\n    // Extract camera position\n    let camera_pos: vec3f = input.camera_matrix[3].xyz;\n    \n    // Calculate ray direction\n    let ray_direction = normalize(\n        forward + uv.x * right * aspect_ratio * input.fov_scale + uv.y * up * input.fov_scale\n    );\n    return Ray(camera_pos, ray_direction);\n}\n\n@compute @workgroup_size(16, 16)\nfn computeMain(@builtin(global_invocation_id) global_id: vec3u) {\n    let screen_size = textureDimensions(outputTexture);\n    \n    // Early exit for out-of-bounds threads\n    if global_id.x >= screen_size.x || global_id.y >= screen_size.y {\n        return;\n    }\n\n    // Generate ray\n    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5, vec2f(screen_size));\n    \n    // Raymarching using scene graph\n    let color = raymarch_scene_graph(ray);\n    \n    // Write result\n    textureStore(outputTexture, global_id.xy, vec4f(color, 1.0));\n}\n";
 
 // ../picovdb.wgsl
-var picovdb_default = "\n//@group(0) @binding(0) var<storage> picovdb_grids: array<PicoVDBGrid>;\n//@group(0) @binding(1) var<storage> picovdb_roots: array<PicoVDBRoot>;\n//@group(0) @binding(2) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n//@group(0) @binding(3) var<storage> picovdb_lowers: array<PicoVDBLower>;\n//@group(0) @binding(4) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n//@group(0) @binding(5) var<storage> picovdb_buffer: array<u32>;\n\nstruct PicoVDBFileHeader {\n  magic: vec2u,    // 'PicoVDB0' little endian (8 bytes)\n  version: u32,    // Format version (4 bytes)\n  gridCount: u32,  // Number of grids (4 bytes)\n  upperCount: u32, // Total upper nodes (4 bytes)\n  lowerCount: u32, // Total lower nodes (4 bytes)\n  leafCount: u32,  // Total leaf nodes (4 bytes)\n  dataCount: u32,  // Total data buffer size in 16-byte units (4 bytes)\n}\n\nstruct PicoVDBGrid {\n  gridIndex: u32,     // This grid's index (4 bytes)\n  upperStart: u32,    // Index into uppers array (= root index) (4 bytes)\n  lowerStart: u32,    // Index into lowers array (4 bytes)\n  leafStart: u32,     // Index into leaves array (4 bytes)\n  dataStart: u32,     // 16-byte index into data buffer (4 bytes)\n  dataElemCount: u32, // Number of data elements for this grid (4 bytes)\n  gridType: u32,      // GRID_TYPE_SDF_FLOAT=1, GRID_TYPE_SDF_UINT8=2 (4 bytes)\n  _pad1: u32,\n  indexBoundsMin: vec3i, // Index min (12 bytes)\n  _pad2: u32,\n  indexBoundsMax: vec3i, // Index min (12 bytes)\n  _pad3: u32,\n}\n\nconst GRID_TYPE_SDF_FLOAT = 1;\nconst GRID_TYPE_SDF_UINT8 = 2;\n\n// https://webgpufundamentals.org/webgpu/lessons/resources/wgsl-offset-computer.html\n\n// Root key for spatial lookup - maps coordinate to upper node index.\n// Roots are 1:1 with uppers (root[i] -> upper[i]).\n// Count derived from upperCount. Padded to 16-byte alignment.\nstruct PicoVDBRoot {\n  key: vec2u,  // 64-bit coordinate key (8 bytes)\n}\n\nstruct PicoVDBNodeMask {\n  inside: u32,      // Bitmask of outside/inside (+/-) (4 bytes)\n  value: u32,       // Bitmask of value, inside && value set this is a child (4 bytes)\n  valueOffset: u32, // Prefix sum offset of value (4 bytes)\n  childOffset: u32, // Prefix sum offset of child (4 bytes)\n}\n\nstruct PicoVDBLeafMask{\n  inside: u32,      // Bitmask of outside/inside (+/-) (4 bytes)\n  value: u32,       // Bifmask of value, inside && value always is 0 (4 bytes)\n  valueOffset: u32, // Prefix sum offset of value (4 bytes)\n}\n\nstruct PicoVDBUpper {\n  mask: array<PicoVDBNodeMask,1024>,\n}\n\nstruct PicoVDBLower {\n  mask: array<PicoVDBNodeMask,128>,\n}\n\nstruct PicoVDBLeaf {\n  mask: array<PicoVDBLeafMask,16>,\n}\n\nstruct PicoVDBLevelCount {\n    level: u32,  // Level of value found\n    count: u32,  // Count offset (0 means no active values/background)\n}\n\nstruct PicoVDBReadAccessor {\n  key: vec3i,\n  grid: u32,\n  upper: u32,\n  lower: u32,\n  leaf: u32,\n  _pad: u32,\n}\n\nconst PICOVDB_INVALID_INDEX: u32 = 0xFFFFFFFFu;\n\nfn picovdbReadAccessorInit(acc: ptr<function, PicoVDBReadAccessor>, grid: u32) {\n    (*acc).key = vec3i(0x7FFFFFFF);\n    (*acc).grid = grid;\n    (*acc).upper = PICOVDB_INVALID_INDEX;\n    (*acc).lower = PICOVDB_INVALID_INDEX;\n    (*acc).leaf = PICOVDB_INVALID_INDEX;\n    (*acc)._pad = 0u;\n}\n\nfn picovdbReadAccessorIsCachedLeaf(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {\n    let addr = (*acc).leaf;\n    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0x7i) == 0; // Leaf is 8x8x8 (bits 0-2)\n    (*acc).leaf = select(PICOVDB_INVALID_INDEX, addr, is_cached);\n    return is_cached;\n}\n\nfn picovdbReadAccessorIsCachedLower(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {\n    let addr = (*acc).lower;\n    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0x7Fi) == 0; // Lower is 128x128x128 (bits 0-6)\n    (*acc).lower = select(PICOVDB_INVALID_INDEX, addr, is_cached);\n    return is_cached;\n}\n\nfn picovdbReadAccessorIsCachedUpper(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {\n    let addr = (*acc).upper;\n    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0xFFFi) == 0; // Upper is 4096x4096x4096 (bits 0-11)\n    (*acc).upper = select(PICOVDB_INVALID_INDEX, addr, is_cached);\n    return is_cached;\n}\n\nfn picovdbReadAccessorComputeDirty(acc: ptr<function, PicoVDBReadAccessor>, ijk: vec3i) -> i32 {\n    return (ijk.x ^ (*acc).key.x) | (ijk.y ^ (*acc).key.y) | (ijk.z ^ (*acc).key.z);\n}\n\nfn picovdbCoordToKey(ijk: vec3i) -> vec2u {\n    // Use the non-native 64-bit path since WGSL doesn't have native 64-bit\n    let iu = u32(ijk.x) >> 12u;\n    let ju = u32(ijk.y) >> 12u;\n    let ku = u32(ijk.z) >> 12u;\n    let key_x = ku | (ju << 21u);\n    let key_y = (iu << 10u) | (ju >> 11u);\n    return vec2u(key_x, key_y);\n}\n\nfn picovdbUpperCoordToOffset(ijk: vec3i) -> u32 {\n    return (((u32(ijk.x) & 0xFFFu) >> 7u) << 10u) |\n           (((u32(ijk.y) & 0xFFFu) >> 7u) << 5u)  |\n            ((u32(ijk.z) & 0xFFFu) >> 7u);\n}\n\nfn picovdbLowerCoordToOffset(ijk: vec3i) -> u32 {\n    return (((u32(ijk.x) & 0x7Fu) >> 3u) << 8u) |\n           (((u32(ijk.y) & 0x7Fu) >> 3u) << 4u) |\n            ((u32(ijk.z) & 0x7Fu) >> 3u);\n}\n\nfn picovdbLeafCoordToOffset(ijk: vec3i) -> u32 {\n    return ((u32(ijk.x) & 0x7u) << 6u) |\n           ((u32(ijk.y) & 0x7u) << 3u) |\n            (u32(ijk.z) & 0x7u);\n}\n\n\n// Find root/upper index for coordinate within grid bounds.\n// Roots are 1:1 with uppers, so the returned index works for both.\nfn picovdbReadAccessorFindUpperIndex(\n    ijk: vec3i,\n    grid: PicoVDBGrid,\n) -> i32 {\n    let coordKey = picovdbCoordToKey(ijk);\n    let startIndex = grid.upperStart;\n    let endIndex = select(\n      picovdb_grids[grid.gridIndex + 1u].upperStart, // false: use next grid's start\n      arrayLength(&picovdb_roots),                   // true: use total roots count\n      arrayLength(&picovdb_grids) - 1u == grid.gridIndex,\n    );\n    for (var i = startIndex; i < endIndex; i++) {\n        let root = picovdb_roots[i];\n        if (coordKey.x == root.key.x && coordKey.y == root.key.y) {\n            return i32(i);\n        }\n    }\n    return -1; // Not found\n}\n\nfn picovdbReadAccessorLeafGetLevelCountAndCache(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    ijk: vec3i,\n    grid: PicoVDBGrid,\n) -> PicoVDBLevelCount {\n    let n = picovdbLeafCoordToOffset(ijk);\n    let word_index = n >> 5u; // Fast divide by 32\n    let bit_index = n & 31u; // Fast modulo 32\n    let mask = picovdb_leaves[grid.leafStart + (*acc).leaf].mask[word_index];\n\n    let bit_at_pos = 1u << bit_index;\n    let is_value = (mask.value & bit_at_pos) != 0u;\n    let is_inside = (mask.inside & bit_at_pos) != 0u;\n    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);\n    let count = select(\n        u32(is_inside),\n        mask.valueOffset + countOneBits(preceding_bits),\n        is_value,\n    );\n    (*acc).key = ijk;\n    return PicoVDBLevelCount(0u, count);\n}\n\nfn picovdbReadAccessorLowerGetLevelCountAndCache(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    ijk: vec3i,\n    grid: PicoVDBGrid,\n) -> PicoVDBLevelCount {\n    let n = picovdbLowerCoordToOffset(ijk);\n    let word_index = n >> 5u; // Fast divide by 32\n    let bit_index = n & 31u; // Fast modulo 32\n    let mask = picovdb_lowers[grid.lowerStart + (*acc).lower].mask[word_index];\n\n    let bit_at_pos = 1u << bit_index;\n    let is_value = (mask.value & bit_at_pos) != 0u;\n    let is_inside = (mask.inside & bit_at_pos) != 0u;\n\n    if (is_value && is_inside) {\n        let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);\n        (*acc).leaf = mask.childOffset + countOneBits(preceding_bits);\n        (*acc).key = ijk;\n        return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);\n    }\n    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);\n    let count = select(\n        u32(is_inside),\n        mask.valueOffset + countOneBits(preceding_bits),\n        is_value,\n    );\n    return PicoVDBLevelCount(1u, count);\n}\n\nfn picovdbReadAccessorUpperGetLevelCountAndCache(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    ijk: vec3i,\n    grid: PicoVDBGrid,\n) -> PicoVDBLevelCount {\n    let n = picovdbUpperCoordToOffset(ijk);\n    let word_index = n >> 5u; // Fast divide by 32\n    let bit_index = n & 31u; // Fast modulo 32\n    let mask = picovdb_uppers[grid.upperStart + (*acc).upper].mask[word_index];\n\n    let bit_at_pos = 1u << bit_index;\n    let is_value = (mask.value & bit_at_pos) != 0u;\n    let is_inside = (mask.inside & bit_at_pos) != 0u;\n\n    if (is_value && is_inside) {\n        let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);\n        (*acc).lower = mask.childOffset + countOneBits(preceding_bits);\n        (*acc).key = ijk;\n        return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);\n    }\n    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);\n    let count = select(\n        u32(is_inside),\n        mask.valueOffset + countOneBits(preceding_bits),\n        is_value,\n    );\n    return PicoVDBLevelCount(2u, count);\n}\n\n// Get level and count from root and update cache\nfn picovdbReadAccessorRootGetLevelCountAndCache(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    ijk: vec3i,\n    grid: PicoVDBGrid,\n) -> PicoVDBLevelCount {\n    let rootIndex = picovdbReadAccessorFindUpperIndex(ijk, grid);\n    if (rootIndex == -1) {\n        // No matching root tile, return background\n        return PicoVDBLevelCount(3u, 0u);\n    }\n    (*acc).upper = u32(rootIndex);\n    (*acc).key = ijk;\n    return picovdbReadAccessorUpperGetLevelCountAndCache(acc, ijk, grid);\n}\n\nfn picovdbReadAccessorGetLevelCount(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    ijk: vec3i,\n    grid: PicoVDBGrid,\n) -> PicoVDBLevelCount {\n    let dirty = picovdbReadAccessorComputeDirty(acc, ijk);\n    \n    if (picovdbReadAccessorIsCachedLeaf(acc, dirty)) {\n        return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);\n    } else if (picovdbReadAccessorIsCachedLower(acc, dirty)) {\n        return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);\n    } else if (picovdbReadAccessorIsCachedUpper(acc, dirty)) {\n        return picovdbReadAccessorUpperGetLevelCountAndCache(acc, ijk, grid);\n    } else {\n        return picovdbReadAccessorRootGetLevelCountAndCache(acc, ijk, grid);\n    }\n}\n\n// --- HDDA (Hierarchical Digital Differential Analyzer) ---\nconst PICOVDB_HDDA_FLOAT_MAX: f32 = 1e38;\n\nstruct PicoVDBHDDA {\n    dim: i32,\n    tmin: f32,\n    tmax: f32,\n    voxel: vec3i,\n    step: vec3i,\n    inv_dir: vec3f,\n    delta: vec3f,\n    next: vec3f,\n}\n\nfn picovdbHDDAPosToIjk(pos: vec3f) -> vec3i {\n    return vec3i(floor(pos));\n}\n\nfn picovdbHDDAPosToVoxel(pos: vec3f, dim: i32) -> vec3i {\n    let mask = ~(dim - 1);\n    return vec3i(floor(pos)) & vec3i(mask);\n}\n\nfn picovdbHDDARayStart(origin: vec3f, tmin: f32, direction: vec3f) -> vec3f {\n    return origin + direction * tmin;\n}\n\nfn picovdbHDDAInit(\n    hdda: ptr<function, PicoVDBHDDA>,\n    origin: vec3f,\n    tmin: f32,\n    direction: vec3f,\n    tmax: f32,\n    dim: i32\n) {\n    let dir_inv = 1.0 / direction;\n    let pos = origin + direction * tmin;\n    let vox = picovdbHDDAPosToVoxel(pos, dim);\n\n    (*hdda).dim = dim;\n    (*hdda).tmin = tmin;\n    (*hdda).tmax = tmax;\n    (*hdda).voxel = vox;\n    (*hdda).inv_dir = dir_inv;\n    (*hdda).step = vec3i(sign(direction));\n    (*hdda).delta = abs(f32(dim) * dir_inv); // Pre-multiply delta by dim\n\n    let boundary = select(vec3f(vox), vec3f(vox + vec3i(dim)), direction > vec3f(0.0));\n\n    // Safety: handle cases where direction is 0 to avoid NaNs\n    (*hdda).next = select(\n        tmin + (boundary - pos) * dir_inv,\n        vec3f(PICOVDB_HDDA_FLOAT_MAX),\n        direction == vec3f(0.0)\n    );\n}\n\n// Update HDDA to switch hierarchical level\nfn picovdbHDDAUpdate(\n    hdda: ptr<function, PicoVDBHDDA>,\n    origin: vec3f,\n    direction: vec3f,\n    dim: i32\n) {\n    (*hdda).dim = dim;\n    (*hdda).delta = abs(f32(dim) * (*hdda).inv_dir);\n\n    // Re-calculate position at the exact current tmin plus a safety nudge\n    let eps = max(1e-4f, (*hdda).tmin * 1e-7f);\n    let pos = origin + direction * ((*hdda).tmin + eps);\n\n    // Crucial: Re-mask the voxel to the new dimension\n    (*hdda).voxel = picovdbHDDAPosToVoxel(pos, dim);\n\n    // Re-calculate next boundary for the new grid scale\n    let boundary = select(vec3f((*hdda).voxel), vec3f((*hdda).voxel + vec3i(dim)), direction > vec3f(0.0));\n    let t_to_boundary = (boundary - (origin + direction * (*hdda).tmin)) * (*hdda).inv_dir;\n\n    // Ensure the next step is always forward\n    (*hdda).next = (*hdda).tmin + max(t_to_boundary, vec3f(eps));\n}\n\nfn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {\n    // Determine which axis has the nearest boundary\n    let next = (*hdda).next;\n    if (next.x < next.y && next.x < next.z) { // X is smallest\n        (*hdda).tmin = (*hdda).next.x;\n        (*hdda).next.x += (*hdda).delta.x;\n        (*hdda).voxel.x += (*hdda).dim * (*hdda).step.x;\n    } else if (next.y < next.z) { // Y is smallest\n        (*hdda).tmin = (*hdda).next.y;\n        (*hdda).next.y += (*hdda).delta.y;\n        (*hdda).voxel.y += (*hdda).dim * (*hdda).step.y;\n    } else { // Z is smallest\n        (*hdda).tmin = (*hdda).next.z;\n        (*hdda).next.z += (*hdda).delta.z;\n        (*hdda).voxel.z += (*hdda).dim * (*hdda).step.z;\n    }\n    return (*hdda).tmin <= (*hdda).tmax;\n}\n\n// Clip ray to bounding box\nfn picovdbHDDARayClip(\n    bbox_min: vec3f,\n    bbox_max: vec3f,\n    origin: vec3f,\n    tmin: ptr<function, f32>,\n    direction: vec3f,\n    tmax: ptr<function, f32>\n) -> bool {\n    let dir_inv = 1.0 / direction;\n    let t0 = (bbox_min - origin) * dir_inv;\n    let t1 = (bbox_max - origin) * dir_inv;\n    let tmin3 = min(t0, t1);\n    let tmax3 = max(t0, t1);\n    let tnear = max(tmin3.x, max(tmin3.y, tmin3.z));\n    let tfar = min(tmax3.x, min(tmax3.y, tmax3.z));\n    let hit = tnear <= tfar;\n    *tmin = max(*tmin, tnear);\n    *tmax = min(*tmax, tfar);\n    return hit;\n}\n\n// Dimension based on level (for HDDA stepping)\n// Level 0 (Leaf) -> 1\n// Level 1 (Lower) -> 8 (2^3)\n// Level 2 (Upper) -> 128 (2^7)\n// Level 3 (Root) -> 4096 (2^12)\nconst picovdbDimForLevel = array(1, 8, 128, 4096);\n\n// Check if voxel is active (count > 1 means has value)\nfn picovdbIsActive(level_count: PicoVDBLevelCount) -> bool {\n    return level_count.count > 1u;\n}\n// Get float value from data buffer using grid offset and value index\nfn picovdbGetValue(grid: PicoVDBGrid, count: u32) -> f32 {\n    // dataStart is in 16-byte units, multiply by 4 to get u32 index (16 bytes = 4 u32s)\n    let u32Index = grid.dataStart * 4u + count;\n    return bitcast<f32>(picovdb_buffer[u32Index]);\n}\n\n// Zero-crossing detection for level set raymarching\nfn picovdbHDDAZeroCrossing(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    grid: PicoVDBGrid,\n    origin: vec3f,\n    tmin: f32,\n    direction: vec3f,\n    tmax: f32,\n    thit: ptr<function, f32>,\n    v: ptr<function, f32>\n) -> bool {\n    var tmin_mut = tmin;\n    var tmax_mut = tmax;\n    \n    // Clip to bounding box\n    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction, &tmax_mut)) {\n        return false;\n    }\n\n    // Get initial hierarchy level\n    let start_pos = origin + direction * tmin_mut;\n    let res0 = picovdbReadAccessorGetLevelCount(acc, vec3i(floor(start_pos)), grid);\n    let v0 = picovdbGetValue(grid, res0.count);\n    \n    var hdda: PicoVDBHDDA;\n    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, picovdbDimForLevel[res0.level]);\n\n    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety\n        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);\n        let target_dim = picovdbDimForLevel[result.level];\n\n        // If hierarchy changed, update HDDA and re-read\n        if (hdda.dim != target_dim) {\n            picovdbHDDAUpdate(&hdda, origin, direction, target_dim);\n            continue; // Re-evaluate with the new aligned voxel\n        }\n\n        // Leaf level logic (Surface detection)\n        if (hdda.dim == 1 && picovdbIsActive(result)) {\n            let val = picovdbGetValue(grid, result.count);\n            if (val * v0 < 0.0) {\n                *thit = hdda.tmin;\n                *v = val;\n                return true;\n            }\n            // Optional: v0 = val; // Update previous value for continuous crossing\n        }\n\n        // Step to next boundary\n        if (!picovdbHDDAStep(&hdda)) { break; }\n    }\n    return false;\n}\n\nstruct PicoVDBStencil {\n    v000: f32, v001: f32, v010: f32, v011: f32,\n    v100: f32, v101: f32, v110: f32, v111: f32,\n}\n\n// Sample 2x2x2 stencil of voxel values around a point\nfn picovdbSampleStencil(\n    acc: ptr<function, PicoVDBReadAccessor>,\n    grid: PicoVDBGrid,\n    ijk: vec3i\n) -> PicoVDBStencil {\n    var s: PicoVDBStencil;\n    s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 0), grid).count);\n    s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);\n    s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);\n    s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);\n    s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 0), grid).count);\n    s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);\n    s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 0), grid).count);\n    s.v111 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 1), grid).count);\n    return s;\n}\n\n// Compute trilinear gradient from 2x2x2 stencil\nfn picovdbTrilinearGradient(uvw: vec3f, s: PicoVDBStencil) -> vec3f {\n    // Interpolate values along Z for the four XY columns\n    let v00z = mix(s.v000, s.v001, uvw.z);\n    let v01z = mix(s.v010, s.v011, uvw.z);\n    let v10z = mix(s.v100, s.v101, uvw.z);\n    let v11z = mix(s.v110, s.v111, uvw.z);\n\n    // Interpolate values along Y for the two X slabs\n    let v0yz = mix(v00z, v01z, uvw.y);\n    let v1yz = mix(v10z, v11z, uvw.y);\n\n    // X Gradient: Difference between the two YZ-interpolated slabs\n    let grad_x = v1yz - v0yz;\n\n    // Y Gradient: Interpolate the differences along X\n    let grad_y = mix(v01z - v00z, v11z - v10z, uvw.x);\n\n    // Z Gradient: Interpolate the differences along X and Y\n    let dZ00 = s.v001 - s.v000;\n    let dZ01 = s.v011 - s.v010;\n    let dZ10 = s.v101 - s.v100;\n    let dZ11 = s.v111 - s.v110;\n    let grad_z = mix(mix(dZ00, dZ01, uvw.y), mix(dZ10, dZ11, uvw.y), uvw.x);\n\n    return vec3f(grad_x, grad_y, grad_z);\n}\n\n// Trilinear interpolation of a value at position uvw within a voxel stencil\nfn picovdbTrilinearInterpolation(uvw: vec3f, s: PicoVDBStencil) -> f32 {\n    // Interpolate along Z\n    let v00 = mix(s.v000, s.v001, uvw.z);\n    let v01 = mix(s.v010, s.v011, uvw.z);\n    let v10 = mix(s.v100, s.v101, uvw.z);\n    let v11 = mix(s.v110, s.v111, uvw.z);\n    \n    // Interpolate along Y\n    let v0 = mix(v00, v01, uvw.y);\n    let v1 = mix(v10, v11, uvw.y);\n    \n    // Interpolate along X\n    return mix(v0, v1, uvw.x);\n}\n";
+var picovdb_default = `
+//@group(0) @binding(0) var<storage> picovdb_grids: array<PicoVDBGrid>;
+//@group(0) @binding(1) var<storage> picovdb_roots: array<PicoVDBRoot>;
+//@group(0) @binding(2) var<storage> picovdb_uppers: array<PicoVDBUpper>;
+//@group(0) @binding(3) var<storage> picovdb_lowers: array<PicoVDBLower>;
+//@group(0) @binding(4) var<storage> picovdb_leaves: array<PicoVDBLeaf>;
+//@group(0) @binding(5) var<storage> picovdb_buffer: array<u32>;
+
+struct PicoVDBFileHeader {
+  magic: vec2u,    // 'PicoVDB0' little endian (8 bytes)
+  version: u32,    // Format version (4 bytes)
+  gridCount: u32,  // Number of grids (4 bytes)
+  upperCount: u32, // Total upper nodes (4 bytes)
+  lowerCount: u32, // Total lower nodes (4 bytes)
+  leafCount: u32,  // Total leaf nodes (4 bytes)
+  dataCount: u32,  // Total data buffer size in 16-byte units (4 bytes)
+}
+
+struct PicoVDBGrid {
+  gridIndex: u32,     // This grid's index (4 bytes)
+  upperStart: u32,    // Index into uppers array (= root index) (4 bytes)
+  lowerStart: u32,    // Index into lowers array (4 bytes)
+  leafStart: u32,     // Index into leaves array (4 bytes)
+  dataStart: u32,     // 16-byte index into data buffer (4 bytes)
+  dataElemCount: u32, // Number of data elements for this grid (4 bytes)
+  gridType: u32,      // GRID_TYPE_SDF_FLOAT=1, GRID_TYPE_SDF_UINT8=2 (4 bytes)
+  _pad1: u32,
+  indexBoundsMin: vec3i, // Index min (12 bytes)
+  _pad2: u32,
+  indexBoundsMax: vec3i, // Index min (12 bytes)
+  _pad3: u32,
+}
+
+const GRID_TYPE_SDF_FLOAT = 1;
+const GRID_TYPE_SDF_UINT8 = 2;
+
+// https://webgpufundamentals.org/webgpu/lessons/resources/wgsl-offset-computer.html
+
+// Root key for spatial lookup - maps coordinate to upper node index.
+// Roots are 1:1 with uppers (root[i] -> upper[i]).
+// Count derived from upperCount. Padded to 16-byte alignment.
+struct PicoVDBRoot {
+  key: vec2u,  // 64-bit coordinate key (8 bytes)
+}
+
+struct PicoVDBNodeMask {
+  inside: u32,      // Bitmask of outside/inside (+/-) (4 bytes)
+  value: u32,       // Bitmask of value, inside && value set this is a child (4 bytes)
+  valueOffset: u32, // Prefix sum offset of value (4 bytes)
+  childOffset: u32, // Prefix sum offset of child (4 bytes)
+}
+
+struct PicoVDBLeafMask{
+  inside: u32,      // Bitmask of outside/inside (+/-) (4 bytes)
+  value: u32,       // Bifmask of value, inside && value always is 0 (4 bytes)
+  valueOffset: u32, // Prefix sum offset of value (4 bytes)
+}
+
+struct PicoVDBUpper {
+  mask: array<PicoVDBNodeMask,1024>,
+}
+
+struct PicoVDBLower {
+  mask: array<PicoVDBNodeMask,128>,
+}
+
+struct PicoVDBLeaf {
+  mask: array<PicoVDBLeafMask,16>,
+}
+
+struct PicoVDBLevelCount {
+    level: u32,  // Level of value found
+    count: u32,  // Count offset (0 means no active values/background)
+}
+
+struct PicoVDBReadAccessor {
+  key: vec3i,
+  grid: u32,
+  upper: u32,
+  lower: u32,
+  leaf: u32,
+  _pad: u32,
+}
+
+const PICOVDB_INVALID_INDEX: u32 = 0xFFFFFFFFu;
+
+fn picovdbReadAccessorInit(acc: ptr<function, PicoVDBReadAccessor>, grid: u32) {
+    (*acc).key = vec3i(0x7FFFFFFF);
+    (*acc).grid = grid;
+    (*acc).upper = PICOVDB_INVALID_INDEX;
+    (*acc).lower = PICOVDB_INVALID_INDEX;
+    (*acc).leaf = PICOVDB_INVALID_INDEX;
+    (*acc)._pad = 0u;
+}
+
+fn picovdbReadAccessorIsCachedLeaf(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {
+    let addr = (*acc).leaf;
+    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0x7i) == 0; // Leaf is 8x8x8 (bits 0-2)
+    (*acc).leaf = select(PICOVDB_INVALID_INDEX, addr, is_cached);
+    return is_cached;
+}
+
+fn picovdbReadAccessorIsCachedLower(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {
+    let addr = (*acc).lower;
+    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0x7Fi) == 0; // Lower is 128x128x128 (bits 0-6)
+    (*acc).lower = select(PICOVDB_INVALID_INDEX, addr, is_cached);
+    return is_cached;
+}
+
+fn picovdbReadAccessorIsCachedUpper(acc: ptr<function, PicoVDBReadAccessor>, dirty: i32) -> bool {
+    let addr = (*acc).upper;
+    let is_cached = (addr != PICOVDB_INVALID_INDEX) && (dirty & ~0xFFFi) == 0; // Upper is 4096x4096x4096 (bits 0-11)
+    (*acc).upper = select(PICOVDB_INVALID_INDEX, addr, is_cached);
+    return is_cached;
+}
+
+fn picovdbReadAccessorComputeDirty(acc: ptr<function, PicoVDBReadAccessor>, ijk: vec3i) -> i32 {
+    return (ijk.x ^ (*acc).key.x) | (ijk.y ^ (*acc).key.y) | (ijk.z ^ (*acc).key.z);
+}
+
+fn picovdbCoordToKey(ijk: vec3i) -> vec2u {
+    // Use the non-native 64-bit path since WGSL doesn't have native 64-bit
+    let iu = u32(ijk.x) >> 12u;
+    let ju = u32(ijk.y) >> 12u;
+    let ku = u32(ijk.z) >> 12u;
+    let key_x = ku | (ju << 21u);
+    let key_y = (iu << 10u) | (ju >> 11u);
+    return vec2u(key_x, key_y);
+}
+
+fn picovdbUpperCoordToOffset(ijk: vec3i) -> u32 {
+    return (((u32(ijk.x) & 0xFFFu) >> 7u) << 10u) |
+           (((u32(ijk.y) & 0xFFFu) >> 7u) << 5u)  |
+            ((u32(ijk.z) & 0xFFFu) >> 7u);
+}
+
+fn picovdbLowerCoordToOffset(ijk: vec3i) -> u32 {
+    return (((u32(ijk.x) & 0x7Fu) >> 3u) << 8u) |
+           (((u32(ijk.y) & 0x7Fu) >> 3u) << 4u) |
+            ((u32(ijk.z) & 0x7Fu) >> 3u);
+}
+
+fn picovdbLeafCoordToOffset(ijk: vec3i) -> u32 {
+    return ((u32(ijk.x) & 0x7u) << 6u) |
+           ((u32(ijk.y) & 0x7u) << 3u) |
+            (u32(ijk.z) & 0x7u);
+}
+
+
+// Find root/upper index for coordinate within grid bounds.
+// Roots are 1:1 with uppers, so the returned index works for both.
+fn picovdbReadAccessorFindUpperIndex(
+    ijk: vec3i,
+    grid: PicoVDBGrid,
+) -> i32 {
+    let coordKey = picovdbCoordToKey(ijk);
+    let startIndex = grid.upperStart;
+    let endIndex = select(
+      picovdb_grids[grid.gridIndex + 1u].upperStart, // false: use next grid's start
+      arrayLength(&picovdb_roots),                   // true: use total roots count
+      arrayLength(&picovdb_grids) - 1u == grid.gridIndex,
+    );
+    for (var i = startIndex; i < endIndex; i++) {
+        let root = picovdb_roots[i];
+        if (coordKey.x == root.key.x && coordKey.y == root.key.y) {
+            return i32(i);
+        }
+    }
+    return -1; // Not found
+}
+
+fn picovdbReadAccessorLeafGetLevelCountAndCache(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    ijk: vec3i,
+    grid: PicoVDBGrid,
+) -> PicoVDBLevelCount {
+    let n = picovdbLeafCoordToOffset(ijk);
+    let word_index = n >> 5u; // Fast divide by 32
+    let bit_index = n & 31u; // Fast modulo 32
+    let mask = picovdb_leaves[grid.leafStart + (*acc).leaf].mask[word_index];
+
+    let bit_at_pos = 1u << bit_index;
+    let is_value = (mask.value & bit_at_pos) != 0u;
+    let is_inside = (mask.inside & bit_at_pos) != 0u;
+    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
+    let count = select(
+        u32(is_inside),
+        mask.valueOffset + countOneBits(preceding_bits),
+        is_value,
+    );
+    (*acc).key = ijk;
+    return PicoVDBLevelCount(0u, count);
+}
+
+fn picovdbReadAccessorLowerGetLevelCountAndCache(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    ijk: vec3i,
+    grid: PicoVDBGrid,
+) -> PicoVDBLevelCount {
+    let n = picovdbLowerCoordToOffset(ijk);
+    let word_index = n >> 5u; // Fast divide by 32
+    let bit_index = n & 31u; // Fast modulo 32
+    let mask = picovdb_lowers[grid.lowerStart + (*acc).lower].mask[word_index];
+
+    let bit_at_pos = 1u << bit_index;
+    let is_value = (mask.value & bit_at_pos) != 0u;
+    let is_inside = (mask.inside & bit_at_pos) != 0u;
+
+    if (is_value && is_inside) {
+        let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
+        (*acc).leaf = mask.childOffset + countOneBits(preceding_bits);
+        (*acc).key = ijk;
+        return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);
+    }
+    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
+    let count = select(
+        u32(is_inside),
+        mask.valueOffset + countOneBits(preceding_bits),
+        is_value,
+    );
+    return PicoVDBLevelCount(1u, count);
+}
+
+fn picovdbReadAccessorUpperGetLevelCountAndCache(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    ijk: vec3i,
+    grid: PicoVDBGrid,
+) -> PicoVDBLevelCount {
+    let n = picovdbUpperCoordToOffset(ijk);
+    let word_index = n >> 5u; // Fast divide by 32
+    let bit_index = n & 31u; // Fast modulo 32
+    let mask = picovdb_uppers[grid.upperStart + (*acc).upper].mask[word_index];
+
+    let bit_at_pos = 1u << bit_index;
+    let is_value = (mask.value & bit_at_pos) != 0u;
+    let is_inside = (mask.inside & bit_at_pos) != 0u;
+
+    if (is_value && is_inside) {
+        let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
+        (*acc).lower = mask.childOffset + countOneBits(preceding_bits);
+        (*acc).key = ijk;
+        return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);
+    }
+    let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
+    let count = select(
+        u32(is_inside),
+        mask.valueOffset + countOneBits(preceding_bits),
+        is_value,
+    );
+    return PicoVDBLevelCount(2u, count);
+}
+
+// Get level and count from root and update cache
+fn picovdbReadAccessorRootGetLevelCountAndCache(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    ijk: vec3i,
+    grid: PicoVDBGrid,
+) -> PicoVDBLevelCount {
+    let rootIndex = picovdbReadAccessorFindUpperIndex(ijk, grid);
+    if (rootIndex == -1) {
+        // No matching root tile, return background
+        return PicoVDBLevelCount(3u, 0u);
+    }
+    (*acc).upper = u32(rootIndex);
+    (*acc).key = ijk;
+    return picovdbReadAccessorUpperGetLevelCountAndCache(acc, ijk, grid);
+}
+
+fn picovdbReadAccessorGetLevelCount(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    ijk: vec3i,
+    grid: PicoVDBGrid,
+) -> PicoVDBLevelCount {
+    let dirty = picovdbReadAccessorComputeDirty(acc, ijk);
+    
+    if (picovdbReadAccessorIsCachedLeaf(acc, dirty)) {
+        return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);
+    } else if (picovdbReadAccessorIsCachedLower(acc, dirty)) {
+        return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);
+    } else if (picovdbReadAccessorIsCachedUpper(acc, dirty)) {
+        return picovdbReadAccessorUpperGetLevelCountAndCache(acc, ijk, grid);
+    } else {
+        return picovdbReadAccessorRootGetLevelCountAndCache(acc, ijk, grid);
+    }
+}
+
+// --- HDDA (Hierarchical Digital Differential Analyzer) ---
+const PICOVDB_HDDA_FLOAT_MAX: f32 = 1e38;
+
+struct PicoVDBHDDA {
+    voxel: vec3i,
+    dim: i32,
+    step: vec3i,
+    tmin: f32,
+    delta: vec3f,
+    tmax: f32,
+    next: vec3f,
+}
+
+fn picovdbHDDAPosToVoxel(pos: vec3f, dim: i32) -> vec3i {
+    let mask = ~(dim - 1);
+    return vec3i(floor(pos)) & vec3i(mask);
+}
+
+fn picovdbHDDAInit(
+    hdda: ptr<function, PicoVDBHDDA>,
+    origin: vec3f,
+    tmin: f32,
+    direction: vec3f,
+    tmax: f32,
+    direction_inv: vec3f,
+    dim: i32
+) {
+    let pos = origin + direction * tmin;
+    let vox = picovdbHDDAPosToVoxel(pos, dim);
+
+    (*hdda).dim = dim;
+    (*hdda).tmin = tmin;
+    (*hdda).tmax = tmax;
+    (*hdda).voxel = vox;
+    (*hdda).step = vec3i(sign(direction));
+    (*hdda).delta = abs(f32(dim) * direction_inv); // Pre-multiply delta by dim
+
+    let boundary = select(vec3f(vox), vec3f(vox + vec3i(dim)), direction > vec3f(0.0));
+
+    // Safety: handle cases where direction is 0 to avoid NaNs
+    (*hdda).next = select(
+        tmin + (boundary - pos) * direction_inv,
+        vec3f(PICOVDB_HDDA_FLOAT_MAX),
+        direction == vec3f(0.0)
+    );
+}
+
+// Update HDDA to switch hierarchical level
+fn picovdbHDDAUpdate(
+    hdda: ptr<function, PicoVDBHDDA>,
+    origin: vec3f,
+    dim: i32,
+    direction: vec3f,
+    direction_inv: vec3f,
+) {
+    (*hdda).dim = dim;
+    (*hdda).delta = abs(f32(dim) * direction_inv);
+
+    // Re-calculate position at the exact current tmin plus a safety nudge
+    let eps = max(1e-4f, (*hdda).tmin * 1e-7f);
+    let pos = origin + direction * ((*hdda).tmin + eps);
+
+    // Crucial: Re-mask the voxel to the new dimension
+    (*hdda).voxel = picovdbHDDAPosToVoxel(pos, dim);
+
+    // Re-calculate next boundary for the new grid scale
+    let boundary = select(vec3f((*hdda).voxel), vec3f((*hdda).voxel + vec3i(dim)), direction > vec3f(0.0));
+    let t_to_boundary = (boundary - (origin + direction * (*hdda).tmin)) * direction_inv;
+
+    // Ensure the next step is always forward
+    (*hdda).next = (*hdda).tmin + max(t_to_boundary, vec3f(eps));
+}
+
+fn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {
+    // Determine which axis has the nearest boundary
+    let next = (*hdda).next;
+    if (next.x < next.y && next.x < next.z) { // X is smallest
+        (*hdda).tmin = (*hdda).next.x;
+        (*hdda).next.x += (*hdda).delta.x;
+        (*hdda).voxel.x += (*hdda).dim * (*hdda).step.x;
+    } else if (next.y < next.z) { // Y is smallest
+        (*hdda).tmin = (*hdda).next.y;
+        (*hdda).next.y += (*hdda).delta.y;
+        (*hdda).voxel.y += (*hdda).dim * (*hdda).step.y;
+    } else { // Z is smallest
+        (*hdda).tmin = (*hdda).next.z;
+        (*hdda).next.z += (*hdda).delta.z;
+        (*hdda).voxel.z += (*hdda).dim * (*hdda).step.z;
+    }
+    return (*hdda).tmin <= (*hdda).tmax;
+}
+
+// Clip ray to bounding box
+fn picovdbHDDARayClip(
+    bbox_min: vec3f,
+    bbox_max: vec3f,
+    origin: vec3f,
+    tmin: ptr<function, f32>,
+    dir_inv: vec3f,
+    tmax: ptr<function, f32>
+) -> bool {
+    let t0 = (bbox_min - origin) * dir_inv;
+    let t1 = (bbox_max - origin) * dir_inv;
+    let tmin3 = min(t0, t1);
+    let tmax3 = max(t0, t1);
+    let tnear = max(tmin3.x, max(tmin3.y, tmin3.z));
+    let tfar = min(tmax3.x, min(tmax3.y, tmax3.z));
+    let hit = tnear <= tfar;
+    *tmin = max(*tmin, tnear);
+    *tmax = min(*tmax, tfar);
+    return hit;
+}
+
+// Dimension based on level (for HDDA stepping)
+// Level 0 (Leaf) -> 1
+// Level 1 (Lower) -> 8 (2^3)
+// Level 2 (Upper) -> 128 (2^7)
+// Level 3 (Root) -> 4096 (2^12)
+const picovdbDimForLevel = array(1, 8, 128, 4096);
+
+// Check if voxel is active (count > 1 means has value)
+fn picovdbIsActive(level_count: PicoVDBLevelCount) -> bool {
+    return level_count.count > 1u;
+}
+// Get float value from data buffer using grid offset and value index
+fn picovdbGetValue(grid: PicoVDBGrid, count: u32) -> f32 {
+    // dataStart is in 16-byte units, multiply by 4 to get u32 index (16 bytes = 4 u32s)
+    let u32Index = grid.dataStart * 4u + count;
+    return bitcast<f32>(picovdb_buffer[u32Index]);
+}
+
+// Zero-crossing detection for level set raymarching
+fn picovdbHDDAZeroCrossing(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    origin: vec3f,
+    tmin: f32,
+    direction: vec3f,
+    tmax: f32,
+    thit: ptr<function, f32>,
+    v: ptr<function, f32>
+) -> bool {
+    let direction_inv = 1 / direction;
+    var tmin_mut = tmin;
+    var tmax_mut = tmax;
+    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+        return false;
+    }
+
+    // Get initial hierarchy level
+    let start_pos = origin + direction * tmin_mut;
+    let res0 = picovdbReadAccessorGetLevelCount(acc, vec3i(floor(start_pos)), grid);
+    let v0 = picovdbGetValue(grid, res0.count);
+    
+    var hdda: PicoVDBHDDA;
+    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
+
+    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
+        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
+        let target_dim = picovdbDimForLevel[result.level];
+
+        // If hierarchy changed, update HDDA and re-read
+        if (hdda.dim != target_dim) {
+            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
+            continue; // Re-evaluate with the new aligned voxel
+        }
+
+        // Leaf level logic (Surface detection)
+        if (hdda.dim == 1 && picovdbIsActive(result)) {
+            let val = picovdbGetValue(grid, result.count);
+            if (val * v0 < 0.0) {
+                *thit = hdda.tmin;
+                *v = val;
+                return true;
+            }
+            // Optional: v0 = val; // Update previous value for continuous crossing
+        }
+
+        // Step to next boundary
+        if (!picovdbHDDAStep(&hdda)) { break; }
+    }
+    return false;
+}
+
+struct PicoVDBStencil {
+    v000: f32, v001: f32, v010: f32, v011: f32,
+    v100: f32, v101: f32, v110: f32, v111: f32,
+}
+
+// Sample 2x2x2 stencil of voxel values around a point
+fn picovdbSampleStencil(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    ijk: vec3i
+) -> PicoVDBStencil {
+    var s: PicoVDBStencil;
+    s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 0), grid).count);
+    s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);
+    s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);
+    s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);
+    s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 0), grid).count);
+    s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);
+    s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 0), grid).count);
+    s.v111 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 1), grid).count);
+    return s;
+}
+
+// Compute trilinear gradient from 2x2x2 stencil
+fn picovdbTrilinearGradient(uvw: vec3f, s: PicoVDBStencil) -> vec3f {
+    // Interpolate values along Z for the four XY columns
+    let v00z = mix(s.v000, s.v001, uvw.z);
+    let v01z = mix(s.v010, s.v011, uvw.z);
+    let v10z = mix(s.v100, s.v101, uvw.z);
+    let v11z = mix(s.v110, s.v111, uvw.z);
+
+    // Interpolate values along Y for the two X slabs
+    let v0yz = mix(v00z, v01z, uvw.y);
+    let v1yz = mix(v10z, v11z, uvw.y);
+
+    // X Gradient: Difference between the two YZ-interpolated slabs
+    let grad_x = v1yz - v0yz;
+
+    // Y Gradient: Interpolate the differences along X
+    let grad_y = mix(v01z - v00z, v11z - v10z, uvw.x);
+
+    // Z Gradient: Interpolate the differences along X and Y
+    let dZ00 = s.v001 - s.v000;
+    let dZ01 = s.v011 - s.v010;
+    let dZ10 = s.v101 - s.v100;
+    let dZ11 = s.v111 - s.v110;
+    let grad_z = mix(mix(dZ00, dZ01, uvw.y), mix(dZ10, dZ11, uvw.y), uvw.x);
+
+    return vec3f(grad_x, grad_y, grad_z);
+}
+
+// Trilinear interpolation of a value at position uvw within a voxel stencil
+fn picovdbTrilinearInterpolation(uvw: vec3f, s: PicoVDBStencil) -> f32 {
+    // Interpolate along Z
+    let v00 = mix(s.v000, s.v001, uvw.z);
+    let v01 = mix(s.v010, s.v011, uvw.z);
+    let v10 = mix(s.v100, s.v101, uvw.z);
+    let v11 = mix(s.v110, s.v111, uvw.z);
+    
+    // Interpolate along Y
+    let v0 = mix(v00, v01, uvw.y);
+    let v1 = mix(v10, v11, uvw.y);
+    
+    // Interpolate along X
+    return mix(v0, v1, uvw.x);
+}
+
+fn picovdbHDDAIsOccluded(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    origin: vec3f,
+    tmin: f32,
+    direction: vec3f,
+    tmax: f32
+) -> bool {
+    let direction_inv = 1 / direction;
+    var tmin_mut = tmin;
+    var tmax_mut = tmax;
+    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+        return false;
+    }
+
+    var hdda: PicoVDBHDDA;
+    // Shadow rays can start at a coarser level (e.g., dim 8) to skip empty space faster
+    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, 8);
+
+    for (var i = 0; i < 256; i++) { // Shadow rays usually need fewer steps
+        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
+        let target_dim = picovdbDimForLevel[result.level];
+
+        if (hdda.dim != target_dim) {
+            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
+            continue;
+        }
+
+        // For SDFs, active leaf usually means "near or inside the surface"
+        if (hdda.dim == 1 && picovdbIsActive(result)) {
+            let val = picovdbGetValue(grid, result.count);
+            if (val <= 0.0) { return true; } // Inside or on the surface
+        }
+
+        if (!picovdbHDDAStep(&hdda)) { break; }
+    }
+    return false;
+}
+
+fn picovdbSampleTrilinear(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    pos: vec3f
+) -> f32 {
+    let ijk = vec3i(floor(pos));
+    let uvw = fract(pos);
+    let s = picovdbSampleStencil(acc, grid, ijk);
+    return picovdbTrilinearInterpolation(uvw, s);
+}
+
+//fn picovdbHDDASmoothTraversal(
+//    acc: ptr<function, PicoVDBReadAccessor>,
+//    grid: PicoVDBGrid,
+//    origin: vec3f,
+//    tmin: f32,
+//    direction: vec3f,
+//    tmax: f32,
+//    thit: ptr<function, f32>
+//) -> bool {
+//    let direction_inv = 1 / direction;
+//    var tmin_mut = tmin;
+//    var tmax_mut = tmax;
+//    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+//        return false;
+//    }
+//
+//    var hdda: PicoVDBHDDA;
+//    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax, direction_inv, 4096);
+//
+//    // Cache the trilinear value at the entry point of the current voxel
+//    var v_entry: f32 = picovdbSampleTrilinear(acc, grid, origin + direction * hdda.tmin);
+//
+//    for (var i = 0; i < 256; i++) {
+//        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
+//        let target_dim = picovdbDimForLevel[result.level];
+//
+//        if (hdda.dim != target_dim) {
+//            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
+//            // Re-sync v_entry after a level jump
+//            v_entry = picovdbSampleTrilinear(acc, grid, origin + direction * hdda.tmin);
+//            continue;
+//        }
+//
+//        if (hdda.dim == 1) {
+//            let discrete_val = picovdbGetValue(grid, result.count);
+//            
+//            // OPTIMIZATION 1: Discrete Guard
+//            // If the discrete value is far from the surface, don't sample the stencil.
+//            // 1.732 (sqrt(3)) is the max distance from a voxel center to its corner.
+//            if (discrete_val > 1.2) { 
+//                if (!picovdbHDDAStep(&hdda)) { break; }
+//                // Use discrete value as a cheap approximation for the next v_entry
+//                v_entry = discrete_val; 
+//                continue; 
+//            }
+//
+//            let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z);
+//            let v_exit = picovdbSampleTrilinear(acc, grid, origin + direction * t_exit);
+//
+//            // OPTIMIZATION 2: Early Exit for solid interior
+//            if (v_entry <= 0.0) {
+//                *thit = hdda.tmin;
+//                return true;
+//            }
+//
+//            // Check for zero-crossing
+//            if (v_entry * v_exit <= 0.0) {
+//                // Iterations reduced to 3 for performance; 
+//                // Secant search is better than Binary for SDFs
+//                *thit = picovdbRefineIntersection(acc, grid, origin, direction, hdda.tmin, t_exit, v_entry, v_exit);
+//                return true;
+//            }
+//            
+//            // OPTIMIZATION 3: Value Caching
+//            // The exit of this voxel IS the entry of the next.
+//            v_entry = v_exit;
+//        }
+//
+//        if (!picovdbHDDAStep(&hdda)) { break; }
+//    }
+//    return false;
+//}
+//
+// Optimize refinement using Secant Method
+//fn picovdbRefineIntersection(
+//    acc: ptr<function, PicoVDBReadAccessor>,
+//    grid: PicoVDBGrid,
+//    origin: vec3f,
+//    direction: vec3f,
+//    t_start: f32,
+//    t_end: f32,
+//    v_start: f32,
+//    v_end: f32
+//) -> f32 {
+//    var ts = t_start;
+//    var te = t_end;
+//    var vs = v_start;
+//    var ve = v_end;
+//
+//    for (var i = 0; i < 2; i++) {
+//        // Linear interpolation to find where the line crosses zero
+//        let t_guess = ts + (te - ts) * (vs / (vs - ve));
+//        let v_guess = picovdbSampleTrilinear(acc, grid, origin + direction * t_guess);
+//
+//        if (v_guess > 0.0) {
+//            ts = t_guess;
+//            vs = v_guess;
+//        } else {
+//            te = t_guess;
+//            ve = v_guess;
+//        }
+//    }
+//    return te;
+//}
+`;
 
 // ../picovdb.ts
 var PICOVDB_MAGIC = [1868786e3, 809649238];

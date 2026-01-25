@@ -288,27 +288,18 @@ fn picovdbReadAccessorGetLevelCount(
 const PICOVDB_HDDA_FLOAT_MAX: f32 = 1e38;
 
 struct PicoVDBHDDA {
-    dim: i32,
-    tmin: f32,
-    tmax: f32,
     voxel: vec3i,
+    dim: i32,
     step: vec3i,
-    inv_dir: vec3f,
+    tmin: f32,
     delta: vec3f,
+    tmax: f32,
     next: vec3f,
-}
-
-fn picovdbHDDAPosToIjk(pos: vec3f) -> vec3i {
-    return vec3i(floor(pos));
 }
 
 fn picovdbHDDAPosToVoxel(pos: vec3f, dim: i32) -> vec3i {
     let mask = ~(dim - 1);
     return vec3i(floor(pos)) & vec3i(mask);
-}
-
-fn picovdbHDDARayStart(origin: vec3f, tmin: f32, direction: vec3f) -> vec3f {
-    return origin + direction * tmin;
 }
 
 fn picovdbHDDAInit(
@@ -317,9 +308,9 @@ fn picovdbHDDAInit(
     tmin: f32,
     direction: vec3f,
     tmax: f32,
+    direction_inv: vec3f,
     dim: i32
 ) {
-    let dir_inv = 1.0 / direction;
     let pos = origin + direction * tmin;
     let vox = picovdbHDDAPosToVoxel(pos, dim);
 
@@ -327,15 +318,14 @@ fn picovdbHDDAInit(
     (*hdda).tmin = tmin;
     (*hdda).tmax = tmax;
     (*hdda).voxel = vox;
-    (*hdda).inv_dir = dir_inv;
     (*hdda).step = vec3i(sign(direction));
-    (*hdda).delta = abs(f32(dim) * dir_inv); // Pre-multiply delta by dim
+    (*hdda).delta = abs(f32(dim) * direction_inv); // Pre-multiply delta by dim
 
     let boundary = select(vec3f(vox), vec3f(vox + vec3i(dim)), direction > vec3f(0.0));
 
     // Safety: handle cases where direction is 0 to avoid NaNs
     (*hdda).next = select(
-        tmin + (boundary - pos) * dir_inv,
+        tmin + (boundary - pos) * direction_inv,
         vec3f(PICOVDB_HDDA_FLOAT_MAX),
         direction == vec3f(0.0)
     );
@@ -345,11 +335,12 @@ fn picovdbHDDAInit(
 fn picovdbHDDAUpdate(
     hdda: ptr<function, PicoVDBHDDA>,
     origin: vec3f,
+    dim: i32,
     direction: vec3f,
-    dim: i32
+    direction_inv: vec3f,
 ) {
     (*hdda).dim = dim;
-    (*hdda).delta = abs(f32(dim) * (*hdda).inv_dir);
+    (*hdda).delta = abs(f32(dim) * direction_inv);
 
     // Re-calculate position at the exact current tmin plus a safety nudge
     let eps = max(1e-4f, (*hdda).tmin * 1e-7f);
@@ -360,7 +351,7 @@ fn picovdbHDDAUpdate(
 
     // Re-calculate next boundary for the new grid scale
     let boundary = select(vec3f((*hdda).voxel), vec3f((*hdda).voxel + vec3i(dim)), direction > vec3f(0.0));
-    let t_to_boundary = (boundary - (origin + direction * (*hdda).tmin)) * (*hdda).inv_dir;
+    let t_to_boundary = (boundary - (origin + direction * (*hdda).tmin)) * direction_inv;
 
     // Ensure the next step is always forward
     (*hdda).next = (*hdda).tmin + max(t_to_boundary, vec3f(eps));
@@ -391,10 +382,9 @@ fn picovdbHDDARayClip(
     bbox_max: vec3f,
     origin: vec3f,
     tmin: ptr<function, f32>,
-    direction: vec3f,
+    dir_inv: vec3f,
     tmax: ptr<function, f32>
 ) -> bool {
-    let dir_inv = 1.0 / direction;
     let t0 = (bbox_min - origin) * dir_inv;
     let t1 = (bbox_max - origin) * dir_inv;
     let tmin3 = min(t0, t1);
@@ -436,11 +426,10 @@ fn picovdbHDDAZeroCrossing(
     thit: ptr<function, f32>,
     v: ptr<function, f32>
 ) -> bool {
+    let direction_inv = 1 / direction;
     var tmin_mut = tmin;
     var tmax_mut = tmax;
-    
-    // Clip to bounding box
-    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction, &tmax_mut)) {
+    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
         return false;
     }
 
@@ -450,7 +439,7 @@ fn picovdbHDDAZeroCrossing(
     let v0 = picovdbGetValue(grid, res0.count);
     
     var hdda: PicoVDBHDDA;
-    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, picovdbDimForLevel[res0.level]);
+    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
 
     for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
         let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
@@ -458,7 +447,7 @@ fn picovdbHDDAZeroCrossing(
 
         // If hierarchy changed, update HDDA and re-read
         if (hdda.dim != target_dim) {
-            picovdbHDDAUpdate(&hdda, origin, direction, target_dim);
+            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
             continue; // Re-evaluate with the new aligned voxel
         }
 
@@ -545,3 +534,158 @@ fn picovdbTrilinearInterpolation(uvw: vec3f, s: PicoVDBStencil) -> f32 {
     // Interpolate along X
     return mix(v0, v1, uvw.x);
 }
+
+fn picovdbHDDAIsOccluded(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    origin: vec3f,
+    tmin: f32,
+    direction: vec3f,
+    tmax: f32
+) -> bool {
+    let direction_inv = 1 / direction;
+    var tmin_mut = tmin;
+    var tmax_mut = tmax;
+    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+        return false;
+    }
+
+    var hdda: PicoVDBHDDA;
+    // Shadow rays can start at a coarser level (e.g., dim 8) to skip empty space faster
+    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, 8);
+
+    for (var i = 0; i < 256; i++) { // Shadow rays usually need fewer steps
+        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
+        let target_dim = picovdbDimForLevel[result.level];
+
+        if (hdda.dim != target_dim) {
+            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
+            continue;
+        }
+
+        // For SDFs, active leaf usually means "near or inside the surface"
+        if (hdda.dim == 1 && picovdbIsActive(result)) {
+            let val = picovdbGetValue(grid, result.count);
+            if (val <= 0.0) { return true; } // Inside or on the surface
+        }
+
+        if (!picovdbHDDAStep(&hdda)) { break; }
+    }
+    return false;
+}
+
+fn picovdbSampleTrilinear(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    pos: vec3f
+) -> f32 {
+    let ijk = vec3i(floor(pos));
+    let uvw = fract(pos);
+    let s = picovdbSampleStencil(acc, grid, ijk);
+    return picovdbTrilinearInterpolation(uvw, s);
+}
+
+//fn picovdbHDDASmoothTraversal(
+//    acc: ptr<function, PicoVDBReadAccessor>,
+//    grid: PicoVDBGrid,
+//    origin: vec3f,
+//    tmin: f32,
+//    direction: vec3f,
+//    tmax: f32,
+//    thit: ptr<function, f32>
+//) -> bool {
+//    let direction_inv = 1 / direction;
+//    var tmin_mut = tmin;
+//    var tmax_mut = tmax;
+//    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+//        return false;
+//    }
+//
+//    var hdda: PicoVDBHDDA;
+//    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax, direction_inv, 4096);
+//
+//    // Cache the trilinear value at the entry point of the current voxel
+//    var v_entry: f32 = picovdbSampleTrilinear(acc, grid, origin + direction * hdda.tmin);
+//
+//    for (var i = 0; i < 256; i++) {
+//        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
+//        let target_dim = picovdbDimForLevel[result.level];
+//
+//        if (hdda.dim != target_dim) {
+//            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
+//            // Re-sync v_entry after a level jump
+//            v_entry = picovdbSampleTrilinear(acc, grid, origin + direction * hdda.tmin);
+//            continue;
+//        }
+//
+//        if (hdda.dim == 1) {
+//            let discrete_val = picovdbGetValue(grid, result.count);
+//            
+//            // OPTIMIZATION 1: Discrete Guard
+//            // If the discrete value is far from the surface, don't sample the stencil.
+//            // 1.732 (sqrt(3)) is the max distance from a voxel center to its corner.
+//            if (discrete_val > 1.2) { 
+//                if (!picovdbHDDAStep(&hdda)) { break; }
+//                // Use discrete value as a cheap approximation for the next v_entry
+//                v_entry = discrete_val; 
+//                continue; 
+//            }
+//
+//            let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z);
+//            let v_exit = picovdbSampleTrilinear(acc, grid, origin + direction * t_exit);
+//
+//            // OPTIMIZATION 2: Early Exit for solid interior
+//            if (v_entry <= 0.0) {
+//                *thit = hdda.tmin;
+//                return true;
+//            }
+//
+//            // Check for zero-crossing
+//            if (v_entry * v_exit <= 0.0) {
+//                // Iterations reduced to 3 for performance; 
+//                // Secant search is better than Binary for SDFs
+//                *thit = picovdbRefineIntersection(acc, grid, origin, direction, hdda.tmin, t_exit, v_entry, v_exit);
+//                return true;
+//            }
+//            
+//            // OPTIMIZATION 3: Value Caching
+//            // The exit of this voxel IS the entry of the next.
+//            v_entry = v_exit;
+//        }
+//
+//        if (!picovdbHDDAStep(&hdda)) { break; }
+//    }
+//    return false;
+//}
+//
+// Optimize refinement using Secant Method
+//fn picovdbRefineIntersection(
+//    acc: ptr<function, PicoVDBReadAccessor>,
+//    grid: PicoVDBGrid,
+//    origin: vec3f,
+//    direction: vec3f,
+//    t_start: f32,
+//    t_end: f32,
+//    v_start: f32,
+//    v_end: f32
+//) -> f32 {
+//    var ts = t_start;
+//    var te = t_end;
+//    var vs = v_start;
+//    var ve = v_end;
+//
+//    for (var i = 0; i < 2; i++) {
+//        // Linear interpolation to find where the line crosses zero
+//        let t_guess = ts + (te - ts) * (vs / (vs - ve));
+//        let v_guess = picovdbSampleTrilinear(acc, grid, origin + direction * t_guess);
+//
+//        if (v_guess > 0.0) {
+//            ts = t_guess;
+//            vs = v_guess;
+//        } else {
+//            te = t_guess;
+//            ve = v_guess;
+//        }
+//    }
+//    return te;
+//}

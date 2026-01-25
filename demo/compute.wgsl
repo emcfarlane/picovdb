@@ -21,116 +21,44 @@ struct RayHit {
     normal: vec3f,
 }
 
-// Define a structure for an Axis-Aligned Bounding Box (AABB)
-struct AABB {
-    min_bounds: vec3<f32>,
-    max_bounds: vec3<f32>,
-};
-
-
-// Define a structure to hold the intersection results
-struct IntersectionInterval {
-    // The parametric distance to the nearest intersection point
-    t_near: f32,
-    // The parametric distance to the farthest intersection point
-    t_far: f32,
-    // True if a valid intersection occurs in front of the ray origin
-    hit: bool,
-};
-
-/**
- * Checks if a ray intersects an AABB and returns the min/max distances.
- *
- * @param box The AABB to check for intersection.
- * @param ray The ray used for intersection testing.
- * @returns An IntersectionInterval structure with hit status and distances.
- */
-fn intersect_ray_aabb_interval(box: AABB, ray: Ray) -> IntersectionInterval {
-    // Calculate intersection distances for the x, y, and z slabs
-    let ray_inv_direction = 1.0 / ray.direction; // TODO: precompute?
-    let t0 = (box.min_bounds - ray.origin) * ray_inv_direction;
-    let t1 = (box.max_bounds - ray.origin) * ray_inv_direction;
-
-    // Order the distances for each axis to get t_min and t_max for each slab
-    let t_min_xyz = min(t0, t1);
-    let t_max_xyz = max(t0, t1);
-
-    // Find the maximum of all near intersections (t_near) and the minimum of all far intersections (t_far)
-    let t_near_final = max(max(t_min_xyz.x, t_min_xyz.y), t_min_xyz.z);
-    let t_far_final = min(min(t_max_xyz.x, t_max_xyz.y), t_max_xyz.z);
-
-    // Check for a valid intersection:
-    // 1. The near point must be less than or equal to the far point (intervals overlap).
-    // 2. The far point must not be behind the ray origin (t_far_final >= 0.0).
-    let hit_valid = t_near_final <= t_far_final && t_far_final >= 0.0;
-
-    // If a hit occurred, ensure t_near_final is >= 0 if we only care about hits in front of the origin.
-    // If the origin is inside the box, t_near_final might be negative, 
-    // but the intersection technically starts "at the origin" (t=0) for visual rendering purposes.
-    let final_t_near = max(0.0, t_near_final);
-
-    return IntersectionInterval(final_t_near, t_far_final, hit_valid);
-}
-
 fn intersect_picovdb(
     world_ray: Ray,
     world_to_index: mat4x4f,
     index_to_world: mat4x4f,
 ) -> RayHit {
     let grid = picovdb_grids[0];
-
-    // Transform World Ray directly to Index Space
-    // Direction stays unnormalized initially to preserve T-metric scale
     let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;
     let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;
     let idx_dir_len = length(idx_dir_unnorm);
     let idx_direction = idx_dir_unnorm / idx_dir_len;
 
     let index_ray = Ray(idx_origin, idx_direction);
-
-    let bbox = AABB(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax));
-    let intersection = intersect_ray_aabb_interval(bbox, index_ray);
-    if !intersection.hit {
-        return RayHit(-1.0, vec3f(0.0));
-    }
+    let tmin = 0.0;
+    let tmax = 10000.0; // TODO: set max world clip distance.
 
     var accessor: PicoVDBReadAccessor;
     picovdbReadAccessorInit(&accessor, 0);
 
-    // Use HDDA zero crossing detection (all parameters in index space)
-    var hit_t_index: f32;
-    var hit_value: f32;
-     let hit = picovdbHDDAZeroCrossing(
-        &accessor,
-        grid,
-        index_ray.origin,
-        intersection.t_near,
-        index_ray.direction,
-        intersection.t_far,
-        &hit_t_index,
-        &hit_value
-    );
-    if !hit {
-        return RayHit(-1.0, vec3f(0));
+    // Inside Check (Works even if camera is in background space)
+    let start_val = picovdbSampleTrilinear(&accessor, grid, idx_origin);
+    if start_val < 0.0 {
+        return RayHit(0.01, -world_ray.direction);
     }
 
-    // Calculate World Space Data
-    let index_hit_point = index_ray.origin + index_ray.direction * hit_t_index;
-    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;
+    var hit_t_idx: f32;
+    var hit_v: f32;
+    let hit = picovdbHDDAZeroCrossing(
+        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, &hit_t_idx, &hit_v,
+    );
+    if !hit { return RayHit(-1.0, vec3f(0)); }
 
-    // Distance in world space
+    let index_hit_point = index_ray.origin + index_ray.direction * hit_t_idx;
+    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;
     let world_distance = length(world_hit_point - world_ray.origin);
 
-    // Normal Calculation (Gradient in Index Space -> World Space)
-    let ijk_base = vec3i(floor(index_hit_point));
-    let uvw = fract(index_hit_point);
-    let stencil = picovdbSampleStencil(&accessor, grid, ijk_base);
-    let index_gradient = picovdbTrilinearGradient(uvw, stencil);
-    
-    // Normals transform by the Transpose of the Inverse (World-to-Index)
-    // Or more simply: transform the gradient by the inverse-world matrix
-    let world_gradient = (index_to_world * vec4f(index_gradient, 0.0)).xyz;
-    let normal = normalize(world_gradient);
+    let stencil = picovdbSampleStencil(&accessor, grid, vec3i(floor(index_hit_point)));
+    let index_gradient = picovdbTrilinearGradient(fract(index_hit_point), stencil);
+    let normal = normalize((index_to_world * vec4f(index_gradient, 0.0)).xyz);
 
     return RayHit(world_distance, normal);
 }
@@ -149,96 +77,54 @@ fn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {
     return select(-1.0, t, t > 0.001);
 }
 
-// Shadow ray test
-fn is_in_shadow(point: vec3f, normal: vec3f, light_dir: vec3f, light_distance: f32) -> bool {
-    // Offset ray origin along surface normal to avoid self-intersection
-    let shadow_ray = Ray(point + normal * 0.01, light_dir);
-    let shadow_hit = intersect_picovdb(
-        shadow_ray,
-        input.transform_matrix,
-        input.transform_inverse_matrix,
-    );
-    return shadow_hit.distance > 0.0 && shadow_hit.distance < light_distance;
-}
-
 fn raymarch_scene_graph(ray: Ray) -> vec3f {
-    let ground_y = -2.0;
+    let volume_hit = intersect_picovdb(ray, input.transform_matrix, input.transform_inverse_matrix);
+    let ground_t = intersect_ground_plane(ray, -2.0);
     
-    // Check volume intersection
-    let volume_hit = intersect_picovdb(
-        ray,
-        input.transform_matrix,
-        input.transform_inverse_matrix,
-    );
-    
-    // Check ground plane intersection  
-    let ground_t = intersect_ground_plane(ray, ground_y);
-    
+    let background = vec3f(0.95, 0.95, 1.0);
     let light_pos = vec3f(20.0, 30.0, 10.0);
-    let ambient = vec3f(0.15);
-    
-    // Determine closest hit
-    var closest_t = 10000.0;
-    var hit_volume = false;
-    var hit_ground = false;
-    
-    if volume_hit.distance > 0.0 && volume_hit.distance < closest_t {
-        closest_t = volume_hit.distance;
-        hit_volume = true;
-    }
-    
-    if ground_t > 0.0 && ground_t < closest_t {
-        closest_t = ground_t;
-        hit_ground = true;
-        hit_volume = false;
-    }
-    
-    if hit_volume {
-        // Blue bunny material
-        let hit_point = ray.origin + ray.direction * volume_hit.distance;
-        let light_dir = normalize(light_pos - hit_point);
-        let light_distance = length(light_pos - hit_point);
-        
-        // Diffuse lighting
+
+    // Determine primary hit
+    var t = 1e6f;
+    var is_volume = false;
+    if volume_hit.distance > 0.0 { t = volume_hit.distance; is_volume = true; }
+    if ground_t > 0.0 && ground_t < t { t = ground_t; is_volume = false; }
+
+    if t > 1e5f { return background; }
+
+    let hit_point = ray.origin + ray.direction * t;
+    let light_vec = light_pos - hit_point;
+    let light_dir = normalize(light_vec);
+    let light_dist = length(light_vec);
+
+    if is_volume {
         let diffuse = max(dot(volume_hit.normal, light_dir), 0.0);
         
-        // Shadow test
-        let shadow_factor = select(1.0, 0.3, is_in_shadow(hit_point, volume_hit.normal, light_dir, light_distance));
-        
-        // Blue bunny color
-        let base_color = vec3f(0.2, 0.5, 1.0);
-        return base_color * (ambient + diffuse * shadow_factor * 0.8);
-        
-    } else if hit_ground {
-        // Shadow-only ground plane
-        let hit_point = ray.origin + ray.direction * ground_t;
-        let ground_normal = vec3f(0.0, 1.0, 0.0);
-        let light_dir = normalize(light_pos - hit_point);
-        let light_distance = length(light_pos - hit_point);
-        
-        // Distance fade from center
-        let distance_from_center = length(hit_point.xz);
-        let fade_radius = 30.0;
-        let fade_factor = 1.0 - smoothstep(fade_radius - 10.0, fade_radius, distance_from_center);
-        
-        // If completely faded, return background
-        if fade_factor <= 0.001 {
-            return vec3f(0.95, 0.95, 1.0);
-        }
-        
-        // Shadow test - only show ground if in shadow
-        let in_shadow = is_in_shadow(hit_point, ground_normal, light_dir, light_distance);
-        
-        if in_shadow {
-            // Dark shadow color
-            let shadow_color = vec3f(0.3, 0.3, 0.35);
-            let background_color = vec3f(0.95, 0.95, 1.0);
-            return mix(background_color, shadow_color, fade_factor * 0.7);
-        }
+        // Use the optimized occlusion check for shadows
+        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);
+        let in_shadow = picovdbHDDAIsOccluded(
+            &acc, picovdb_grids[0],
+            (input.transform_matrix * vec4f(hit_point + volume_hit.normal * 0.1, 1.0)).xyz,
+            0.0,
+            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,
+            light_dist
+        );
+        let shadow = select(1.0, 0.3, in_shadow);
+        return vec3f(0.2, 0.5, 1.0) * (0.15 + diffuse * shadow * 0.8);
+    } else {
+        // Simple ground shadow
+        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);
+        let in_shadow = picovdbHDDAIsOccluded(
+            &acc, picovdb_grids[0],
+            (input.transform_matrix * vec4f(hit_point + vec3f(0, 0.1, 0), 1.0)).xyz,
+            0.0,
+            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,
+            light_dist
+        );
+        let fade = 1.0 - smoothstep(20.0, 30.0, length(hit_point.xz));
+        return mix(background, vec3f(0.3), select(0.0, fade * 0.7, in_shadow));
     }
-    return vec3f(0.95, 0.95, 1.0); // Background color
 }
-
 
 fn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {
     // Convert to normalized coordinates [-1, 1]
