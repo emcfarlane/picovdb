@@ -75,13 +75,13 @@ export class PicoVDBFile {
   // Header
   header: PicoVDBFileHeader;
 
-  // Slices (as Uint8Arrays for WebGPU)
-  gridsBuffer: Uint8Array;
-  rootsBuffer: Uint8Array;
-  uppersBuffer: Uint8Array;
-  lowersBuffer: Uint8Array;
-  leavesBuffer: Uint8Array;
-  dataBuffer: Uint8Array;
+  // Slices (as Uint8Arrays for WebGPU - explicitly typed for ArrayBuffer, not SharedArrayBuffer)
+  gridsBuffer: Uint8Array<ArrayBuffer>;
+  rootsBuffer: Uint8Array<ArrayBuffer>;
+  uppersBuffer: Uint8Array<ArrayBuffer>;
+  lowersBuffer: Uint8Array<ArrayBuffer>;
+  leavesBuffer: Uint8Array<ArrayBuffer>;
+  dataBuffer: Uint8Array<ArrayBuffer>;
 
   constructor(buffer: ArrayBuffer) {
     this.buffer = buffer;

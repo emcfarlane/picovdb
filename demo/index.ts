@@ -3,9 +3,10 @@ import DisplayShader from "./blit.wgsl";
 import ComputeShader from "./compute.wgsl";
 import PicoVDBShader from "./../picovdb.wgsl";
 import { loadPicoVDB } from './lib/loader';
-import { ArcballCamera, WASDCamera } from './lib/camera';
+//import { ArcballCamera, WASDCamera } from './lib/camera.old';
+import { createOrbitCamera } from './lib/camera';
 import { createInputHandler } from "./lib/input";
-import { controls, pauseController, cameraController, highDPIController, rotationController } from './lib/gui';
+import { controls, pauseController, highDPIController, rotationController } from './lib/gui';
 import { TimestampQueryManager } from './lib/TimestampQueryManager';
 import { Stats } from './lib/Stats';
 
@@ -288,20 +289,18 @@ device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
 const fov = (2 * Math.PI) / 5; // 72 degrees
 const fovScaled = Math.tan(fov / 2);
 const initialCameraPosition = vec3.create(3, 2, 5);
-const cameras = {
-  arcball: new ArcballCamera({ position: initialCameraPosition }),
-  WASD: new WASDCamera({ position: initialCameraPosition }),
-};
-let currentCamera = cameras[controls.cameraType];
-
-cameraController.onChange((newCameraType: 'arcball' | 'WASD') => {
-  // Copy the camera matrix from old to new
-  const oldCamera = currentCamera;
-  const newCamera = cameras[newCameraType];
-  newCamera.matrix = oldCamera.matrix;
-  currentCamera = newCamera;
-  controls.cameraType = newCameraType;
+const initialCameraTarget = vec3.create(0, 0, 0);
+let camera = createOrbitCamera({
+  position: initialCameraPosition,
+  target: initialCameraTarget,
 });
+
+controls.resetCamera = () => {
+  camera = createOrbitCamera({
+    position: initialCameraPosition,
+    target: initialCameraTarget,
+  });
+};
 
 
 const InputValues = new ArrayBuffer(256);
@@ -363,8 +362,8 @@ function updateInput(deltaTime: number) {
   InputViews.time_delta[0] = deltaTime;
 
   // Update camera
-  currentCamera.update(deltaTime, inputHandler());
-  InputViews.camera_matrix.set(currentCamera.matrix);
+  camera.update(deltaTime, inputHandler());
+  InputViews.camera_matrix.set(camera.matrix);
 
   // Write entire input buffer at once
   device.queue.writeBuffer(inputBuffer, 0, InputValues);

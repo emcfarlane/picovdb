@@ -9,16 +9,16 @@ export class TimestampQueryManager {
 
   // The query objects. This is meant to be used in a ComputePassDescriptor's
   // or RenderPassDescriptor's 'timestampWrites' field.
-  #timestampQuerySet: GPUQuerySet;
+  #timestampQuerySet!: GPUQuerySet;
 
   // A buffer where to store query results
-  #timestampBuffer: GPUBuffer;
+  #timestampBuffer!: GPUBuffer;
 
   // A buffer to map this result back to CPU
-  #timestampMapBuffer: GPUBuffer;
+  #timestampMapBuffer!: GPUBuffer;
 
   // Callback to call when results are available.
-  #callback: (deltaTimeMs: number) => void;
+  #callback!: (deltaTimeMs: number) => void;
 
   // Device must have the "timestamp-query" feature
   constructor(device: GPUDevice, callback: (deltaTimeNs: number) => void) {

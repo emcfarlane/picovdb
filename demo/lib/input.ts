@@ -1,9 +1,6 @@
-// Input handling
-// https://webgpu.github.io/webgpu-samples/?sample=cameras#input.ts
 
-// Input holds as snapshot of input state
+
 export default interface Input {
-  // Digital input (e.g keyboard state)
   readonly digital: {
     readonly forward: boolean;
     readonly backward: boolean;
@@ -12,121 +9,96 @@ export default interface Input {
     readonly up: boolean;
     readonly down: boolean;
   };
-  // Analog input (e.g mouse, touchscreen)
   readonly analog: {
-    readonly x: number;
-    readonly y: number;
-    readonly zoom: number;
+    readonly x: number;    // Delta X
+    readonly y: number;    // Delta Y
+    readonly zoom: number; // Delta Zoom
     readonly touching: boolean;
+    readonly panning: boolean; // True if gesture/key implies panning
   };
 }
 
-// InputHandler is a function that when called, returns the current Input state.
 export type InputHandler = () => Input;
 
-// createInputHandler returns an InputHandler by attaching event handlers to the window and canvas.
-export function createInputHandler(
-  window: Window,
-  canvas: HTMLCanvasElement
-): InputHandler {
-  const digital = {
-    forward: false,
-    backward: false,
-    left: false,
-    right: false,
-    up: false,
-    down: false,
-  };
-  const analog = {
-    x: 0,
-    y: 0,
-    zoom: 0,
-  };
-  let mouseDown = false;
+export function createInputHandler(window: Window, canvas: HTMLCanvasElement): InputHandler {
+  const digital = { forward: false, backward: false, left: false, right: false, up: false, down: false };
+  const analog = { x: 0, y: 0, zoom: 0, touching: false, panning: false };
 
-  const setDigital = (e: KeyboardEvent, value: boolean) => {
+  // State
+  const pointers = new Map<number, PointerEvent>();
+  let prevDist = 0;
+  let isAlt = false;
+
+  // Keyboard
+  const setKey = (e: KeyboardEvent, v: boolean) => {
+    if (e.key === 'Alt') isAlt = v;
     switch (e.code) {
-      case 'KeyW':
-        digital.forward = value;
-        e.preventDefault();
-        e.stopPropagation();
-        break;
-      case 'KeyS':
-        digital.backward = value;
-        e.preventDefault();
-        e.stopPropagation();
-        break;
-      case 'KeyA':
-        digital.left = value;
-        e.preventDefault();
-        e.stopPropagation();
-        break;
-      case 'KeyD':
-        digital.right = value;
-        e.preventDefault();
-        e.stopPropagation();
-        break;
-      case 'Space':
-        digital.up = value;
-        e.preventDefault();
-        e.stopPropagation();
-        break;
-      case 'ShiftLeft':
-      case 'ControlLeft':
-      case 'KeyC':
-        digital.down = value;
-        e.preventDefault();
-        e.stopPropagation();
-        break;
+      case 'KeyW': digital.forward = v; break;
+      case 'KeyS': digital.backward = v; break;
+      case 'KeyA': digital.left = v; break;
+      case 'KeyD': digital.right = v; break;
+      case 'Space': digital.up = v; break;
+      case 'ShiftLeft': digital.down = v; break;
     }
   };
+  window.addEventListener('keydown', e => setKey(e, true));
+  window.addEventListener('keyup', e => setKey(e, false));
 
-  window.addEventListener('keydown', (e) => setDigital(e, true));
-  window.addEventListener('keyup', (e) => setDigital(e, false));
+  // Pointer (Touch/Mouse)
+  canvas.style.touchAction = 'none'; // Prevent browser scroll
 
-  canvas.style.touchAction = 'pinch-zoom';
-  canvas.addEventListener('pointerdown', () => {
-    mouseDown = true;
+  canvas.addEventListener('pointerdown', e => {
+    canvas.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, e);
+    if (pointers.size === 2) {
+      // Init pinch
+      const p = [...pointers.values()];
+      prevDist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+    }
   });
-  canvas.addEventListener('pointerup', () => {
-    mouseDown = false;
+
+  canvas.addEventListener('pointerup', e => {
+    canvas.releasePointerCapture(e.pointerId);
+    pointers.delete(e.pointerId);
   });
-  canvas.addEventListener('pointermove', (e) => {
-    mouseDown = e.pointerType == 'mouse' ? (e.buttons & 1) !== 0 : true;
-    if (mouseDown) {
+
+  canvas.addEventListener('pointermove', e => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, e); // Update cache
+
+    // Multi-touch (Pinch + Pan)
+    if (pointers.size === 2) {
+      const p = [...pointers.values()];
+      const dist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+
+      analog.zoom += (dist - prevDist) * 0.01; // Pinch Zoom
+      analog.x += e.movementX;                 // 2-finger Pan
+      analog.y += e.movementY;
+      analog.panning = true;
+      prevDist = dist;
+    }
+    // Single Touch / Mouse
+    else if (pointers.size === 1) {
       analog.x += e.movementX;
       analog.y += e.movementY;
+      // Pan if Middle Mouse (4) or Alt held
+      analog.panning = (e.buttons & 4) !== 0 || isAlt;
     }
   });
-  canvas.addEventListener(
-    'wheel',
-    (e) => {
-      mouseDown = (e.buttons & 1) !== 0;
-      if (mouseDown) {
-        // The scroll value varies substantially between user agents / browsers.
-        // Just use the sign.
-        analog.zoom += Math.sign(e.deltaY);
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    },
-    { passive: false }
-  );
+
+  // Wheel Zoom
+  canvas.addEventListener('wheel', e => {
+    e.preventDefault();
+    analog.zoom -= Math.sign(e.deltaY);
+  }, { passive: false });
 
   return () => {
     const out = {
       digital,
-      analog: {
-        x: analog.x,
-        y: analog.y,
-        zoom: analog.zoom,
-        touching: mouseDown,
-      },
+      analog: { ...analog, touching: pointers.size > 0 }
     };
-    // Clear the analog values, as these accumulate.
-    analog.x = 0;
-    analog.y = 0;
-    analog.zoom = 0;
+    // Reset deltas
+    analog.x = 0; analog.y = 0; analog.zoom = 0; analog.panning = false;
     return out;
   };
 }

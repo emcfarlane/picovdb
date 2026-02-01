@@ -45,7 +45,7 @@ function getAPIImpl$5(Ctor) {
     newDst[1] = Math.round(v[1]);
     return newDst;
   }
-  function clamp2(v, min2 = 0, max2 = 1, dst) {
+  function clamp(v, min2 = 0, max2 = 1, dst) {
     const newDst = dst ?? new Ctor(2);
     newDst[0] = Math.min(max2, Math.max(min2, v[0]));
     newDst[1] = Math.min(max2, Math.max(min2, v[1]));
@@ -87,7 +87,7 @@ function getAPIImpl$5(Ctor) {
   function equals(a, b) {
     return a[0] === b[0] && a[1] === b[1];
   }
-  function lerp2(a, b, t, dst) {
+  function lerp(a, b, t, dst) {
     const newDst = dst ?? new Ctor(2);
     newDst[0] = a[0] + t * (b[0] - a[0]);
     newDst[1] = a[1] + t * (b[1] - a[1]);
@@ -236,7 +236,7 @@ function getAPIImpl$5(Ctor) {
     newDst[1] = m[1] * x + m[5] * y + m[9];
     return newDst;
   }
-  function rotate2(a, b, rad, dst) {
+  function rotate(a, b, rad, dst) {
     const newDst = dst ?? new Ctor(2);
     const p0 = a[0] - b[0];
     const p1 = a[1] - b[1];
@@ -260,7 +260,7 @@ function getAPIImpl$5(Ctor) {
   }
   function midpoint(a, b, dst) {
     const newDst = dst ?? new Ctor(2);
-    return lerp2(a, b, 0.5, newDst);
+    return lerp(a, b, 0.5, newDst);
   }
   return {
     create,
@@ -269,7 +269,7 @@ function getAPIImpl$5(Ctor) {
     ceil,
     floor,
     round,
-    clamp: clamp2,
+    clamp,
     add,
     addScaled,
     angle,
@@ -277,7 +277,7 @@ function getAPIImpl$5(Ctor) {
     sub,
     equalsApproximately,
     equals,
-    lerp: lerp2,
+    lerp,
     lerpV,
     max,
     min,
@@ -308,7 +308,7 @@ function getAPIImpl$5(Ctor) {
     zero,
     transformMat4,
     transformMat3,
-    rotate: rotate2,
+    rotate,
     setLength,
     truncate,
     midpoint
@@ -366,7 +366,7 @@ function getAPIImpl$4(Ctor) {
     newDst[2] = Math.round(v[2]);
     return newDst;
   }
-  function clamp2(v, min2 = 0, max2 = 1, dst) {
+  function clamp(v, min2 = 0, max2 = 1, dst) {
     const newDst = dst ?? new Ctor(3);
     newDst[0] = Math.min(max2, Math.max(min2, v[0]));
     newDst[1] = Math.min(max2, Math.max(min2, v[1]));
@@ -414,7 +414,7 @@ function getAPIImpl$4(Ctor) {
   function equals(a, b) {
     return a[0] === b[0] && a[1] === b[1] && a[2] === b[2];
   }
-  function lerp2(a, b, t, dst) {
+  function lerp(a, b, t, dst) {
     const newDst = dst ?? new Ctor(3);
     newDst[0] = a[0] + t * (b[0] - a[0]);
     newDst[1] = a[1] + t * (b[1] - a[1]);
@@ -708,7 +708,7 @@ function getAPIImpl$4(Ctor) {
   }
   function midpoint(a, b, dst) {
     const newDst = dst ?? new Ctor(3);
-    return lerp2(a, b, 0.5, newDst);
+    return lerp(a, b, 0.5, newDst);
   }
   return {
     create,
@@ -717,7 +717,7 @@ function getAPIImpl$4(Ctor) {
     ceil,
     floor,
     round,
-    clamp: clamp2,
+    clamp,
     add,
     addScaled,
     angle,
@@ -725,7 +725,7 @@ function getAPIImpl$4(Ctor) {
     sub,
     equalsApproximately,
     equals,
-    lerp: lerp2,
+    lerp,
     lerpV,
     max,
     min,
@@ -1173,7 +1173,7 @@ function getAPIImpl$3(Ctor) {
     newDst[10] = 1;
     return newDst;
   }
-  function rotate2(m, angleInRadians, dst) {
+  function rotate(m, angleInRadians, dst) {
     const newDst = dst ?? new Ctor(12);
     const m00 = m[0 * 4 + 0];
     const m01 = m[0 * 4 + 1];
@@ -1273,7 +1273,7 @@ function getAPIImpl$3(Ctor) {
     return newDst;
   }
   const rotationZ = rotation;
-  const rotateZ = rotate2;
+  const rotateZ = rotate;
   function scaling(v, dst) {
     const newDst = dst ?? new Ctor(12);
     newDst[0] = v[0];
@@ -1409,7 +1409,7 @@ function getAPIImpl$3(Ctor) {
     multiply,
     multiplyScalar,
     negate,
-    rotate: rotate2,
+    rotate,
     rotateX,
     rotateY,
     rotateZ,
@@ -2463,7 +2463,7 @@ function getAPIImpl$2(Ctor) {
     }
     return newDst;
   }
-  const rotate2 = axisRotate;
+  const rotate = axisRotate;
   function scaling(v, dst) {
     const newDst = dst ?? new Ctor(16);
     newDst[0] = v[0];
@@ -2582,7 +2582,7 @@ function getAPIImpl$2(Ctor) {
     ortho,
     perspective,
     perspectiveReverseZ,
-    rotate: rotate2,
+    rotate,
     rotateX,
     rotateY,
     rotateZ,
@@ -2914,7 +2914,7 @@ function getAPIImpl$1(Ctor) {
   function dot(a, b) {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
   }
-  function lerp2(a, b, t, dst) {
+  function lerp(a, b, t, dst) {
     const newDst = dst ?? new Ctor(4);
     newDst[0] = a[0] + t * (b[0] - a[0]);
     newDst[1] = a[1] + t * (b[1] - a[1]);
@@ -3036,7 +3036,7 @@ function getAPIImpl$1(Ctor) {
     scale,
     divScalar,
     dot,
-    lerp: lerp2,
+    lerp,
     length,
     len,
     lengthSq,
@@ -3108,7 +3108,7 @@ function getAPIImpl(Ctor) {
     newDst[3] = Math.round(v[3]);
     return newDst;
   }
-  function clamp2(v, min2 = 0, max2 = 1, dst) {
+  function clamp(v, min2 = 0, max2 = 1, dst) {
     const newDst = dst ?? new Ctor(4);
     newDst[0] = Math.min(max2, Math.max(min2, v[0]));
     newDst[1] = Math.min(max2, Math.max(min2, v[1]));
@@ -3147,7 +3147,7 @@ function getAPIImpl(Ctor) {
   function equals(a, b) {
     return a[0] === b[0] && a[1] === b[1] && a[2] === b[2] && a[3] === b[3];
   }
-  function lerp2(a, b, t, dst) {
+  function lerp(a, b, t, dst) {
     const newDst = dst ?? new Ctor(4);
     newDst[0] = a[0] + t * (b[0] - a[0]);
     newDst[1] = a[1] + t * (b[1] - a[1]);
@@ -3329,7 +3329,7 @@ function getAPIImpl(Ctor) {
   }
   function midpoint(a, b, dst) {
     const newDst = dst ?? new Ctor(4);
-    return lerp2(a, b, 0.5, newDst);
+    return lerp(a, b, 0.5, newDst);
   }
   return {
     create,
@@ -3338,14 +3338,14 @@ function getAPIImpl(Ctor) {
     ceil,
     floor,
     round,
-    clamp: clamp2,
+    clamp,
     add,
     addScaled,
     subtract,
     sub,
     equalsApproximately,
     equals,
-    lerp: lerp2,
+    lerp,
     lerpV,
     max,
     min,
@@ -4216,7 +4216,7 @@ var PicoVDBFile = class {
   view;
   // Header
   header;
-  // Slices (as Uint8Arrays for WebGPU)
+  // Slices (as Uint8Arrays for WebGPU - explicitly typed for ArrayBuffer, not SharedArrayBuffer)
   gridsBuffer;
   rootsBuffer;
   uppersBuffer;
@@ -4416,345 +4416,172 @@ async function loadPicoVDB(url) {
 }
 
 // lib/camera.ts
-var CameraBase = class {
-  // The camera matrix
-  matrix_ = new Float32Array([
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    1,
-    0,
-    0,
-    0,
-    0,
-    1
-  ]);
-  // The calculated view matrix
-  view_ = mat4.create();
-  // Aliases to column vectors of the matrix
-  right_ = new Float32Array(this.matrix_.buffer, 4 * 0, 4);
-  up_ = new Float32Array(this.matrix_.buffer, 4 * 4, 4);
-  back_ = new Float32Array(this.matrix_.buffer, 4 * 8, 4);
-  position_ = new Float32Array(this.matrix_.buffer, 4 * 12, 4);
-  // Returns the camera matrix
-  get matrix() {
-    return this.matrix_;
-  }
-  // Assigns `mat` to the camera matrix
-  set matrix(mat) {
-    mat4.copy(mat, this.matrix_);
-  }
-  // Returns the camera view matrix
-  get view() {
-    return this.view_;
-  }
-  // Assigns `mat` to the camera view
-  set view(mat) {
-    mat4.copy(mat, this.view_);
-  }
-  // Returns column vector 0 of the camera matrix
-  get right() {
-    return this.right_;
-  }
-  // Assigns `vec` to the first 3 elements of column vector 0 of the camera matrix
-  set right(vec) {
-    vec3.copy(vec, this.right_);
-  }
-  // Returns column vector 1 of the camera matrix
-  get up() {
-    return this.up_;
-  }
-  // Assigns `vec` to the first 3 elements of column vector 1 of the camera matrix
-  set up(vec) {
-    vec3.copy(vec, this.up_);
-  }
-  // Returns column vector 2 of the camera matrix
-  get back() {
-    return this.back_;
-  }
-  // Assigns `vec` to the first 3 elements of column vector 2 of the camera matrix
-  set back(vec) {
-    vec3.copy(vec, this.back_);
-  }
-  // Returns column vector 3 of the camera matrix
-  get position() {
-    return this.position_;
-  }
-  // Assigns `vec` to the first 3 elements of column vector 3 of the camera matrix
-  set position(vec) {
-    vec3.copy(vec, this.position_);
-  }
-};
-var WASDCamera = class extends CameraBase {
-  // The camera absolute pitch angle
-  pitch = 0;
-  // The camera absolute yaw angle
-  yaw = 0;
-  // The movement veloicty
-  velocity_ = vec3.create();
-  // Speed multiplier for camera movement
-  movementSpeed = 10;
-  // Speed multiplier for camera rotation
-  rotationSpeed = 1;
-  // Movement velocity drag coeffient [0 .. 1]
-  // 0: Continues forever
-  // 1: Instantly stops moving
-  frictionCoefficient = 0.99;
-  // Returns velocity vector
-  get velocity() {
-    return this.velocity_;
-  }
-  // Assigns `vec` to the velocity vector
-  set velocity(vec) {
-    vec3.copy(vec, this.velocity_);
-  }
-  // Construtor
-  constructor(options) {
-    super();
-    if (options && (options.position || options.target)) {
-      const position = options.position ?? vec3.create(0, 0, -5);
-      const target = options.target ?? vec3.create(0, 0, 0);
-      const back = vec3.normalize(vec3.sub(position, target));
-      this.recalculateAngles(back);
-      this.position = position;
+function createOrbitCamera(options) {
+  const matrix_ = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+  const view_ = mat4.create();
+  const right_ = new Float32Array(matrix_.buffer, 0, 4);
+  const up_ = new Float32Array(matrix_.buffer, 16, 4);
+  const position_ = new Float32Array(matrix_.buffer, 48, 4);
+  const pivot = options?.target ? vec3.clone(options.target) : vec3.create();
+  let theta = 0, phi = 0, radius = 5;
+  const targetPivot = vec3.clone(pivot);
+  let targetTheta = 0, targetPhi = 0, targetRadius = 5;
+  const smoothing = 0.15;
+  const temp = vec3.create();
+  const upWorld = vec3.create(0, 1, 0);
+  if (options?.position) {
+    vec3.sub(options.position, pivot, temp);
+    radius = vec3.len(temp);
+    if (radius > 1e-4) {
+      theta = Math.atan2(temp[0], temp[2]);
+      phi = Math.asin(temp[1] / radius);
     }
+    targetTheta = theta;
+    targetPhi = phi;
+    targetRadius = radius;
   }
-  // Returns the camera matrix
-  get matrix() {
-    return super.matrix;
-  }
-  // Assigns `mat` to the camera matrix, and recalcuates the camera angles
-  set matrix(mat) {
-    super.matrix = mat;
-    this.recalculateAngles(this.back);
-  }
-  update(deltaTime, input) {
-    const sign = (positive, negative) => (positive ? 1 : 0) - (negative ? 1 : 0);
-    this.yaw -= input.analog.x * deltaTime * this.rotationSpeed;
-    this.pitch -= input.analog.y * deltaTime * this.rotationSpeed;
-    this.yaw = mod(this.yaw, Math.PI * 2);
-    this.pitch = clamp(this.pitch, -Math.PI / 2, Math.PI / 2);
-    const position = vec3.copy(this.position);
-    super.matrix = mat4.rotateX(mat4.rotationY(this.yaw), this.pitch);
-    const digital = input.digital;
-    const deltaRight = sign(digital.right, digital.left);
-    const deltaUp = sign(digital.up, digital.down);
-    const targetVelocity = vec3.create();
-    const deltaBack = sign(digital.backward, digital.forward);
-    vec3.addScaled(targetVelocity, this.right, deltaRight, targetVelocity);
-    vec3.addScaled(targetVelocity, this.up, deltaUp, targetVelocity);
-    vec3.addScaled(targetVelocity, this.back, deltaBack, targetVelocity);
-    vec3.normalize(targetVelocity, targetVelocity);
-    vec3.mulScalar(targetVelocity, this.movementSpeed, targetVelocity);
-    this.velocity = lerp(
-      targetVelocity,
-      this.velocity,
-      Math.pow(1 - this.frictionCoefficient, deltaTime)
+  recalc();
+  function recalc() {
+    const cy = Math.cos(phi);
+    vec3.set(
+      radius * cy * Math.sin(theta),
+      radius * Math.sin(phi),
+      radius * cy * Math.cos(theta),
+      temp
     );
-    this.position = vec3.addScaled(position, this.velocity, deltaTime);
-    this.view = mat4.invert(this.matrix);
-    return this.view;
+    vec3.add(pivot, temp, position_);
+    mat4.lookAt(position_, pivot, upWorld, view_);
+    mat4.invert(view_, matrix_);
   }
-  // Recalculates the yaw and pitch values from a directional vector
-  recalculateAngles(dir) {
-    this.yaw = Math.atan2(dir[0], dir[2]);
-    this.pitch = -Math.asin(dir[1]);
-  }
-};
-var ArcballCamera = class extends CameraBase {
-  // The camera distance from the target
-  distance = 0;
-  // The current angular velocity
-  angularVelocity = 0;
-  // The current rotation axis
-  axis_ = vec3.create();
-  // Returns the rotation axis
-  get axis() {
-    return this.axis_;
-  }
-  // Assigns `vec` to the rotation axis
-  set axis(vec) {
-    vec3.copy(vec, this.axis_);
-  }
-  // Speed multiplier for camera rotation
-  rotationSpeed = 1;
-  // Speed multiplier for camera zoom
-  zoomSpeed = 0.1;
-  // Rotation velocity drag coeffient [0 .. 1]
-  // 0: Spins forever
-  // 1: Instantly stops spinning
-  frictionCoefficient = 0.999;
-  // Construtor
-  constructor(options) {
-    super();
-    if (options && options.position) {
-      this.position = options.position;
-      this.distance = vec3.len(this.position);
-      this.back = vec3.normalize(this.position);
-      this.recalcuateRight();
-      this.recalcuateUp();
+  return {
+    get matrix() {
+      return matrix_;
+    },
+    get view() {
+      return view_;
+    },
+    get position() {
+      return position_;
+    },
+    get pivot() {
+      return pivot;
+    },
+    update(dt, input) {
+      const { x: dx, y: dy, zoom: dz, panning } = input.analog;
+      if (panning && (dx || dy)) {
+        const speed = targetRadius * 2e-3;
+        vec3.addScaled(targetPivot, right_, -dx * speed, targetPivot);
+        vec3.addScaled(targetPivot, up_, dy * speed, targetPivot);
+      } else if (dx || dy) {
+        const orbitSpeed = 5e-3;
+        targetTheta -= dx * orbitSpeed;
+        targetPhi = Math.max(-1.5, Math.min(1.5, targetPhi - dy * orbitSpeed));
+      }
+      if (dz) {
+        targetRadius *= Math.pow(1.1, dz * 0.5);
+        targetRadius = Math.max(0.1, targetRadius);
+      }
+      const t = 1 - Math.pow(smoothing, dt * 60);
+      const epsilon = 1e-6;
+      let dirty = false;
+      if (Math.abs(targetTheta - theta) > epsilon) {
+        theta += (targetTheta - theta) * t;
+        dirty = true;
+      }
+      if (Math.abs(targetPhi - phi) > epsilon) {
+        phi += (targetPhi - phi) * t;
+        dirty = true;
+      }
+      if (Math.abs(targetRadius - radius) > epsilon) {
+        radius += (targetRadius - radius) * t;
+        dirty = true;
+      }
+      const pivotDiff = vec3.sub(targetPivot, pivot, temp);
+      if (vec3.lenSq(pivotDiff) > epsilon * epsilon) {
+        vec3.addScaled(pivot, pivotDiff, t, pivot);
+        dirty = true;
+      }
+      if (dirty) recalc();
+      return view_;
     }
-  }
-  // Returns the camera matrix
-  get matrix() {
-    return super.matrix;
-  }
-  // Assigns `mat` to the camera matrix, and recalcuates the distance
-  set matrix(mat) {
-    super.matrix = mat;
-    this.distance = vec3.len(this.position);
-  }
-  update(deltaTime, input) {
-    const epsilon = 1e-7;
-    if (input.analog.touching) {
-      this.angularVelocity = 0;
-    } else {
-      this.angularVelocity *= Math.pow(1 - this.frictionCoefficient, deltaTime);
-    }
-    const movement = vec3.create();
-    vec3.addScaled(movement, this.right, input.analog.x, movement);
-    vec3.addScaled(movement, this.up, -input.analog.y, movement);
-    const crossProduct = vec3.cross(movement, this.back);
-    const magnitude = vec3.len(crossProduct);
-    if (magnitude > epsilon) {
-      this.axis = vec3.scale(crossProduct, 1 / magnitude);
-      this.angularVelocity = magnitude * this.rotationSpeed;
-    }
-    const rotationAngle = this.angularVelocity * deltaTime;
-    if (rotationAngle > epsilon) {
-      this.back = vec3.normalize(rotate(this.back, this.axis, rotationAngle));
-      this.recalcuateRight();
-      this.recalcuateUp();
-    }
-    if (input.analog.zoom !== 0) {
-      this.distance *= 1 + input.analog.zoom * this.zoomSpeed;
-    }
-    this.position = vec3.scale(this.back, this.distance);
-    this.view = mat4.invert(this.matrix);
-    return this.view;
-  }
-  // Assigns `this.right` with the cross product of `this.up` and `this.back`
-  recalcuateRight() {
-    this.right = vec3.normalize(vec3.cross(this.up, this.back));
-  }
-  // Assigns `this.up` with the cross product of `this.back` and `this.right`
-  recalcuateUp() {
-    this.up = vec3.normalize(vec3.cross(this.back, this.right));
-  }
-};
-function clamp(x, min, max) {
-  return Math.min(Math.max(x, min), max);
-}
-function mod(x, div) {
-  return x - Math.floor(Math.abs(x) / div) * div * Math.sign(x);
-}
-function rotate(vec, axis, angle) {
-  return vec3.transformMat4Upper3x3(vec, mat4.rotation(axis, angle));
-}
-function lerp(a, b, s) {
-  return vec3.addScaled(a, vec3.sub(b, a), s);
+  };
 }
 
 // lib/input.ts
 function createInputHandler(window2, canvas2) {
-  const digital = {
-    forward: false,
-    backward: false,
-    left: false,
-    right: false,
-    up: false,
-    down: false
-  };
-  const analog = {
-    x: 0,
-    y: 0,
-    zoom: 0
-  };
-  let mouseDown = false;
-  const setDigital = (e, value) => {
+  const digital = { forward: false, backward: false, left: false, right: false, up: false, down: false };
+  const analog = { x: 0, y: 0, zoom: 0, touching: false, panning: false };
+  const pointers = /* @__PURE__ */ new Map();
+  let prevDist = 0;
+  let isAlt = false;
+  const setKey = (e, v) => {
+    if (e.key === "Alt") isAlt = v;
     switch (e.code) {
       case "KeyW":
-        digital.forward = value;
-        e.preventDefault();
-        e.stopPropagation();
+        digital.forward = v;
         break;
       case "KeyS":
-        digital.backward = value;
-        e.preventDefault();
-        e.stopPropagation();
+        digital.backward = v;
         break;
       case "KeyA":
-        digital.left = value;
-        e.preventDefault();
-        e.stopPropagation();
+        digital.left = v;
         break;
       case "KeyD":
-        digital.right = value;
-        e.preventDefault();
-        e.stopPropagation();
+        digital.right = v;
         break;
       case "Space":
-        digital.up = value;
-        e.preventDefault();
-        e.stopPropagation();
+        digital.up = v;
         break;
       case "ShiftLeft":
-      case "ControlLeft":
-      case "KeyC":
-        digital.down = value;
-        e.preventDefault();
-        e.stopPropagation();
+        digital.down = v;
         break;
     }
   };
-  window2.addEventListener("keydown", (e) => setDigital(e, true));
-  window2.addEventListener("keyup", (e) => setDigital(e, false));
-  canvas2.style.touchAction = "pinch-zoom";
-  canvas2.addEventListener("pointerdown", () => {
-    mouseDown = true;
-  });
-  canvas2.addEventListener("pointerup", () => {
-    mouseDown = false;
-  });
-  canvas2.addEventListener("pointermove", (e) => {
-    mouseDown = e.pointerType == "mouse" ? (e.buttons & 1) !== 0 : true;
-    if (mouseDown) {
-      analog.x += e.movementX;
-      analog.y += e.movementY;
+  window2.addEventListener("keydown", (e) => setKey(e, true));
+  window2.addEventListener("keyup", (e) => setKey(e, false));
+  canvas2.style.touchAction = "none";
+  canvas2.addEventListener("pointerdown", (e) => {
+    canvas2.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, e);
+    if (pointers.size === 2) {
+      const p = [...pointers.values()];
+      prevDist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
     }
   });
-  canvas2.addEventListener(
-    "wheel",
-    (e) => {
-      mouseDown = (e.buttons & 1) !== 0;
-      if (mouseDown) {
-        analog.zoom += Math.sign(e.deltaY);
-        e.preventDefault();
-        e.stopPropagation();
-      }
-    },
-    { passive: false }
-  );
+  canvas2.addEventListener("pointerup", (e) => {
+    canvas2.releasePointerCapture(e.pointerId);
+    pointers.delete(e.pointerId);
+  });
+  canvas2.addEventListener("pointermove", (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, e);
+    if (pointers.size === 2) {
+      const p = [...pointers.values()];
+      const dist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+      analog.zoom += (dist - prevDist) * 0.01;
+      analog.x += e.movementX;
+      analog.y += e.movementY;
+      analog.panning = true;
+      prevDist = dist;
+    } else if (pointers.size === 1) {
+      analog.x += e.movementX;
+      analog.y += e.movementY;
+      analog.panning = (e.buttons & 4) !== 0 || isAlt;
+    }
+  });
+  canvas2.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    analog.zoom -= Math.sign(e.deltaY);
+  }, { passive: false });
   return () => {
     const out = {
       digital,
-      analog: {
-        x: analog.x,
-        y: analog.y,
-        zoom: analog.zoom,
-        touching: mouseDown
-      }
+      analog: { ...analog, touching: pointers.size > 0 }
     };
     analog.x = 0;
     analog.y = 0;
     analog.zoom = 0;
+    analog.panning = false;
     return out;
   };
 }
@@ -6471,12 +6298,13 @@ var GUI = class _GUI {
 var gui = new GUI();
 var controls = {
   pause: false,
-  cameraType: "arcball",
   highDPI: false,
-  bunnyRotation: 0
+  bunnyRotation: 0,
+  resetCamera: () => {
+  }
 };
 var pauseController = gui.add(controls, "pause").name("Pause");
-var cameraController = gui.add(controls, "cameraType", ["arcball", "WASD"]).name("Camera Type");
+var cameraController = gui.add(controls, "resetCamera").name("Reset Camera");
 var highDPIController = gui.add(controls, "highDPI").name("High DPI");
 var rotationController = gui.add(controls, "bunnyRotation", 0, 360, 1).name("Bunny Rotation");
 
@@ -6928,18 +6756,17 @@ device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
 var fov = 2 * Math.PI / 5;
 var fovScaled = Math.tan(fov / 2);
 var initialCameraPosition = vec3.create(3, 2, 5);
-var cameras = {
-  arcball: new ArcballCamera({ position: initialCameraPosition }),
-  WASD: new WASDCamera({ position: initialCameraPosition })
-};
-var currentCamera = cameras[controls.cameraType];
-cameraController.onChange((newCameraType) => {
-  const oldCamera = currentCamera;
-  const newCamera = cameras[newCameraType];
-  newCamera.matrix = oldCamera.matrix;
-  currentCamera = newCamera;
-  controls.cameraType = newCameraType;
+var initialCameraTarget = vec3.create(0, 0, 0);
+var camera = createOrbitCamera({
+  position: initialCameraPosition,
+  target: initialCameraTarget
 });
+controls.resetCamera = () => {
+  camera = createOrbitCamera({
+    position: initialCameraPosition,
+    target: initialCameraTarget
+  });
+};
 var InputValues = new ArrayBuffer(256);
 var InputViews = {
   camera_matrix: new Float32Array(InputValues, 0, 16),
@@ -6982,8 +6809,8 @@ Grid: ${bboxSize[0]} \xD7 ${bboxSize[1]} \xD7 ${bboxSize[2]} units
 Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime) {
   InputViews.time_delta[0] = deltaTime;
-  currentCamera.update(deltaTime, inputHandler());
-  InputViews.camera_matrix.set(currentCamera.matrix);
+  camera.update(deltaTime, inputHandler());
+  InputViews.camera_matrix.set(camera.matrix);
   device.queue.writeBuffer(inputBuffer, 0, InputValues);
 }
 var combinedShader = picovdb_default + "\n" + compute_default;
