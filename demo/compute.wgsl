@@ -98,7 +98,8 @@ fn raymarch_scene_graph(ray: Ray) -> vec3f {
     let light_dist = length(light_vec);
 
     if is_volume {
-        let diffuse = max(dot(volume_hit.normal, light_dir), 0.0);
+        var diffuse = 0.5 + 0.5 * dot(volume_hit.normal, light_dir);
+        diffuse = diffuse * diffuse;
         
         // Use the optimized occlusion check for shadows
         var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);
@@ -109,8 +110,8 @@ fn raymarch_scene_graph(ray: Ray) -> vec3f {
             (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,
             light_dist
         );
-        let shadow = select(1.0, 0.3, in_shadow);
-        return vec3f(0.2, 0.5, 1.0) * (0.15 + diffuse * shadow * 0.8);
+        let shadow = select(1.0, 0.8, in_shadow);
+        return vec3f(0.2, 0.5, 1.0) * (diffuse * shadow);
     } else {
         // Simple ground shadow
         var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);
