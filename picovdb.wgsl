@@ -620,66 +620,39 @@ struct PicoVDBVoxelHit {
     normal: vec3f,   // analytic surface normal
 }
 
-// Evaluate cubic polynomial in Horner form: c0 + t*(c1 + t*(c2 + t*c3))
-fn picovdbEvalCubic(c: vec4f, t: f32) -> f32 {
-    return c.x + t * (c.y + t * (c.z + t * c.w));
-}
+// Newton-Raphson refinement within a monotonic interval.
+// 3 fixed iterations with regula falsi seed — no convergence branch.
+fn picovdbSolveNewton(
+    c: vec4f,
+    t_start: f32, t_end: f32,
+    g_start: f32, g_end: f32,
+    o: vec3f, d: vec3f,
+    stencil: PicoVDBStencil,
+) -> PicoVDBVoxelHit {
+    // Regula falsi initial guess
+    var t = (g_end * t_start - g_start * t_end) / (g_end - g_start);
 
-// Evaluate derivative: c1 + t*(2*c2 + t*3*c3)
-fn picovdbEvalCubicDeriv(c: vec4f, t: f32) -> f32 {
-    return c.y + t * (2.0 * c.z + t * 3.0 * c.w);
-}
-
-// Solve quadratic a*t^2 + b*t + c = 0, returning sorted roots in [0, tFar].
-// Returns count of valid roots (0, 1, or 2).
-fn picovdbSolveQuadraticInRange(
-    a: f32, b: f32, c: f32, tFar: f32,
-    roots: ptr<function, array<f32, 2>>
-) -> u32 {
-    if (abs(a) < 1e-8) {
-        // Degenerate: linear equation b*t + c = 0
-        if (abs(b) < 1e-8) { return 0u; }
-        let t = -c / b;
-        if (t > 0.0 && t < tFar) {
-            (*roots)[0] = t;
-            return 1u;
-        }
-        return 0u;
+    // 3 NR iterations — quadratic convergence from a good initial guess
+    // means ~12 digits of precision, well beyond f32's ~7.
+    for (var i = 0; i < 3; i++) {
+        let gt  = ((c.w * t + c.z) * t + c.y) * t + c.x;
+        let gdt = (3.0 * c.w * t + 2.0 * c.z) * t + c.y;
+        // Guard: if derivative is near zero (tangential graze), stop.
+        // Without this, t can fly to infinity and corrupt the result.
+        if (abs(gdt) < 1e-10) { break; }
+        t -= gt / gdt;
     }
 
-    let disc = b * b - 4.0 * a * c;
-    if (disc < 0.0) { return 0u; }
-
-    // Numerically stable form: avoid catastrophic cancellation
-    let sqrtDisc = sqrt(disc);
-    let sign_b = select(-1.0, 1.0, b >= 0.0);
-    let q = -0.5 * (b + sign_b * sqrtDisc);
-
-    var t0 = q / a;
-    var t1 = select(c / q, 0.0, abs(q) < 1e-12);
-
-    // Sort ascending
-    let tMin = min(t0, t1);
-    let tMax = max(t0, t1);
-
-    var count = 0u;
-    if (tMin > 0.0 && tMin < tFar) {
-        (*roots)[count] = tMin;
-        count += 1u;
-    }
-    if (tMax > 0.0 && tMax < tFar) {
-        (*roots)[count] = tMax;
-        count += 1u;
-    }
-    return count;
+    t = clamp(t, t_start, t_end);
+    let uvw = o + t * d;
+    return PicoVDBVoxelHit(
+        true,
+        t,
+        uvw,
+        picovdbTrilinearGradient(uvw, stencil),  // unnormalized
+    );
 }
 
-// Analytical ray–voxel intersection.
-//
-// o:        ray origin in voxel-local [0,1]^3 space (at entry point)
-// d:        ray direction in index space (not normalized)
-// t_far:    parametric distance from o to the voxel exit
-// stencil:  2x2x2 corner SDF values
 fn picovdbVoxelIntersect(
     o:       vec3f,
     d:       vec3f,
@@ -688,18 +661,6 @@ fn picovdbVoxelIntersect(
 ) -> PicoVDBVoxelHit {
     var result: PicoVDBVoxelHit;
     result.hit = false;
-
-    // --- Solid voxel test (Section 2): if the ray enters inside the surface,
-    //     report an immediate hit. This patches cracks from rays sneaking
-    //     between adjacent voxels due to floating-point imprecision. ---
-    let f_entry = picovdbTrilinearInterpolation(o, stencil);
-    if (f_entry < 0.0) {
-        result.hit = true;
-        result.t = 0.0;
-        result.uvw = o;
-        result.normal = normalize(picovdbTrilinearGradient(o, stencil));
-        return result;
-    }
 
     // --- k-coefficients (Equation 3) ---
     let k0 = stencil.v000;
@@ -721,68 +682,80 @@ fn picovdbVoxelIntersect(
     let m5 = k7 * o.z - k3;
 
     // --- Cubic coefficients c3*t^3 + c2*t^2 + c1*t + c0 = 0 (Equation 6) ---
-    // Packed as vec4f(c0, c1, c2, c3) for the Horner evaluators.
+    // Packed as vec4f(c0, c1, c2, c3).
+    // c.x == trilinear value at ray origin (t=0), proven algebraically.
     let c = vec4f(
-        /* c0 */ (k4 * o.z - k0) + o.x * m3 + o.y * m4 + m0 * m5,
-        /* c1 */ d.x * m3 + d.y * m4 + m2 * m5 + d.z * (k4 + k5 * o.x + k6 * o.y + k7 * m0),
-        /* c2 */ m1 * m5 + d.z * (k5 * d.x + k6 * d.y + k7 * m2),
-        /* c3 */ k7 * m1 * d.z,
+        (k4 * o.z - k0) + o.x * m3 + o.y * m4 + m0 * m5,
+        d.x * m3 + d.y * m4 + m2 * m5 + d.z * (k4 + k5 * o.x + k6 * o.y + k7 * m0),
+        m1 * m5 + d.z * (k5 * d.x + k6 * d.y + k7 * m2),
+        k7 * m1 * d.z,
     );
 
-    // --- Marmitt interval splitting (Section 2, Figure 4) ---
-    // Roots of g'(t) = 3*c3*t^2 + 2*c2*t + c1 split [0, tFar] into
-    // monotonic sub-intervals where at most one root of g(t) exists.
-    var derivRoots: array<f32, 2>;
-    let numDerivRoots = picovdbSolveQuadraticInRange(
-        3.0 * c.w, 2.0 * c.z, c.y, t_far, &derivRoots
-    );
-
-    // Interval boundaries: [0, derivRoot0?, derivRoot1?, tFar]
-    var bounds: array<f32, 4>;
-    bounds[0] = 0.0;
-    var n = 1u;
-    for (var i = 0u; i < numDerivRoots; i += 1u) {
-        bounds[n] = derivRoots[i];
-        n += 1u;
+    // --- Solid voxel test (Section 2) ---
+    // NOTE: c.x = -f(o) due to Equation 2's sign convention:
+    //   f = z*(k4+...) - (k0+...), so c0 = -k0 - k1*ox - ... + oz*(k4+...)
+    // which equals -f(ox,oy,oz). Therefore c.x > 0 means f(o) < 0 (inside).
+    if (c.x > 0.0) {
+        return PicoVDBVoxelHit(
+            true, 0.0, o,
+            picovdbTrilinearGradient(o, stencil),
+        );
     }
-    bounds[n] = t_far;
-    n += 1u;
 
-    // --- Process sub-intervals: find first sign change, refine with NR ---
-    for (var i = 0u; i < n - 1u; i += 1u) {
-        let tStart = bounds[i];
-        let tEnd   = bounds[i + 1u];
+    // --- Derivative roots for Marmitt interval splitting ---
+    // g'(t) = 3*c3*t^2 + 2*c2*t + c1. Roots split [0, t_far] into
+    // monotonic sub-intervals. Solved inline, no function call overhead.
+    let qA = 3.0 * c.w;
+    let qB = 2.0 * c.z;
+    let qC = c.y;
 
-        let gStart = picovdbEvalCubic(c, tStart);
-        let gEnd   = picovdbEvalCubic(c, tEnd);
+    // Default: roots outside range (effectively ignored in interval checks)
+    var r0 = -1.0;
+    var r1 = -1.0;
 
-        // No sign change → no root in this interval
-        if (gStart * gEnd > 0.0) { continue; }
-
-        // Initial guess: regula falsi (linear interpolation of the root)
-        var t = (gEnd * tStart - gStart * tEnd) / (gEnd - gStart);
-
-        // Newton-Raphson refinement (paper Listing 1)
-        var tPrev = t_far;
-        for (var q = 0u; q < 4u; q += 1u) { // 8 or 4
-            if (abs(t - tPrev) < 4e-3) { break; }
-            let gt  = picovdbEvalCubic(c, t);
-            let gdt = picovdbEvalCubicDeriv(c, t);
-            tPrev = t;
-            if (abs(gdt) < 1e-10) { break; }
-            t -= gt / gdt;
+    if (abs(qA) > 1e-8) {
+        let disc = qB * qB - 4.0 * qA * qC;
+        if (disc >= 0.0) {
+            let inv2A = 0.5 / qA;
+            let sqrtDisc = sqrt(disc);
+            r0 = (-qB - sqrtDisc) * inv2A;
+            r1 = (-qB + sqrtDisc) * inv2A;
         }
-
-        t = clamp(t, tStart, tEnd);
-
-        if (t >= 0.0 && t <= t_far) {
-            let uvw = o + t * d;
-            result.hit = true;
-            result.t = t;
-            result.uvw = uvw;
-            result.normal = normalize(picovdbTrilinearGradient(uvw, stencil));
-            return result;
-        }
+    } else if (abs(qB) > 1e-8) {
+        r0 = -qC / qB;
     }
+
+    // --- Unrolled interval checking ---
+    // Up to 3 intervals: [0, r0], [r0, r1], [last_boundary, t_far]
+    // Walk front-to-back, return at first sign change.
+    var t_start = 0.0;
+    var g_start = c.x;  // Already computed, reuse
+
+    // Interval 1: [0, r0]
+    if (r0 > 0.0 && r0 < t_far) {
+        let g_r0 = ((c.w * r0 + c.z) * r0 + c.y) * r0 + c.x;
+        if (g_start * g_r0 <= 0.0) {
+            return picovdbSolveNewton(c, t_start, r0, g_start, g_r0, o, d, stencil);
+        }
+        t_start = r0;
+        g_start = g_r0;
+    }
+
+    // Interval 2: [r0, r1]
+    if (r1 > t_start && r1 < t_far) {
+        let g_r1 = ((c.w * r1 + c.z) * r1 + c.y) * r1 + c.x;
+        if (g_start * g_r1 <= 0.0) {
+            return picovdbSolveNewton(c, t_start, r1, g_start, g_r1, o, d, stencil);
+        }
+        t_start = r1;
+        g_start = g_r1;
+    }
+
+    // Interval 3: [last_boundary, t_far]
+    let g_far = ((c.w * t_far + c.z) * t_far + c.y) * t_far + c.x;
+    if ((g_start <= 0.0) != (g_far <= 0.0)) {
+        return picovdbSolveNewton(c, t_start, t_far, g_start, g_far, o, d, stencil);
+    }
+
     return result;
 }
