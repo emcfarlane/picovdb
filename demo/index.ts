@@ -45,6 +45,7 @@ function resizeCanvas() {
   // Will recreate GPU resources after they're initially created
   if (raytracedTexture) {
     createGPUResources();
+    updatePixelRadius();
   }
 }
 
@@ -54,6 +55,7 @@ window.addEventListener('resize', resizeCanvas);
 // Update canvas size when High DPI setting changes
 highDPIController.onChange(() => {
   resizeCanvas();
+  updatePixelRadius();
 });
 
 // The use of timestamps require a dedicated adapter feature:
@@ -308,7 +310,8 @@ const InputViews = {
   camera_matrix: new Float32Array(InputValues, 0, 16),
   fov_scale: new Float32Array(InputValues, 64, 1),
   time_delta: new Float32Array(InputValues, 68, 1),
-  _pad: new Uint32Array(InputValues, 72, 2),
+  pixel_radius: new Float32Array(InputValues, 72, 1),
+  _pad: new Uint32Array(InputValues, 76, 1),
   transform_matrix: new Float32Array(InputValues, 80, 16),
   transform_inverse_matrix: new Float32Array(InputValues, 144, 16),
 };
@@ -319,6 +322,22 @@ const inputBuffer = device.createBuffer({
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
 InputViews.fov_scale[0] = fovScaled;
+
+// Calculate pixel radius for cone tracing: how much ray spreads per unit distance
+// pixel_radius = fov_scale / resolution_height (in normalized coordinates)
+function computePixelRadius(fov_y_radians: number, resolution_height: number) {
+  const fov_scale = Math.tan(fov_y_radians * 0.5);
+  // This gives the angular size of one pixel
+  return (2.0 * fov_scale) / resolution_height;
+}
+
+// Update pixel radius (call on resize)
+function updatePixelRadius() {
+  InputViews.pixel_radius[0] = computePixelRadius(fov, height);
+}
+
+// Initialize cone constants
+updatePixelRadius();
 
 // Function to update transform matrices
 function updateTransformMatrices() {

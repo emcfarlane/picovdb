@@ -272,7 +272,6 @@ fn picovdbReadAccessorGetLevelCount(
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelCount {
     let dirty = picovdbReadAccessorComputeDirty(acc, ijk);
-    
     if (picovdbReadAccessorIsCachedLeaf(acc, dirty)) {
         return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);
     } else if (picovdbReadAccessorIsCachedLower(acc, dirty)) {
@@ -423,8 +422,9 @@ fn picovdbHDDAZeroCrossing(
     tmin: f32,
     direction: vec3f,
     tmax: f32,
-    thit: ptr<function, f32>,
-    v: ptr<function, f32>
+    pixel_radius: f32,
+    out_distance: ptr<function, f32>,
+    out_normal: ptr<function, vec3f>,
 ) -> bool {
     let direction_inv = 1 / direction;
     var tmin_mut = tmin;
@@ -451,17 +451,31 @@ fn picovdbHDDAZeroCrossing(
             continue; // Re-evaluate with the new aligned voxel
         }
 
-        // Leaf level logic (Surface detection)
         if (hdda.dim == 1 && picovdbIsActive(result)) {
             let val = picovdbGetValue(grid, result.count);
-            if (val * v0 < 0.0) {
-                *thit = hdda.tmin;
-                *v = val;
-                return true;
+            if (val < 0.0) {
+                let cone_radius = hdda.tmin * pixel_radius;
+                if (cone_radius < 0.5) {
+                    // Voxel projects larger than a pixel — use analytical cubic solver
+                    // for smooth, sub-voxel accurate intersection.
+                    let stencil = picovdbSampleStencil(acc, grid, hdda.voxel);
+                    let o_local = origin + direction * hdda.tmin - vec3f(hdda.voxel);
+                    let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z) - hdda.tmin;
+                    let hit = picovdbVoxelIntersect(o_local, direction, t_exit, stencil);
+                    if (hit.hit) {
+                        *out_distance = hdda.tmin + hit.t;
+                        *out_normal = hit.normal;
+                        return true;
+                    }
+                } else {
+                    let stencil = picovdbSampleStencil(acc, grid, hdda.voxel);
+                    let p_local = fract(origin + direction * hdda.tmin);
+                    *out_distance = hdda.tmin;
+                    *out_normal = picovdbTrilinearGradient(p_local, stencil);
+                    return true;
+                }
             }
-            // Optional: v0 = val; // Update previous value for continuous crossing
         }
-
         // Step to next boundary
         if (!picovdbHDDAStep(&hdda)) { break; }
     }
@@ -480,13 +494,15 @@ fn picovdbSampleStencil(
     ijk: vec3i
 ) -> PicoVDBStencil {
     var s: PicoVDBStencil;
+    // Plane Z=0
     s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 0), grid).count);
-    s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);
-    s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);
-    s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);
     s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 0), grid).count);
-    s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);
+    s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);
     s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 0), grid).count);
+    // Plane Z=1
+    s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);
+    s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);
+    s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);
     s.v111 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 1), grid).count);
     return s;
 }
@@ -526,13 +542,22 @@ fn picovdbTrilinearInterpolation(uvw: vec3f, s: PicoVDBStencil) -> f32 {
     let v01 = mix(s.v010, s.v011, uvw.z);
     let v10 = mix(s.v100, s.v101, uvw.z);
     let v11 = mix(s.v110, s.v111, uvw.z);
-    
     // Interpolate along Y
     let v0 = mix(v00, v01, uvw.y);
     let v1 = mix(v10, v11, uvw.y);
-    
     // Interpolate along X
     return mix(v0, v1, uvw.x);
+}
+
+fn picovdbSampleTrilinear(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    pos: vec3f
+) -> f32 {
+    let ijk = vec3i(floor(pos));
+    let uvw = fract(pos);
+    let s = picovdbSampleStencil(acc, grid, ijk);
+    return picovdbTrilinearInterpolation(uvw, s);
 }
 
 fn picovdbHDDAIsOccluded(
@@ -574,118 +599,190 @@ fn picovdbHDDAIsOccluded(
     return false;
 }
 
-fn picovdbSampleTrilinear(
-    acc: ptr<function, PicoVDBReadAccessor>,
-    grid: PicoVDBGrid,
-    pos: vec3f
-) -> f32 {
-    let ijk = vec3i(floor(pos));
-    let uvw = fract(pos);
-    let s = picovdbSampleStencil(acc, grid, ijk);
-    return picovdbTrilinearInterpolation(uvw, s);
+// ============================================================================
+// Analytical Ray–Voxel Intersection for Trilinearly Interpolated SDF Grids
+//
+// Based on: Hansson-Söderlund, Evans, Akenine-Möller,
+//   "Ray Tracing of Signed Distance Function Grids", JCGT 2022
+//   https://jcgt.org/published/0011/03/06/
+//
+// Given the 2x2x2 SDF stencil at a voxel's corners, trilinear interpolation
+// defines a cubic implicit surface f(x,y,z) = 0. Substituting the ray
+// parametrically yields a cubic polynomial in t: c3*t^3 + c2*t^2 + c1*t + c0 = 0.
+// We use Marmitt's interval splitting (via the derivative roots) to isolate
+// monotonic sub-intervals, then Newton-Raphson to refine the root.
+// ============================================================================
+
+struct PicoVDBVoxelHit {
+    hit:    bool,
+    t:      f32,     // parametric distance in voxel-local space
+    uvw:    vec3f,   // hit position in voxel-local [0,1]^3
+    normal: vec3f,   // analytic surface normal
 }
 
-//fn picovdbHDDASmoothTraversal(
-//    acc: ptr<function, PicoVDBReadAccessor>,
-//    grid: PicoVDBGrid,
-//    origin: vec3f,
-//    tmin: f32,
-//    direction: vec3f,
-//    tmax: f32,
-//    thit: ptr<function, f32>
-//) -> bool {
-//    let direction_inv = 1 / direction;
-//    var tmin_mut = tmin;
-//    var tmax_mut = tmax;
-//    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
-//        return false;
-//    }
+// Evaluate cubic polynomial in Horner form: c0 + t*(c1 + t*(c2 + t*c3))
+fn picovdbEvalCubic(c: vec4f, t: f32) -> f32 {
+    return c.x + t * (c.y + t * (c.z + t * c.w));
+}
+
+// Evaluate derivative: c1 + t*(2*c2 + t*3*c3)
+fn picovdbEvalCubicDeriv(c: vec4f, t: f32) -> f32 {
+    return c.y + t * (2.0 * c.z + t * 3.0 * c.w);
+}
+
+// Solve quadratic a*t^2 + b*t + c = 0, returning sorted roots in [0, tFar].
+// Returns count of valid roots (0, 1, or 2).
+fn picovdbSolveQuadraticInRange(
+    a: f32, b: f32, c: f32, tFar: f32,
+    roots: ptr<function, array<f32, 2>>
+) -> u32 {
+    if (abs(a) < 1e-8) {
+        // Degenerate: linear equation b*t + c = 0
+        if (abs(b) < 1e-8) { return 0u; }
+        let t = -c / b;
+        if (t > 0.0 && t < tFar) {
+            (*roots)[0] = t;
+            return 1u;
+        }
+        return 0u;
+    }
+
+    let disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) { return 0u; }
+
+    // Numerically stable form: avoid catastrophic cancellation
+    let sqrtDisc = sqrt(disc);
+    let sign_b = select(-1.0, 1.0, b >= 0.0);
+    let q = -0.5 * (b + sign_b * sqrtDisc);
+
+    var t0 = q / a;
+    var t1 = select(c / q, 0.0, abs(q) < 1e-12);
+
+    // Sort ascending
+    let tMin = min(t0, t1);
+    let tMax = max(t0, t1);
+
+    var count = 0u;
+    if (tMin > 0.0 && tMin < tFar) {
+        (*roots)[count] = tMin;
+        count += 1u;
+    }
+    if (tMax > 0.0 && tMax < tFar) {
+        (*roots)[count] = tMax;
+        count += 1u;
+    }
+    return count;
+}
+
+// Analytical ray–voxel intersection.
 //
-//    var hdda: PicoVDBHDDA;
-//    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax, direction_inv, 4096);
-//
-//    // Cache the trilinear value at the entry point of the current voxel
-//    var v_entry: f32 = picovdbSampleTrilinear(acc, grid, origin + direction * hdda.tmin);
-//
-//    for (var i = 0; i < 256; i++) {
-//        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
-//        let target_dim = picovdbDimForLevel[result.level];
-//
-//        if (hdda.dim != target_dim) {
-//            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
-//            // Re-sync v_entry after a level jump
-//            v_entry = picovdbSampleTrilinear(acc, grid, origin + direction * hdda.tmin);
-//            continue;
-//        }
-//
-//        if (hdda.dim == 1) {
-//            let discrete_val = picovdbGetValue(grid, result.count);
-//            
-//            // OPTIMIZATION 1: Discrete Guard
-//            // If the discrete value is far from the surface, don't sample the stencil.
-//            // 1.732 (sqrt(3)) is the max distance from a voxel center to its corner.
-//            if (discrete_val > 1.2) { 
-//                if (!picovdbHDDAStep(&hdda)) { break; }
-//                // Use discrete value as a cheap approximation for the next v_entry
-//                v_entry = discrete_val; 
-//                continue; 
-//            }
-//
-//            let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z);
-//            let v_exit = picovdbSampleTrilinear(acc, grid, origin + direction * t_exit);
-//
-//            // OPTIMIZATION 2: Early Exit for solid interior
-//            if (v_entry <= 0.0) {
-//                *thit = hdda.tmin;
-//                return true;
-//            }
-//
-//            // Check for zero-crossing
-//            if (v_entry * v_exit <= 0.0) {
-//                // Iterations reduced to 3 for performance; 
-//                // Secant search is better than Binary for SDFs
-//                *thit = picovdbRefineIntersection(acc, grid, origin, direction, hdda.tmin, t_exit, v_entry, v_exit);
-//                return true;
-//            }
-//            
-//            // OPTIMIZATION 3: Value Caching
-//            // The exit of this voxel IS the entry of the next.
-//            v_entry = v_exit;
-//        }
-//
-//        if (!picovdbHDDAStep(&hdda)) { break; }
-//    }
-//    return false;
-//}
-//
-// Optimize refinement using Secant Method
-//fn picovdbRefineIntersection(
-//    acc: ptr<function, PicoVDBReadAccessor>,
-//    grid: PicoVDBGrid,
-//    origin: vec3f,
-//    direction: vec3f,
-//    t_start: f32,
-//    t_end: f32,
-//    v_start: f32,
-//    v_end: f32
-//) -> f32 {
-//    var ts = t_start;
-//    var te = t_end;
-//    var vs = v_start;
-//    var ve = v_end;
-//
-//    for (var i = 0; i < 2; i++) {
-//        // Linear interpolation to find where the line crosses zero
-//        let t_guess = ts + (te - ts) * (vs / (vs - ve));
-//        let v_guess = picovdbSampleTrilinear(acc, grid, origin + direction * t_guess);
-//
-//        if (v_guess > 0.0) {
-//            ts = t_guess;
-//            vs = v_guess;
-//        } else {
-//            te = t_guess;
-//            ve = v_guess;
-//        }
-//    }
-//    return te;
-//}
+// o:        ray origin in voxel-local [0,1]^3 space (at entry point)
+// d:        ray direction in index space (not normalized)
+// t_far:    parametric distance from o to the voxel exit
+// stencil:  2x2x2 corner SDF values
+fn picovdbVoxelIntersect(
+    o:       vec3f,
+    d:       vec3f,
+    t_far:   f32,
+    stencil: PicoVDBStencil,
+) -> PicoVDBVoxelHit {
+    var result: PicoVDBVoxelHit;
+    result.hit = false;
+
+    // --- Solid voxel test (Section 2): if the ray enters inside the surface,
+    //     report an immediate hit. This patches cracks from rays sneaking
+    //     between adjacent voxels due to floating-point imprecision. ---
+    let f_entry = picovdbTrilinearInterpolation(o, stencil);
+    if (f_entry < 0.0) {
+        result.hit = true;
+        result.t = 0.0;
+        result.uvw = o;
+        result.normal = normalize(picovdbTrilinearGradient(o, stencil));
+        return result;
+    }
+
+    // --- k-coefficients (Equation 3) ---
+    let k0 = stencil.v000;
+    let k1 = stencil.v100 - stencil.v000;
+    let k2 = stencil.v010 - stencil.v000;
+    let a  = stencil.v101 - stencil.v001;
+    let k3 = stencil.v110 - stencil.v010 - k1;
+    let k4 = k0 - stencil.v001;
+    let k5 = k1 - a;
+    let k6 = k2 - (stencil.v011 - stencil.v001);
+    let k7 = k3 - (stencil.v111 - stencil.v011 - a);
+
+    // --- m-intermediates (Equation 7) ---
+    let m0 = o.x * o.y;
+    let m1 = d.x * d.y;
+    let m2 = o.x * d.y + o.y * d.x;
+    let m3 = k5 * o.z - k1;
+    let m4 = k6 * o.z - k2;
+    let m5 = k7 * o.z - k3;
+
+    // --- Cubic coefficients c3*t^3 + c2*t^2 + c1*t + c0 = 0 (Equation 6) ---
+    // Packed as vec4f(c0, c1, c2, c3) for the Horner evaluators.
+    let c = vec4f(
+        /* c0 */ (k4 * o.z - k0) + o.x * m3 + o.y * m4 + m0 * m5,
+        /* c1 */ d.x * m3 + d.y * m4 + m2 * m5 + d.z * (k4 + k5 * o.x + k6 * o.y + k7 * m0),
+        /* c2 */ m1 * m5 + d.z * (k5 * d.x + k6 * d.y + k7 * m2),
+        /* c3 */ k7 * m1 * d.z,
+    );
+
+    // --- Marmitt interval splitting (Section 2, Figure 4) ---
+    // Roots of g'(t) = 3*c3*t^2 + 2*c2*t + c1 split [0, tFar] into
+    // monotonic sub-intervals where at most one root of g(t) exists.
+    var derivRoots: array<f32, 2>;
+    let numDerivRoots = picovdbSolveQuadraticInRange(
+        3.0 * c.w, 2.0 * c.z, c.y, t_far, &derivRoots
+    );
+
+    // Interval boundaries: [0, derivRoot0?, derivRoot1?, tFar]
+    var bounds: array<f32, 4>;
+    bounds[0] = 0.0;
+    var n = 1u;
+    for (var i = 0u; i < numDerivRoots; i += 1u) {
+        bounds[n] = derivRoots[i];
+        n += 1u;
+    }
+    bounds[n] = t_far;
+    n += 1u;
+
+    // --- Process sub-intervals: find first sign change, refine with NR ---
+    for (var i = 0u; i < n - 1u; i += 1u) {
+        let tStart = bounds[i];
+        let tEnd   = bounds[i + 1u];
+
+        let gStart = picovdbEvalCubic(c, tStart);
+        let gEnd   = picovdbEvalCubic(c, tEnd);
+
+        // No sign change → no root in this interval
+        if (gStart * gEnd > 0.0) { continue; }
+
+        // Initial guess: regula falsi (linear interpolation of the root)
+        var t = (gEnd * tStart - gStart * tEnd) / (gEnd - gStart);
+
+        // Newton-Raphson refinement (paper Listing 1)
+        var tPrev = t_far;
+        for (var q = 0u; q < 4u; q += 1u) { // 8 or 4
+            if (abs(t - tPrev) < 4e-3) { break; }
+            let gt  = picovdbEvalCubic(c, t);
+            let gdt = picovdbEvalCubicDeriv(c, t);
+            tPrev = t;
+            if (abs(gdt) < 1e-10) { break; }
+            t -= gt / gdt;
+        }
+
+        t = clamp(t, tStart, tEnd);
+
+        if (t >= 0.0 && t <= t_far) {
+            let uvw = o + t * d;
+            result.hit = true;
+            result.t = t;
+            result.uvw = uvw;
+            result.normal = normalize(picovdbTrilinearGradient(uvw, stencil));
+            return result;
+        }
+    }
+    return result;
+}

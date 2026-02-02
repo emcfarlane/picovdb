@@ -2,7 +2,8 @@ struct Input {
     camera_matrix: mat4x4f,
     fov_scale: f32, // tan(fov * 0.5)
     time_delta: f32,
-    _pad: vec2u,
+    pixel_radius: f32, // Cone spread per unit distance: 1 / (resolution.y * focal_length)
+    _pad: u32,
     transform_matrix: mat4x4f,
     transform_inverse_matrix: mat4x4f,
 }
@@ -45,21 +46,18 @@ fn intersect_picovdb(
         return RayHit(0.01, -world_ray.direction);
     }
 
-    var hit_t_idx: f32;
-    var hit_v: f32;
+    var hit_distance: f32;
+    var hit_normal: vec3f;
     let hit = picovdbHDDAZeroCrossing(
-        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, &hit_t_idx, &hit_v,
+        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, input.pixel_radius, &hit_distance, &hit_normal,
     );
     if !hit { return RayHit(-1.0, vec3f(0)); }
 
-    let index_hit_point = index_ray.origin + index_ray.direction * hit_t_idx;
+    let index_hit_point = index_ray.origin + index_ray.direction * hit_distance;
     let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;
     let world_distance = length(world_hit_point - world_ray.origin);
 
-    let stencil = picovdbSampleStencil(&accessor, grid, vec3i(floor(index_hit_point)));
-    let index_gradient = picovdbTrilinearGradient(fract(index_hit_point), stencil);
-    let normal = normalize((index_to_world * vec4f(index_gradient, 0.0)).xyz);
-
+    let normal = normalize((index_to_world * vec4f(hit_normal, 0.0)).xyz);
     return RayHit(world_distance, normal);
 }
 
