@@ -3504,7 +3504,7 @@ var {
 var blit_default = "struct VertexInput {\n    @location(0) position: vec2f,\n}\n\nstruct VertexOutput {\n    @builtin(position) pos: vec4f,\n    @location(0) uv: vec2f,\n}\n\nstruct FragmentInput {\n    @location(0) uv: vec2f,\n}\n\n@group(0) @binding(0) var raytracedTexture: texture_2d<f32>;\n@group(0) @binding(1) var textureSampler: sampler;\n\n@vertex\nfn vertexMain(input: VertexInput) -> VertexOutput {\n    // Convert from [-1,1] to [0,1] for UV coordinates\n    let uv = input.position * 0.5 + 0.5;\n    return VertexOutput(\n        vec4f(input.position, 0.0, 1.0),\n        uv\n    );\n}\n\n@fragment\nfn fragmentMain(\n    input: FragmentInput,\n) -> @location(0) vec4f {\n    let color = textureSample(raytracedTexture, textureSampler, input.uv);\n    // GPU hardware handles filtering and edge cases automatically\n    return color;\n}\n";
 
 // compute.wgsl
-var compute_default = "struct Input {\n    camera_matrix: mat4x4f,\n    fov_scale: f32, // tan(fov * 0.5)\n    time_delta: f32,\n    pixel_radius: f32, // Cone spread per unit distance: 1 / (resolution.y * focal_length)\n    _pad: u32,\n    transform_matrix: mat4x4f,\n    transform_inverse_matrix: mat4x4f,\n}\n\n@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;\n@group(0) @binding(1) var<uniform> input: Input;\n@group(0) @binding(2) var<storage> picovdb_grids: array<PicoVDBGrid>;\n@group(0) @binding(3) var<storage> picovdb_roots: array<PicoVDBRoot>;\n@group(0) @binding(4) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n@group(0) @binding(5) var<storage> picovdb_lowers: array<PicoVDBLower>;\n@group(0) @binding(6) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n@group(0) @binding(7) var<storage> picovdb_buffer: array<u32>;\n\nstruct RayHit {\n    distance: f32,\n    normal: vec3f,\n}\n\nfn intersect_picovdb(\n    world_ray: Ray,\n    world_to_index: mat4x4f,\n    index_to_world: mat4x4f,\n) -> RayHit {\n    let grid = picovdb_grids[0];\n    let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;\n    let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;\n    let idx_dir_len = length(idx_dir_unnorm);\n    let idx_direction = idx_dir_unnorm / idx_dir_len;\n\n    let index_ray = Ray(idx_origin, idx_direction);\n    let tmin = 0.0;\n    let tmax = 10000.0; // TODO: set max world clip distance.\n\n    var accessor: PicoVDBReadAccessor;\n    picovdbReadAccessorInit(&accessor, 0);\n\n    // Inside Check (Works even if camera is in background space)\n    let start_val = picovdbSampleTrilinear(&accessor, grid, idx_origin);\n    if start_val < 0.0 {\n        return RayHit(0.01, -world_ray.direction);\n    }\n\n    var hit_distance: f32;\n    var hit_normal: vec3f;\n    let hit = picovdbHDDAZeroCrossing(\n        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, input.pixel_radius, &hit_distance, &hit_normal,\n    );\n    if !hit { return RayHit(-1.0, vec3f(0)); }\n\n    let index_hit_point = index_ray.origin + index_ray.direction * hit_distance;\n    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;\n    let world_distance = length(world_hit_point - world_ray.origin);\n\n    let normal = normalize((index_to_world * vec4f(hit_normal, 0.0)).xyz);\n    return RayHit(world_distance, normal);\n}\n\nstruct Ray {\n    origin: vec3f,\n    direction: vec3f,\n}\n\n// Ground plane intersection (only visible from above)\nfn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {\n    if ray.direction.y >= 0.0 || abs(ray.direction.y) < 0.001 {\n        return -1.0;\n    }\n    let t = (plane_y - ray.origin.y) / ray.direction.y;\n    return select(-1.0, t, t > 0.001);\n}\n\nfn raymarch_scene_graph(ray: Ray) -> vec3f {\n    let volume_hit = intersect_picovdb(ray, input.transform_matrix, input.transform_inverse_matrix);\n    let ground_t = intersect_ground_plane(ray, -2.0);\n    \n    let background = vec3f(0.95, 0.95, 1.0);\n    let light_pos = vec3f(20.0, 30.0, 10.0);\n\n    // Determine primary hit\n    var t = 1e6f;\n    var is_volume = false;\n    if volume_hit.distance > 0.0 { t = volume_hit.distance; is_volume = true; }\n    if ground_t > 0.0 && ground_t < t { t = ground_t; is_volume = false; }\n\n    if t > 1e5f { return background; }\n\n    let hit_point = ray.origin + ray.direction * t;\n    let light_vec = light_pos - hit_point;\n    let light_dir = normalize(light_vec);\n    let light_dist = length(light_vec);\n\n    if is_volume {\n        var diffuse = 0.5 + 0.5 * dot(volume_hit.normal, light_dir);\n        diffuse = diffuse * diffuse;\n        \n        // Use the optimized occlusion check for shadows\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + volume_hit.normal * 0.1, 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let shadow = select(1.0, 0.8, in_shadow);\n        return vec3f(0.2, 0.5, 1.0) * (diffuse * shadow);\n    } else {\n        // Simple ground shadow\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + vec3f(0, 0.1, 0), 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let fade = 1.0 - smoothstep(20.0, 30.0, length(hit_point.xz));\n        return mix(background, vec3f(0.3), select(0.0, fade * 0.7, in_shadow));\n    }\n}\n\nfn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {\n    // Convert to normalized coordinates [-1, 1]\n    let uv = (screen_coord / screen_size) * 2.0 - 1.0;\n    \n    // Calculate aspect ratio\n    let aspect_ratio = screen_size.x / screen_size.y;\n\n    // Extract camera basis vectors from view matrix\n    let right: vec3f = input.camera_matrix[0].xyz;\n    let up: vec3f = input.camera_matrix[1].xyz;\n    let forward: vec3f = -input.camera_matrix[2].xyz;\n\n    // Extract camera position\n    let camera_pos: vec3f = input.camera_matrix[3].xyz;\n    \n    // Calculate ray direction\n    let ray_direction = normalize(\n        forward + uv.x * right * aspect_ratio * input.fov_scale + uv.y * up * input.fov_scale\n    );\n    return Ray(camera_pos, ray_direction);\n}\n\n@compute @workgroup_size(16, 16)\nfn computeMain(@builtin(global_invocation_id) global_id: vec3u) {\n    let screen_size = textureDimensions(outputTexture);\n    \n    // Early exit for out-of-bounds threads\n    if global_id.x >= screen_size.x || global_id.y >= screen_size.y {\n        return;\n    }\n\n    // Generate ray\n    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5, vec2f(screen_size));\n    \n    // Raymarching using scene graph\n    let color = raymarch_scene_graph(ray);\n    \n    // Write result\n    textureStore(outputTexture, global_id.xy, vec4f(color, 1.0));\n}\n";
+var compute_default = "struct Input {\n    camera_matrix: mat4x4f,\n    fov_scale: f32, // tan(fov * 0.5)\n    time_delta: f32,\n    pixel_radius: f32, // Cone spread per unit distance: 1 / (resolution.y * focal_length)\n    debug_iterations: u32, // 0 = normal rendering, 1 = debug iteration heatmap\n    transform_matrix: mat4x4f,\n    transform_inverse_matrix: mat4x4f,\n}\n\n@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;\n@group(0) @binding(1) var<uniform> input: Input;\n@group(0) @binding(2) var<storage> picovdb_grids: array<PicoVDBGrid>;\n@group(0) @binding(3) var<storage> picovdb_roots: array<PicoVDBRoot>;\n@group(0) @binding(4) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n@group(0) @binding(5) var<storage> picovdb_lowers: array<PicoVDBLower>;\n@group(0) @binding(6) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n@group(0) @binding(7) var<storage> picovdb_buffer: array<u32>;\n\nstruct RayHit {\n    distance: f32,\n    normal: vec3f,\n    iterations: u32,\n}\n\nstruct Ray {\n    origin: vec3f,\n    direction: vec3f,\n}\n\nfn intersect_picovdb(\n    world_ray: Ray,\n    world_to_index: mat4x4f,\n    index_to_world: mat4x4f,\n) -> RayHit {\n    let grid = picovdb_grids[0];\n    let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;\n    let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;\n    let idx_dir_len = length(idx_dir_unnorm);\n    let idx_direction = idx_dir_unnorm / idx_dir_len;\n\n    let index_ray = Ray(idx_origin, idx_direction);\n    let tmin = 0.0;\n    let tmax = 10000.0;\n\n    var accessor: PicoVDBReadAccessor;\n    picovdbReadAccessorInit(&accessor, 0);\n\n    // Inside Check (Works even if camera is in background space)\n    let start_val = picovdbSampleTrilinear(&accessor, grid, idx_origin);\n    if start_val < 0.0 {\n        return RayHit(0.01, -world_ray.direction, 0u);\n    }\n\n    var hit_distance: f32;\n    var hit_normal: vec3f;\n    var iterations: u32;\n    let hit = picovdbHDDAZeroCrossing(\n        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, input.pixel_radius, &hit_distance, &hit_normal, &iterations,\n    );\n    if !hit { return RayHit(-1.0, vec3f(0), iterations); }\n\n    let index_hit_point = index_ray.origin + index_ray.direction * hit_distance;\n    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;\n    let world_distance = length(world_hit_point - world_ray.origin);\n\n    let normal = normalize((index_to_world * vec4f(hit_normal, 0.0)).xyz);\n    return RayHit(world_distance, normal, iterations);\n}\n\n// Ground plane intersection (only visible from above)\nfn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {\n    if ray.direction.y >= 0.0 || abs(ray.direction.y) < 0.001 {\n        return -1.0;\n    }\n    let t = (plane_y - ray.origin.y) / ray.direction.y;\n    return select(-1.0, t, t > 0.001);\n}\n\nfn raymarch_scene_graph(ray: Ray, iterations: ptr<function, u32>) -> vec3f {\n    let volume_hit = intersect_picovdb(ray, input.transform_matrix, input.transform_inverse_matrix);\n    *iterations = volume_hit.iterations;\n    let ground_t = intersect_ground_plane(ray, -2.0);\n\n    let background = vec3f(0.95, 0.95, 1.0);\n    let light_pos = vec3f(20.0, 30.0, 10.0);\n\n    // Determine primary hit\n    var t = 1e6f;\n    var is_volume = false;\n    if volume_hit.distance > 0.0 {\n        t = volume_hit.distance;\n        is_volume = true;\n    }\n    if ground_t > 0.0 && ground_t < t {\n        t = ground_t;\n        is_volume = false;\n    }\n    if t > 1e5f { return background; }\n\n    let hit_point = ray.origin + ray.direction * t;\n    let light_vec = light_pos - hit_point;\n    let light_dir = normalize(light_vec);\n    let light_dist = length(light_vec);\n    if is_volume {\n        var diffuse = 0.5 + 0.5 * dot(volume_hit.normal, light_dir);\n        diffuse = diffuse * diffuse;\n\n        // Use the optimized occlusion check for shadows\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + volume_hit.normal * 0.1, 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let shadow = select(1.0, 0.8, in_shadow);\n        return vec3f(0.2, 0.5, 1.0) * (diffuse * shadow);\n    } else {\n        // Simple ground shadow\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + vec3f(0, 0.1, 0), 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let fade = 1.0 - smoothstep(20.0, 30.0, length(hit_point.xz));\n        return mix(background, vec3f(0.3), select(0.0, fade * 0.7, in_shadow));\n    }\n}\n\nfn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {\n    // Convert to normalized coordinates [-1, 1]\n    let uv = (screen_coord / screen_size) * 2.0 - 1.0;\n\n    // Calculate aspect ratio\n    let aspect_ratio = screen_size.x / screen_size.y;\n\n    // Extract camera basis vectors from view matrix\n    let right: vec3f = input.camera_matrix[0].xyz;\n    let up: vec3f = input.camera_matrix[1].xyz;\n    let forward: vec3f = -input.camera_matrix[2].xyz;\n\n    // Extract camera position\n    let camera_pos: vec3f = input.camera_matrix[3].xyz;\n\n    // Calculate ray direction\n    let ray_direction = normalize(\n        forward + uv.x * right * aspect_ratio * input.fov_scale + uv.y * up * input.fov_scale\n    );\n    return Ray(camera_pos, ray_direction);\n}\n\n@compute @workgroup_size(16, 16)\nfn computeMain(\n    @builtin(global_invocation_id) global_id: vec3u,\n    @builtin(local_invocation_id) local_id: vec3u,\n    @builtin(workgroup_id) workgroup_id: vec3u,\n) {\n    let screen_size = textureDimensions(outputTexture);\n\n    // Early exit for out-of-bounds threads\n    if (global_id.x >= screen_size.x || global_id.y >= screen_size.y) {\n        return;\n    }\n\n    // Generate ray for this pixel\n    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5, vec2f(screen_size));\n    var iterations = u32(0);\n    var color = raymarch_scene_graph(ray, &iterations);\n\n    // Debug iteration visualization: override color with heatmap\n    if (input.debug_iterations == 1u) {\n        // Scale coarse by 32 (typical range 0-32), fine by 128 (typical range 0-128)\n        let heat = clamp(f32(iterations) / 128.0, 0.0, 1.0);\n        color = vec3f(0.0, heat, 0.0);\n    }\n\n    // Write result\n    textureStore(outputTexture, global_id.xy, vec4f(color, 1.0));\n}\n";
 
 // ../picovdb.wgsl
 var picovdb_default = `
@@ -3691,12 +3691,9 @@ fn picovdbReadAccessorLeafGetLevelCountAndCache(
     let bit_at_pos = 1u << bit_index;
     let is_value = (mask.value & bit_at_pos) != 0u;
     let is_inside = (mask.inside & bit_at_pos) != 0u;
+
     let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
-    let count = select(
-        u32(is_inside),
-        mask.valueOffset + countOneBits(preceding_bits),
-        is_value,
-    );
+    let count = select(u32(is_inside), mask.valueOffset + countOneBits(preceding_bits), is_value);
     (*acc).key = ijk;
     return PicoVDBLevelCount(0u, count);
 }
@@ -3714,19 +3711,17 @@ fn picovdbReadAccessorLowerGetLevelCountAndCache(
     let bit_at_pos = 1u << bit_index;
     let is_value = (mask.value & bit_at_pos) != 0u;
     let is_inside = (mask.inside & bit_at_pos) != 0u;
-
-    if (is_value && is_inside) {
+    if (!is_value) {
+        return PicoVDBLevelCount(1u, u32(is_inside)); // fast path
+    }
+    if (is_inside) {
         let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
         (*acc).leaf = mask.childOffset + countOneBits(preceding_bits);
         (*acc).key = ijk;
         return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);
     }
     let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
-    let count = select(
-        u32(is_inside),
-        mask.valueOffset + countOneBits(preceding_bits),
-        is_value,
-    );
+    let count = mask.valueOffset + countOneBits(preceding_bits);
     return PicoVDBLevelCount(1u, count);
 }
 
@@ -3744,18 +3739,17 @@ fn picovdbReadAccessorUpperGetLevelCountAndCache(
     let is_value = (mask.value & bit_at_pos) != 0u;
     let is_inside = (mask.inside & bit_at_pos) != 0u;
 
-    if (is_value && is_inside) {
+    if (!is_value) {
+        return PicoVDBLevelCount(2u, u32(is_inside)); // fast path
+    }
+    if (is_inside) {
         let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
         (*acc).lower = mask.childOffset + countOneBits(preceding_bits);
         (*acc).key = ijk;
         return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);
     }
     let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
-    let count = select(
-        u32(is_inside),
-        mask.valueOffset + countOneBits(preceding_bits),
-        is_value,
-    );
+    let count = mask.valueOffset + countOneBits(preceding_bits);
     return PicoVDBLevelCount(2u, count);
 }
 
@@ -3934,11 +3928,13 @@ fn picovdbHDDAZeroCrossing(
     pixel_radius: f32,
     out_distance: ptr<function, f32>,
     out_normal: ptr<function, vec3f>,
+    out_iterations: ptr<function, u32>,
 ) -> bool {
     let direction_inv = 1 / direction;
     var tmin_mut = tmin;
     var tmax_mut = tmax;
     if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+        *out_iterations = 0u;
         return false;
     }
 
@@ -3946,11 +3942,13 @@ fn picovdbHDDAZeroCrossing(
     let start_pos = origin + direction * tmin_mut;
     let res0 = picovdbReadAccessorGetLevelCount(acc, vec3i(floor(start_pos)), grid);
     let v0 = picovdbGetValue(grid, res0.count);
-    
+
     var hdda: PicoVDBHDDA;
     picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
 
+    var step_count = 0u;
     for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
+        step_count += 1u;
         let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
         let target_dim = picovdbDimForLevel[result.level];
 
@@ -3962,7 +3960,7 @@ fn picovdbHDDAZeroCrossing(
 
         if (hdda.dim == 1 && picovdbIsActive(result)) {
             let val = picovdbGetValue(grid, result.count);
-            if (val < 0.0) {
+            if ((val <= 0.0) != (v0 <= 0.0)) {
                 let cone_radius = hdda.tmin * pixel_radius;
                 if (cone_radius < 0.5) {
                     // Voxel projects larger than a pixel \u2014 use analytical cubic solver
@@ -3974,6 +3972,7 @@ fn picovdbHDDAZeroCrossing(
                     if (hit.hit) {
                         *out_distance = hdda.tmin + hit.t;
                         *out_normal = hit.normal;
+                        *out_iterations = step_count;
                         return true;
                     }
                 } else {
@@ -3981,13 +3980,17 @@ fn picovdbHDDAZeroCrossing(
                     let p_local = fract(origin + direction * hdda.tmin);
                     *out_distance = hdda.tmin;
                     *out_normal = picovdbTrilinearGradient(p_local, stencil);
+                    *out_iterations = step_count;
                     return true;
                 }
             }
         }
         // Step to next boundary
-        if (!picovdbHDDAStep(&hdda)) { break; }
+        if (!picovdbHDDAStep(&hdda)) {
+            break;
+        }
     }
+    *out_iterations = step_count;
     return false;
 }
 
@@ -6371,12 +6374,14 @@ var controls = {
   highDPI: false,
   bunnyRotation: 0,
   resetCamera: () => {
-  }
+  },
+  debugIterations: false
 };
 var pauseController = gui.add(controls, "pause").name("Pause");
 var cameraController = gui.add(controls, "resetCamera").name("Reset Camera");
 var highDPIController = gui.add(controls, "highDPI").name("High DPI");
 var rotationController = gui.add(controls, "bunnyRotation", 0, 360, 1).name("Bunny Rotation");
+var debugController = gui.add(controls, "debugIterations").name("Debug Iterations");
 
 // lib/TimestampQueryManager.ts
 var TimestampQueryManager = class {
@@ -6845,7 +6850,7 @@ var InputViews = {
   fov_scale: new Float32Array(InputValues, 64, 1),
   time_delta: new Float32Array(InputValues, 68, 1),
   pixel_radius: new Float32Array(InputValues, 72, 1),
-  _pad: new Uint32Array(InputValues, 76, 1),
+  debug_iterations: new Uint32Array(InputValues, 76, 1),
   transform_matrix: new Float32Array(InputValues, 80, 16),
   transform_inverse_matrix: new Float32Array(InputValues, 144, 16)
 };
@@ -6890,6 +6895,7 @@ Grid: ${bboxSize[0]} \xD7 ${bboxSize[1]} \xD7 ${bboxSize[2]} units
 Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime) {
   InputViews.time_delta[0] = deltaTime;
+  InputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
   camera.update(deltaTime, inputHandler());
   InputViews.camera_matrix.set(camera.matrix);
   device.queue.writeBuffer(inputBuffer, 0, InputValues);

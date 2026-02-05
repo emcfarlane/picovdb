@@ -182,12 +182,9 @@ fn picovdbReadAccessorLeafGetLevelCountAndCache(
     let bit_at_pos = 1u << bit_index;
     let is_value = (mask.value & bit_at_pos) != 0u;
     let is_inside = (mask.inside & bit_at_pos) != 0u;
+
     let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
-    let count = select(
-        u32(is_inside),
-        mask.valueOffset + countOneBits(preceding_bits),
-        is_value,
-    );
+    let count = select(u32(is_inside), mask.valueOffset + countOneBits(preceding_bits), is_value);
     (*acc).key = ijk;
     return PicoVDBLevelCount(0u, count);
 }
@@ -205,19 +202,17 @@ fn picovdbReadAccessorLowerGetLevelCountAndCache(
     let bit_at_pos = 1u << bit_index;
     let is_value = (mask.value & bit_at_pos) != 0u;
     let is_inside = (mask.inside & bit_at_pos) != 0u;
-
-    if (is_value && is_inside) {
+    if (!is_value) {
+        return PicoVDBLevelCount(1u, u32(is_inside)); // fast path
+    }
+    if (is_inside) {
         let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
         (*acc).leaf = mask.childOffset + countOneBits(preceding_bits);
         (*acc).key = ijk;
         return picovdbReadAccessorLeafGetLevelCountAndCache(acc, ijk, grid);
     }
     let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
-    let count = select(
-        u32(is_inside),
-        mask.valueOffset + countOneBits(preceding_bits),
-        is_value,
-    );
+    let count = mask.valueOffset + countOneBits(preceding_bits);
     return PicoVDBLevelCount(1u, count);
 }
 
@@ -235,18 +230,17 @@ fn picovdbReadAccessorUpperGetLevelCountAndCache(
     let is_value = (mask.value & bit_at_pos) != 0u;
     let is_inside = (mask.inside & bit_at_pos) != 0u;
 
-    if (is_value && is_inside) {
+    if (!is_value) {
+        return PicoVDBLevelCount(2u, u32(is_inside)); // fast path
+    }
+    if (is_inside) {
         let preceding_bits = extractBits(mask.value & mask.inside, 0u, bit_index);
         (*acc).lower = mask.childOffset + countOneBits(preceding_bits);
         (*acc).key = ijk;
         return picovdbReadAccessorLowerGetLevelCountAndCache(acc, ijk, grid);
     }
     let preceding_bits = extractBits(mask.value & ~mask.inside, 0u, bit_index);
-    let count = select(
-        u32(is_inside),
-        mask.valueOffset + countOneBits(preceding_bits),
-        is_value,
-    );
+    let count = mask.valueOffset + countOneBits(preceding_bits);
     return PicoVDBLevelCount(2u, count);
 }
 
@@ -425,11 +419,13 @@ fn picovdbHDDAZeroCrossing(
     pixel_radius: f32,
     out_distance: ptr<function, f32>,
     out_normal: ptr<function, vec3f>,
+    out_iterations: ptr<function, u32>,
 ) -> bool {
     let direction_inv = 1 / direction;
     var tmin_mut = tmin;
     var tmax_mut = tmax;
     if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+        *out_iterations = 0u;
         return false;
     }
 
@@ -437,11 +433,13 @@ fn picovdbHDDAZeroCrossing(
     let start_pos = origin + direction * tmin_mut;
     let res0 = picovdbReadAccessorGetLevelCount(acc, vec3i(floor(start_pos)), grid);
     let v0 = picovdbGetValue(grid, res0.count);
-    
+
     var hdda: PicoVDBHDDA;
     picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
 
+    var step_count = 0u;
     for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
+        step_count += 1u;
         let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
         let target_dim = picovdbDimForLevel[result.level];
 
@@ -453,7 +451,7 @@ fn picovdbHDDAZeroCrossing(
 
         if (hdda.dim == 1 && picovdbIsActive(result)) {
             let val = picovdbGetValue(grid, result.count);
-            if (val < 0.0) {
+            if ((val <= 0.0) != (v0 <= 0.0)) {
                 let cone_radius = hdda.tmin * pixel_radius;
                 if (cone_radius < 0.5) {
                     // Voxel projects larger than a pixel — use analytical cubic solver
@@ -465,6 +463,7 @@ fn picovdbHDDAZeroCrossing(
                     if (hit.hit) {
                         *out_distance = hdda.tmin + hit.t;
                         *out_normal = hit.normal;
+                        *out_iterations = step_count;
                         return true;
                     }
                 } else {
@@ -472,13 +471,17 @@ fn picovdbHDDAZeroCrossing(
                     let p_local = fract(origin + direction * hdda.tmin);
                     *out_distance = hdda.tmin;
                     *out_normal = picovdbTrilinearGradient(p_local, stencil);
+                    *out_iterations = step_count;
                     return true;
                 }
             }
         }
         // Step to next boundary
-        if (!picovdbHDDAStep(&hdda)) { break; }
+        if (!picovdbHDDAStep(&hdda)) {
+            break;
+        }
     }
+    *out_iterations = step_count;
     return false;
 }
 

@@ -311,7 +311,7 @@ const InputViews = {
   fov_scale: new Float32Array(InputValues, 64, 1),
   time_delta: new Float32Array(InputValues, 68, 1),
   pixel_radius: new Float32Array(InputValues, 72, 1),
-  _pad: new Uint32Array(InputValues, 76, 1),
+  debug_iterations: new Uint32Array(InputValues, 76, 1),
   transform_matrix: new Float32Array(InputValues, 80, 16),
   transform_inverse_matrix: new Float32Array(InputValues, 144, 16),
 };
@@ -379,6 +379,9 @@ Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime: number) {
   // Update time delta
   InputViews.time_delta[0] = deltaTime;
+
+  // Update debug flag
+  InputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
 
   // Update camera
   camera.update(deltaTime, inputHandler());

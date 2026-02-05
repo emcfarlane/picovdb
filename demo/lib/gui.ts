@@ -7,6 +7,7 @@ interface Controls {
 	highDPI: boolean;
 	bunnyRotation: number;
 	resetCamera: () => void;
+	debugIterations: boolean;
 }
 
 const controls: Controls = {
@@ -14,14 +15,16 @@ const controls: Controls = {
 	highDPI: false,
 	bunnyRotation: 0.0,
 	resetCamera: () => {},
+	debugIterations: false,
 };
 
 const pauseController = gui.add(controls, 'pause').name('Pause');
 const cameraController = gui.add(controls, 'resetCamera').name('Reset Camera');
 const highDPIController = gui.add(controls, 'highDPI').name('High DPI');
 const rotationController = gui.add(controls, 'bunnyRotation', 0, 360, 1).name('Bunny Rotation');
+const debugController = gui.add(controls, 'debugIterations').name('Debug Iterations');
 
-export { controls, pauseController, cameraController, highDPIController, rotationController };
+export { controls, pauseController, cameraController, highDPIController, rotationController, debugController };
 export type { Controls };
 
 export default gui;
