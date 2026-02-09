@@ -3799,11 +3799,6 @@ struct PicoVDBHDDA {
     next: vec3f,
 }
 
-fn picovdbHDDAPosToVoxel(pos: vec3f, dim: i32) -> vec3i {
-    let mask = ~(dim - 1);
-    return vec3i(floor(pos)) & vec3i(mask);
-}
-
 fn picovdbHDDAInit(
     hdda: ptr<function, PicoVDBHDDA>,
     origin: vec3f,
@@ -3814,7 +3809,8 @@ fn picovdbHDDAInit(
     dim: i32
 ) {
     let pos = origin + direction * tmin;
-    let vox = picovdbHDDAPosToVoxel(pos, dim);
+    let mask = vec3i(~(dim - 1));
+    let vox = vec3i(floor(pos)) & mask;
 
     (*hdda).dim = dim;
     (*hdda).tmin = tmin;
@@ -3823,14 +3819,14 @@ fn picovdbHDDAInit(
     (*hdda).step = vec3i(sign(direction));
     (*hdda).delta = abs(f32(dim) * direction_inv); // Pre-multiply delta by dim
 
-    let boundary = select(vec3f(vox), vec3f(vox + vec3i(dim)), direction > vec3f(0.0));
-
-    // Safety: handle cases where direction is 0 to avoid NaNs
+    let base = (*hdda).tmin + (vec3f(vox) - pos) * direction_inv;
+    let pos_offset = base + (*hdda).delta;
     (*hdda).next = select(
-        tmin + (boundary - pos) * direction_inv,
+        select(base, pos_offset, (*hdda).step > vec3i(0)),
         vec3f(PICOVDB_HDDA_FLOAT_MAX),
         direction == vec3f(0.0)
     );
+
 }
 
 // Update HDDA to switch hierarchical level
@@ -3841,22 +3837,24 @@ fn picovdbHDDAUpdate(
     direction: vec3f,
     direction_inv: vec3f,
 ) {
+    let mask = vec3i(~(dim - 1));
+    let voxel_min = (*hdda).voxel & mask;
+    let voxel_max = ((*hdda).voxel + vec3i((*hdda).dim - 1)) & mask;
+
     (*hdda).dim = dim;
     (*hdda).delta = abs(f32(dim) * direction_inv);
 
-    // Re-calculate position at the exact current tmin plus a safety nudge
-    let eps = max(1e-4f, (*hdda).tmin * 1e-7f);
-    let pos = origin + direction * ((*hdda).tmin + eps);
+    let pos = origin + direction * (*hdda).tmin;
+    let vox = clamp(vec3i(floor(pos)) & mask, voxel_min, voxel_max);
+    (*hdda).voxel = vox;
 
-    // Crucial: Re-mask the voxel to the new dimension
-    (*hdda).voxel = picovdbHDDAPosToVoxel(pos, dim);
-
-    // Re-calculate next boundary for the new grid scale
-    let boundary = select(vec3f((*hdda).voxel), vec3f((*hdda).voxel + vec3i(dim)), direction > vec3f(0.0));
-    let t_to_boundary = (boundary - (origin + direction * (*hdda).tmin)) * direction_inv;
-
-    // Ensure the next step is always forward
-    (*hdda).next = (*hdda).tmin + max(t_to_boundary, vec3f(eps));
+    let base = (*hdda).tmin + (vec3f(vox) - pos) * direction_inv;
+    let pos_offset = base + (*hdda).delta;
+    (*hdda).next = select(
+        select(base, pos_offset, (*hdda).step > vec3i(0)),
+        vec3f(PICOVDB_HDDA_FLOAT_MAX),
+        direction == vec3f(0.0)
+    );
 }
 
 fn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {
@@ -3917,7 +3915,7 @@ fn picovdbGetValue(grid: PicoVDBGrid, count: u32) -> f32 {
     return bitcast<f32>(picovdb_buffer[u32Index]);
 }
 
-// Zero-crossing detection for level set raymarching
+// Zero-crossing detection for level set raymarching.
 fn picovdbHDDAZeroCrossing(
     acc: ptr<function, PicoVDBReadAccessor>,
     grid: PicoVDBGrid,
@@ -3947,7 +3945,7 @@ fn picovdbHDDAZeroCrossing(
     picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
 
     var step_count = 0u;
-    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
+    for (var i = 0; i < 256; i++) { // Fixed loop limit for GPU safety
         step_count += 1u;
         let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
         let target_dim = picovdbDimForLevel[result.level];
