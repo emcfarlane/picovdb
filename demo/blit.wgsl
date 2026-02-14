@@ -29,6 +29,5 @@ fn fragmentMain(
     input: FragmentInput,
 ) -> @location(0) vec4f {
     let color = textureSample(raytracedTexture, textureSampler, input.uv);
-    // GPU hardware handles filtering and edge cases automatically
     return color;
 }

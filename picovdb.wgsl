@@ -351,7 +351,7 @@ fn picovdbHDDAUpdate(
 fn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {
     // Determine which axis has the nearest boundary
     let next = (*hdda).next;
-    if (next.x < next.y && next.x < next.z) { // X is smallest
+    if (next.x <= next.y && next.x <= next.z) { // X is smallest
         (*hdda).tmin = (*hdda).next.x;
         (*hdda).next.x += (*hdda).delta.x;
         (*hdda).voxel.x += (*hdda).dim * (*hdda).step.x;
@@ -436,7 +436,7 @@ fn picovdbHDDAZeroCrossing(
     picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
 
     var step_count = 0u;
-    for (var i = 0; i < 256; i++) { // Fixed loop limit for GPU safety
+    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
         step_count += 1u;
         let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
         let target_dim = picovdbDimForLevel[result.level];
@@ -495,12 +495,10 @@ fn picovdbSampleStencil(
     ijk: vec3i
 ) -> PicoVDBStencil {
     var s: PicoVDBStencil;
-    // Plane Z=0
     s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 0), grid).count);
     s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 0), grid).count);
     s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);
     s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 0), grid).count);
-    // Plane Z=1
     s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);
     s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);
     s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);
@@ -559,45 +557,6 @@ fn picovdbSampleTrilinear(
     let uvw = fract(pos);
     let s = picovdbSampleStencil(acc, grid, ijk);
     return picovdbTrilinearInterpolation(uvw, s);
-}
-
-fn picovdbHDDAIsOccluded(
-    acc: ptr<function, PicoVDBReadAccessor>,
-    grid: PicoVDBGrid,
-    origin: vec3f,
-    tmin: f32,
-    direction: vec3f,
-    tmax: f32
-) -> bool {
-    let direction_inv = 1 / direction;
-    var tmin_mut = tmin;
-    var tmax_mut = tmax;
-    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
-        return false;
-    }
-
-    var hdda: PicoVDBHDDA;
-    // Shadow rays can start at a coarser level (e.g., dim 8) to skip empty space faster
-    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, 8);
-
-    for (var i = 0; i < 256; i++) { // Shadow rays usually need fewer steps
-        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
-        let target_dim = picovdbDimForLevel[result.level];
-
-        if (hdda.dim != target_dim) {
-            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
-            continue;
-        }
-
-        // For SDFs, active leaf usually means "near or inside the surface"
-        if (hdda.dim == 1 && picovdbIsActive(result)) {
-            let val = picovdbGetValue(grid, result.count);
-            if (val <= 0.0) { return true; } // Inside or on the surface
-        }
-
-        if (!picovdbHDDAStep(&hdda)) { break; }
-    }
-    return false;
 }
 
 // ============================================================================

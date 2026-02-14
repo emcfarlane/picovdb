@@ -3,7 +3,6 @@ import DisplayShader from "./blit.wgsl";
 import ComputeShader from "./compute.wgsl";
 import PicoVDBShader from "./../picovdb.wgsl";
 import { loadPicoVDB } from './lib/loader';
-//import { ArcballCamera, WASDCamera } from './lib/camera.old';
 import { createOrbitCamera } from './lib/camera';
 import { createInputHandler } from "./lib/input";
 import { controls, pauseController, highDPIController, rotationController } from './lib/gui';
@@ -32,7 +31,9 @@ let width = canvas.width;
 let height = canvas.height;
 let raytracedTexture: GPUTexture;
 let displayBindGroup: GPUBindGroup;
-let computeBindGroup: GPUBindGroup;
+let perFrameBindGroup: GPUBindGroup;
+let dataBindGroup: GPUBindGroup;
+let passBindGroup: GPUBindGroup;
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
@@ -61,12 +62,13 @@ highDPIController.onChange(() => {
 // The use of timestamps require a dedicated adapter feature:
 // The adapter may or may not support timestamp queries. If not, we simply
 // don't measure timestamps and deactivate the timer display.
-const supportsTimestampQueries = adapter?.features.has('timestamp-query');
+const timestampQueryFeature = 'timestamp-query'
+const supportsTimestampQueries = adapter?.features.has(timestampQueryFeature);
 
-const device = await adapter.requestDevice({
-  // We request a device that has support for timestamp queries
-  requiredFeatures: supportsTimestampQueries ? ['timestamp-query'] : [],
-});
+const requiredFeatures: GPUFeatureName[] = [];
+if (supportsTimestampQueries) { requiredFeatures.push(timestampQueryFeature); }
+
+const device = await adapter.requestDevice({ requiredFeatures: requiredFeatures });
 device.addEventListener('uncapturederror', event => {
   console.log(event.error);
 });
@@ -105,11 +107,8 @@ const vertices = new Float32Array([
 ]);
 
 const vertexBuffer = device.createBuffer({
-  // Labels are useful for debugging.
   label: "Display vertices",
-  // 4 bytes * 6 vertices = 24 bytes.
-  size: vertices.byteLength,
-  // The buffer will be used as the source of vertex data.
+  size: vertices.byteLength, // 4 bytes * 6 vertices = 24 bytes.
   usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
 });
 device.queue.writeBuffer(vertexBuffer, /* offset */ 0, vertices);
@@ -126,12 +125,8 @@ const vertexBufferLayout: GPUVertexBufferLayout = {
 
 // Create size-dependent GPU resources
 function createGPUResources() {
-  // Destroy old texture if it exists
-  if (raytracedTexture) {
-    raytracedTexture.destroy();
-  }
+  if (raytracedTexture) { raytracedTexture.destroy(); }
 
-  // Create the texture (output from compute shader)
   raytracedTexture = device.createTexture({
     size: [width, height],
     format: 'rgba8unorm',
@@ -140,72 +135,45 @@ function createGPUResources() {
       GPUTextureUsage.COPY_SRC
   });
 
-  // Recreate bind groups that depend on the texture
   displayBindGroup = device.createBindGroup({
     label: "Display bind group",
     layout: displayPipeline.getBindGroupLayout(0),
     entries: [
-      {
-        binding: 0, // Corresponds to @binding(0) in the shader.
-        resource: raytracedTexture.createView()
-      },
-      {
-        binding: 1, // Corresponds to @binding(1) in the shader.
-        resource: displaySampler
-      }
+      { binding: 0, resource: raytracedTexture.createView() },
+      { binding: 1, resource: displaySampler },
     ]
   });
 
-  computeBindGroup = device.createBindGroup({
-    label: 'Raytracing Bind Group',
-    layout: computeBindGroupLayout,
+  // Bind group 0: per-frame
+  perFrameBindGroup = device.createBindGroup({
+    label: 'Per-frame bind group',
+    layout: perFrameBindGroupLayout,
     entries: [
-      {
-        binding: 0,
-        resource: raytracedTexture.createView()
-      },
-      {
-        binding: 1,
-        resource: {
-          buffer: inputBuffer
-        }
-      },
-      {
-        binding: 2,
-        resource: {
-          buffer: gridsBuffer
-        }
-      },
-      {
-        binding: 3,
-        resource: {
-          buffer: rootsBuffer
-        }
-      },
-      {
-        binding: 4,
-        resource: {
-          buffer: uppersBuffer
-        }
-      },
-      {
-        binding: 5,
-        resource: {
-          buffer: lowersBuffer
-        }
-      },
-      {
-        binding: 6,
-        resource: {
-          buffer: leavesBuffer
-        }
-      },
-      {
-        binding: 7,
-        resource: {
-          buffer: dataBuffer
-        }
-      }
+      { binding: 0, resource: { buffer: inputBuffer } },
+      { binding: 1, resource: { buffer: objectsBuffer } },
+    ]
+  });
+
+  // Bind group 1: data
+  dataBindGroup = device.createBindGroup({
+    label: 'Data bind group',
+    layout: dataBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: gridsBuffer } },
+      { binding: 1, resource: { buffer: rootsBuffer } },
+      { binding: 2, resource: { buffer: uppersBuffer } },
+      { binding: 3, resource: { buffer: lowersBuffer } },
+      { binding: 4, resource: { buffer: leavesBuffer } },
+      { binding: 5, resource: { buffer: dataBuffer } },
+    ]
+  });
+
+  // Bind group 2: pass
+  passBindGroup = device.createBindGroup({
+    label: 'Pass bind group',
+    layout: passBindGroupLayout,
+    entries: [
+      { binding: 0, resource: raytracedTexture.createView() },
     ]
   });
 }
@@ -305,23 +273,57 @@ controls.resetCamera = () => {
 };
 
 
-const InputValues = new ArrayBuffer(256);
-const InputViews = {
-  camera_matrix: new Float32Array(InputValues, 0, 16),
-  fov_scale: new Float32Array(InputValues, 64, 1),
-  time_delta: new Float32Array(InputValues, 68, 1),
-  pixel_radius: new Float32Array(InputValues, 72, 1),
-  debug_iterations: new Uint32Array(InputValues, 76, 1),
-  transform_matrix: new Float32Array(InputValues, 80, 16),
-  transform_inverse_matrix: new Float32Array(InputValues, 144, 16),
+// Input uniform: camera_matrix(64) + fov_scale(4) + time_delta(4) + pixel_radius(4) + debug_iterations(4) = 80 bytes
+const inputValues = new ArrayBuffer(80);
+const inputViews = {
+  camera_matrix: new Float32Array(inputValues, 0, 16),
+  fov_scale: new Float32Array(inputValues, 64, 1),
+  time_delta: new Float32Array(inputValues, 68, 1),
+  pixel_radius: new Float32Array(inputValues, 72, 1),
+  debug_iterations: new Uint32Array(inputValues, 76, 1),
 };
-
 const inputBuffer = device.createBuffer({
   label: 'Input Uniforms',
-  size: InputValues.byteLength,
+  size: inputValues.byteLength,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
-InputViews.fov_scale[0] = fovScaled;
+inputViews.fov_scale[0] = fovScaled;
+
+// --- Object buffer ---
+// Object struct: object_type(4) + type_id(4) + material_id(4) + _pad(4) + transform(64) + transform_inverse(64) = 144 bytes
+const OBJECT_STRUCT_SIZE = 144;
+const OBJECT_COUNT = 2;
+const objectsData = new ArrayBuffer(OBJECT_STRUCT_SIZE * OBJECT_COUNT);
+const objectsBuffer = device.createBuffer({
+  label: 'Objects',
+  size: objectsData.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+const objectViews = [];
+for (let index = 0; index < OBJECT_COUNT; index++) {
+  const offset = OBJECT_STRUCT_SIZE * index;
+  objectViews.push({
+    object_type: new Uint32Array(objectsData, offset + 0, 1),
+    type_index: new Uint32Array(objectsData, offset + 4, 1),
+    material_index: new Uint32Array(objectsData, offset + 8, 1),
+    _pad: new Uint32Array(objectsData, offset + 12, 1),
+    transform: new Float32Array(objectsData, offset + 16, 16),
+    transform_inverse: new Float32Array(objectsData, offset + 80, 16),
+  });
+}
+// Bunny
+const bunnyObjectView = objectViews[0];
+bunnyObjectView.object_type[0] = 1; // VDB
+bunnyObjectView.type_index[0] = 0; // first volume
+bunnyObjectView.material_index[0] = 0;
+// Ground plane
+const groundObjectView = objectViews[1];
+groundObjectView.object_type[0] = 2; // SDF
+groundObjectView.type_index[0] = 0; // first sdf
+groundObjectView.material_index[0] = 1;
+groundObjectView.transform.set(mat4.translation(vec3.create(0, 2, 0)));
+groundObjectView.transform_inverse.set(mat4.translation(vec3.create(0, -2, 0)));
+
 
 // Calculate pixel radius for cone tracing: how much ray spreads per unit distance
 // pixel_radius = fov_scale / resolution_height (in normalized coordinates)
@@ -333,35 +335,33 @@ function computePixelRadius(fov_y_radians: number, resolution_height: number) {
 
 // Update pixel radius (call on resize)
 function updatePixelRadius() {
-  InputViews.pixel_radius[0] = computePixelRadius(fov, height);
+  inputViews.pixel_radius[0] = computePixelRadius(fov, height);
 }
 
 // Initialize cone constants
 updatePixelRadius();
 
-// Function to update transform matrices
-function updateTransformMatrices() {
-  // Create transformation matrix (scale + translation + rotation)
+// Update VDB object transform (object 0)
+function updateObjects() {
   const transformMatrix = mat4.identity();
   mat4.translation(vec3.create(-40, 240, 0), transformMatrix);
   mat4.scale(transformMatrix, vec3.create(120, 120, 120), transformMatrix);
 
-  // Apply Y-axis rotation from GUI
   const rotationRadians = (controls.bunnyRotation * Math.PI) / 180;
   mat4.rotateY(transformMatrix, rotationRadians, transformMatrix);
 
-  const transformInverseMatrix = mat4.inverse(transformMatrix);
+  bunnyObjectView.transform.set(transformMatrix);
+  bunnyObjectView.transform_inverse.set(mat4.inverse(transformMatrix));
 
-  InputViews.transform_matrix.set(transformMatrix);
-  InputViews.transform_inverse_matrix.set(transformInverseMatrix);
+  device.queue.writeBuffer(objectsBuffer, 0, objectsData);
 }
 
-// Initial matrix setup
-updateTransformMatrices();
+// Initial object setup
+updateObjects();
 
-// Update matrices when rotation changes
+// Update objects when rotation changes
 rotationController.onChange(() => {
-  updateTransformMatrices();
+  updateObjects();
 });
 
 // Update info display
@@ -378,21 +378,23 @@ Grid: ${bboxSize[0]} × ${bboxSize[1]} × ${bboxSize[2]} units
 Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime: number) {
   // Update time delta
-  InputViews.time_delta[0] = deltaTime;
+  inputViews.time_delta[0] = deltaTime;
 
   // Update debug flag
-  InputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
+  inputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
 
   // Update camera
   camera.update(deltaTime, inputHandler());
-  InputViews.camera_matrix.set(camera.matrix);
+  inputViews.camera_matrix.set(camera.matrix);
 
   // Write entire input buffer at once
-  device.queue.writeBuffer(inputBuffer, 0, InputValues);
+  device.queue.writeBuffer(inputBuffer, 0, inputValues);
 }
 
 // Combine PicoVDB shader library with compute shader
-const combinedShader = PicoVDBShader + '\n' + ComputeShader;
+const combinedShader = /* wgsl */ `// Hello GPU
+${PicoVDBShader}
+${ComputeShader}`
 
 const computeShaderModule = device.createShaderModule({
   label: 'Raytracing Compute Shader',
@@ -411,90 +413,55 @@ if (shaderInfo.messages.length > 0) {
   }
 }
 
-// Create explicit bind group layout
-const computeBindGroupLayout = device.createBindGroupLayout({
-  label: 'Compute Bind Group Layout',
+// --- Bind group 0: per-frame ---
+const perFrameBindGroupLayout = device.createBindGroupLayout({
+  label: 'Per-frame Bind Group Layout',
+  entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+  ]
+});
+
+// --- Bind group 1: data ---
+const dataBindGroupLayout = device.createBindGroupLayout({
+  label: 'Data Bind Group Layout',
+  entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+  ]
+});
+
+// --- Bind group 2: pass ---
+const passBindGroupLayout = device.createBindGroupLayout({
+  label: 'Pass Bind Group Layout',
   entries: [
     {
-      binding: 0,
-      visibility: GPUShaderStage.COMPUTE,
-      storageTexture: {
-        access: 'write-only',
-        format: 'rgba8unorm',
-        viewDimension: '2d'
-      }
-    },
-    {
-      binding: 1,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'uniform'
-      }
-    },
-    {
-      binding: 2,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'read-only-storage'
-      }
-    },
-    {
-      binding: 3,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'read-only-storage'
-      }
-    },
-    {
-      binding: 4,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'read-only-storage'
-      }
-    },
-    {
-      binding: 5,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'read-only-storage'
-      }
-    },
-    {
-      binding: 6,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'read-only-storage'
-      }
-    },
-    {
-      binding: 7,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: 'read-only-storage'
-      }
+      binding: 0, visibility: GPUShaderStage.COMPUTE,
+      storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' },
     },
   ]
 });
 
 const computePipelineLayout = device.createPipelineLayout({
   label: 'Compute Pipeline Layout',
-  bindGroupLayouts: [computeBindGroupLayout]
+  bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, passBindGroupLayout],
 });
 
 const computePipeline = await device.createComputePipelineAsync({
-  label: 'Raytracing Compute Pipeline',
+  label: 'Compute Pipeline',
   layout: computePipelineLayout,
-  compute: {
-    module: computeShaderModule,
-    entryPoint: 'computeMain'
-  }
+  compute: { module: computeShaderModule, entryPoint: 'computeMain' },
 }).catch((error) => {
   console.error('Pipeline creation failed:', error);
   alert(`Pipeline error: ${error.message}`);
   throw error;
 });
 
-console.log('Pipeline created, getting bind group layout...');
+console.log('Pipeline created.');
 
 const computePassDescriptor: GPUComputePassDescriptor = {
   label: "Compute pass",
@@ -527,14 +494,12 @@ function requestFrame() {
 
   const encoder = device.createCommandEncoder({ label: "Command Encoder" });
 
-  // Start a compute pass.
   const computePass = encoder.beginComputePass(computePassDescriptor);
   computePass.setPipeline(computePipeline);
-  computePass.setBindGroup(0, computeBindGroup);
-  const workgroups_x = Math.ceil(width / 16);
-  const workgroups_y = Math.ceil(height / 16);
-  computePass.dispatchWorkgroups(workgroups_x, workgroups_y, 1);
-
+  computePass.setBindGroup(0, perFrameBindGroup);
+  computePass.setBindGroup(1, dataBindGroup);
+  computePass.setBindGroup(2, passBindGroup);
+  computePass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8), 1);
   computePass.end();
 
   // Start a display pass.

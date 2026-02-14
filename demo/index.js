@@ -3501,10 +3501,10 @@ var {
 } = wgpuMatrixAPI(ZeroArray, Array, Array, Array, Array, Array);
 
 // blit.wgsl
-var blit_default = "struct VertexInput {\n    @location(0) position: vec2f,\n}\n\nstruct VertexOutput {\n    @builtin(position) pos: vec4f,\n    @location(0) uv: vec2f,\n}\n\nstruct FragmentInput {\n    @location(0) uv: vec2f,\n}\n\n@group(0) @binding(0) var raytracedTexture: texture_2d<f32>;\n@group(0) @binding(1) var textureSampler: sampler;\n\n@vertex\nfn vertexMain(input: VertexInput) -> VertexOutput {\n    // Convert from [-1,1] to [0,1] for UV coordinates\n    let uv = input.position * 0.5 + 0.5;\n    return VertexOutput(\n        vec4f(input.position, 0.0, 1.0),\n        uv\n    );\n}\n\n@fragment\nfn fragmentMain(\n    input: FragmentInput,\n) -> @location(0) vec4f {\n    let color = textureSample(raytracedTexture, textureSampler, input.uv);\n    // GPU hardware handles filtering and edge cases automatically\n    return color;\n}\n";
+var blit_default = "struct VertexInput {\n    @location(0) position: vec2f,\n}\n\nstruct VertexOutput {\n    @builtin(position) pos: vec4f,\n    @location(0) uv: vec2f,\n}\n\nstruct FragmentInput {\n    @location(0) uv: vec2f,\n}\n\n@group(0) @binding(0) var raytracedTexture: texture_2d<f32>;\n@group(0) @binding(1) var textureSampler: sampler;\n\n@vertex\nfn vertexMain(input: VertexInput) -> VertexOutput {\n    // Convert from [-1,1] to [0,1] for UV coordinates\n    let uv = input.position * 0.5 + 0.5;\n    return VertexOutput(\n        vec4f(input.position, 0.0, 1.0),\n        uv\n    );\n}\n\n@fragment\nfn fragmentMain(\n    input: FragmentInput,\n) -> @location(0) vec4f {\n    let color = textureSample(raytracedTexture, textureSampler, input.uv);\n    return color;\n}\n";
 
 // compute.wgsl
-var compute_default = "struct Input {\n    camera_matrix: mat4x4f,\n    fov_scale: f32, // tan(fov * 0.5)\n    time_delta: f32,\n    pixel_radius: f32, // Cone spread per unit distance: 1 / (resolution.y * focal_length)\n    debug_iterations: u32, // 0 = normal rendering, 1 = debug iteration heatmap\n    transform_matrix: mat4x4f,\n    transform_inverse_matrix: mat4x4f,\n}\n\n@group(0) @binding(0) var outputTexture: texture_storage_2d<rgba8unorm, write>;\n@group(0) @binding(1) var<uniform> input: Input;\n@group(0) @binding(2) var<storage> picovdb_grids: array<PicoVDBGrid>;\n@group(0) @binding(3) var<storage> picovdb_roots: array<PicoVDBRoot>;\n@group(0) @binding(4) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n@group(0) @binding(5) var<storage> picovdb_lowers: array<PicoVDBLower>;\n@group(0) @binding(6) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n@group(0) @binding(7) var<storage> picovdb_buffer: array<u32>;\n\nstruct RayHit {\n    distance: f32,\n    normal: vec3f,\n    iterations: u32,\n}\n\nstruct Ray {\n    origin: vec3f,\n    direction: vec3f,\n}\n\nfn intersect_picovdb(\n    world_ray: Ray,\n    world_to_index: mat4x4f,\n    index_to_world: mat4x4f,\n) -> RayHit {\n    let grid = picovdb_grids[0];\n    let idx_origin = (world_to_index * vec4f(world_ray.origin, 1.0)).xyz;\n    let idx_dir_unnorm = (world_to_index * vec4f(world_ray.direction, 0.0)).xyz;\n    let idx_dir_len = length(idx_dir_unnorm);\n    let idx_direction = idx_dir_unnorm / idx_dir_len;\n\n    let index_ray = Ray(idx_origin, idx_direction);\n    let tmin = 0.0;\n    let tmax = 10000.0;\n\n    var accessor: PicoVDBReadAccessor;\n    picovdbReadAccessorInit(&accessor, 0);\n\n    // Inside Check (Works even if camera is in background space)\n    let start_val = picovdbSampleTrilinear(&accessor, grid, idx_origin);\n    if start_val < 0.0 {\n        return RayHit(0.01, -world_ray.direction, 0u);\n    }\n\n    var hit_distance: f32;\n    var hit_normal: vec3f;\n    var iterations: u32;\n    let hit = picovdbHDDAZeroCrossing(\n        &accessor, grid, index_ray.origin, tmin, index_ray.direction, tmax, input.pixel_radius, &hit_distance, &hit_normal, &iterations,\n    );\n    if !hit { return RayHit(-1.0, vec3f(0), iterations); }\n\n    let index_hit_point = index_ray.origin + index_ray.direction * hit_distance;\n    let world_hit_point = (index_to_world * vec4f(index_hit_point, 1.0)).xyz;\n    let world_distance = length(world_hit_point - world_ray.origin);\n\n    let normal = normalize((index_to_world * vec4f(hit_normal, 0.0)).xyz);\n    return RayHit(world_distance, normal, iterations);\n}\n\n// Ground plane intersection (only visible from above)\nfn intersect_ground_plane(ray: Ray, plane_y: f32) -> f32 {\n    if ray.direction.y >= 0.0 || abs(ray.direction.y) < 0.001 {\n        return -1.0;\n    }\n    let t = (plane_y - ray.origin.y) / ray.direction.y;\n    return select(-1.0, t, t > 0.001);\n}\n\nfn raymarch_scene_graph(ray: Ray, iterations: ptr<function, u32>) -> vec3f {\n    let volume_hit = intersect_picovdb(ray, input.transform_matrix, input.transform_inverse_matrix);\n    *iterations = volume_hit.iterations;\n    let ground_t = intersect_ground_plane(ray, -2.0);\n\n    let background = vec3f(0.95, 0.95, 1.0);\n    let light_pos = vec3f(20.0, 30.0, 10.0);\n\n    // Determine primary hit\n    var t = 1e6f;\n    var is_volume = false;\n    if volume_hit.distance > 0.0 {\n        t = volume_hit.distance;\n        is_volume = true;\n    }\n    if ground_t > 0.0 && ground_t < t {\n        t = ground_t;\n        is_volume = false;\n    }\n    if t > 1e5f { return background; }\n\n    let hit_point = ray.origin + ray.direction * t;\n    let light_vec = light_pos - hit_point;\n    let light_dir = normalize(light_vec);\n    let light_dist = length(light_vec);\n    if is_volume {\n        var diffuse = 0.5 + 0.5 * dot(volume_hit.normal, light_dir);\n        diffuse = diffuse * diffuse;\n\n        // Use the optimized occlusion check for shadows\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + volume_hit.normal * 0.1, 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let shadow = select(1.0, 0.8, in_shadow);\n        return vec3f(0.2, 0.5, 1.0) * (diffuse * shadow);\n    } else {\n        // Simple ground shadow\n        var acc: PicoVDBReadAccessor; picovdbReadAccessorInit(&acc, 0);\n        let in_shadow = picovdbHDDAIsOccluded(\n            &acc, picovdb_grids[0],\n            (input.transform_matrix * vec4f(hit_point + vec3f(0, 0.1, 0), 1.0)).xyz,\n            0.0,\n            (input.transform_matrix * vec4f(light_dir, 0.0)).xyz,\n            light_dist\n        );\n        let fade = 1.0 - smoothstep(20.0, 30.0, length(hit_point.xz));\n        return mix(background, vec3f(0.3), select(0.0, fade * 0.7, in_shadow));\n    }\n}\n\nfn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {\n    // Convert to normalized coordinates [-1, 1]\n    let uv = (screen_coord / screen_size) * 2.0 - 1.0;\n\n    // Calculate aspect ratio\n    let aspect_ratio = screen_size.x / screen_size.y;\n\n    // Extract camera basis vectors from view matrix\n    let right: vec3f = input.camera_matrix[0].xyz;\n    let up: vec3f = input.camera_matrix[1].xyz;\n    let forward: vec3f = -input.camera_matrix[2].xyz;\n\n    // Extract camera position\n    let camera_pos: vec3f = input.camera_matrix[3].xyz;\n\n    // Calculate ray direction\n    let ray_direction = normalize(\n        forward + uv.x * right * aspect_ratio * input.fov_scale + uv.y * up * input.fov_scale\n    );\n    return Ray(camera_pos, ray_direction);\n}\n\n@compute @workgroup_size(16, 16)\nfn computeMain(\n    @builtin(global_invocation_id) global_id: vec3u,\n    @builtin(local_invocation_id) local_id: vec3u,\n    @builtin(workgroup_id) workgroup_id: vec3u,\n) {\n    let screen_size = textureDimensions(outputTexture);\n\n    // Early exit for out-of-bounds threads\n    if (global_id.x >= screen_size.x || global_id.y >= screen_size.y) {\n        return;\n    }\n\n    // Generate ray for this pixel\n    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5, vec2f(screen_size));\n    var iterations = u32(0);\n    var color = raymarch_scene_graph(ray, &iterations);\n\n    // Debug iteration visualization: override color with heatmap\n    if (input.debug_iterations == 1u) {\n        // Scale coarse by 32 (typical range 0-32), fine by 128 (typical range 0-128)\n        let heat = clamp(f32(iterations) / 128.0, 0.0, 1.0);\n        color = vec3f(0.0, heat, 0.0);\n    }\n\n    // Write result\n    textureStore(outputTexture, global_id.xy, vec4f(color, 1.0));\n}\n";
+var compute_default = "struct Input {\n    camera_matrix: mat4x4f,\n    fov_scale: f32, // tan(fov * 0.5)\n    time_delta: f32,\n    pixel_radius: f32, // Cone spread per unit distance: 1 / (resolution.y * focal_length)\n    debug_iterations: u32, // 0 = normal rendering, 1 = debug iteration heatmap\n}\n\n// --- Object types ---\nconst OBJECT_TYPE_UNKNOWN: u32 = 0u;\nconst OBJECT_TYPE_VDB: u32 = 1u;\nconst OBJECT_TYPE_SDF: u32 = 2u;\n\nstruct Object { // 144\n    object_type: u32,\n    type_index: u32,\n    material_index: u32,\n    _pad: u32,\n    transform: mat4x4f,\n    transform_inverse: mat4x4f,\n}\n\nstruct Material { // 32\n    color: vec3f,\n    albedo: f32,\n    metallic: f32,\n    roughness: f32,\n    _pad: array<f32, 2>,\n}\n\n// --- Bind group 0: per-frame ---\n@group(0) @binding(0) var<uniform> input: Input;\n@group(0) @binding(1) var<storage> objects: array<Object>;\n\n// -- Bind group 1: data ---\n@group(1) @binding(0) var<storage> picovdb_grids: array<PicoVDBGrid>;\n@group(1) @binding(1) var<storage> picovdb_roots: array<PicoVDBRoot>;\n@group(1) @binding(2) var<storage> picovdb_uppers: array<PicoVDBUpper>;\n@group(1) @binding(3) var<storage> picovdb_lowers: array<PicoVDBLower>;\n@group(1) @binding(4) var<storage> picovdb_leaves: array<PicoVDBLeaf>;\n@group(1) @binding(5) var<storage> picovdb_buffer: array<u32>;\n\n// --- Bind group 2: pass ---\n@group(2) @binding(0) var output_texture: texture_storage_2d<rgba8unorm, write>;\n\nconst MAX_DIST: f32 = 1e7;\n\nstruct Intersection {\n    distance: f32,\n    object_index: i32,\n    iterations: u32,\n    normal: vec3f,\n}\n\nfn no_intersection() -> Intersection {\n    return Intersection(MAX_DIST, -1, 0, vec3f(0));\n}\n\nstruct Ray {\n    origin: vec3f,\n    direction: vec3f,\n}\n\nfn intersect_picovdb(\n    ray: Ray,\n    grid_index: u32,\n    hit_distance: ptr<function, f32>,\n    hit_normal: ptr<function, vec3f>,\n    hit_iterations: ptr<function, u32>,\n) -> bool {\n    let tmin = 0.0;\n    let tmax = 10000.0;\n\n    let grid = picovdb_grids[grid_index];\n    var accessor: PicoVDBReadAccessor;\n    picovdbReadAccessorInit(&accessor, grid_index);\n\n    // Inside Check (Works even if camera is in background space)\n    let start_val = picovdbSampleTrilinear(&accessor, grid, ray.origin);\n    if start_val < 0.0 {\n        *hit_distance = tmin;\n        *hit_normal = -ray.direction;\n        return true;\n    }\n\n    return picovdbHDDAZeroCrossing(\n        &accessor, grid, ray.origin, tmin, ray.direction, tmax, input.pixel_radius, hit_distance, hit_normal, hit_iterations,\n    );\n}\n\nfn intersect_sdf(\n    ray: Ray,\n    index: u32,\n    hit_distance: ptr<function, f32>,\n    hit_normal: ptr<function, vec3f>,\n    iterations: ptr<function, u32>,\n) -> bool {\n    switch index {\n        case 0u: { // ground plane at y=0 in index space\n            if ray.direction.y >= 0.0 || abs(ray.direction.y) < 0.001 {\n                return false;\n            }\n            let t = -ray.origin.y / ray.direction.y;\n            if t < 0.001 {\n                return false;\n            }\n            *hit_distance = t;\n            *hit_normal = vec3f(0, 1, 0);\n            return true;\n        }\n        case default: { return false; }\n    }\n}\n\nfn intersect_scene(world_ray: Ray, iterations: ptr<function, u32>) -> Intersection {\n    var min_hit = no_intersection();\n    for (var i = 0i; i < i32(arrayLength(&objects)); i++) {\n        let obj = objects[i];\n        let idx_origin = (obj.transform * vec4f(world_ray.origin, 1.0)).xyz;\n        let idx_dir_unnorm = (obj.transform * vec4f(world_ray.direction, 0.0)).xyz;\n        let idx_direction = normalize(idx_dir_unnorm);\n        let index_ray = Ray(idx_origin, idx_direction);\n\n        var hit = false;\n        var hit_distance = MAX_DIST;\n        var hit_normal = vec3f(0);\n        var hit_iterations = 0u;\n        switch obj.object_type {\n            case OBJECT_TYPE_VDB: {\n                hit = intersect_picovdb(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);\n            }\n            case OBJECT_TYPE_SDF: {\n                hit = intersect_sdf(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);\n            }\n            case default: { \n                hit = false;\n            }\n        }\n        *iterations += hit_iterations;\n        if !hit {\n            continue;\n        }\n        let index_hit_point = index_ray.origin + index_ray.direction * hit_distance;\n        let world_hit_point = (obj.transform_inverse * vec4f(index_hit_point, 1.0)).xyz;\n        let world_distance = length(world_hit_point - world_ray.origin);\n        if world_distance >= min_hit.distance {\n            continue;\n        }\n\n        min_hit.distance = world_distance;\n        min_hit.object_index = i;\n        min_hit.normal = (obj.transform_inverse * vec4f(hit_normal, 0.0)).xyz;\n    }\n    min_hit.normal = normalize(min_hit.normal);\n    return min_hit;\n}\n\nfn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {\n    // Convert to normalized coordinates [-1, 1k\n    let uv = (screen_coord / screen_size) * 2.0 - 1.0;\n\n    // Calculate aspect ratio\n    let aspect_ratio = screen_size.x / screen_size.y;\n\n    // Extract camera basis vectors from view matrix\n    let right: vec3f = input.camera_matrix[0].xyz;\n    let up: vec3f = input.camera_matrix[1].xyz;\n    let forward: vec3f = -input.camera_matrix[2].xyz;\n\n    // Extract camera position\n    let camera_pos: vec3f = input.camera_matrix[3].xyz;\n\n    // Calculate ray direction\n    let ray_direction = normalize(\n        forward + uv.x * right * aspect_ratio * input.fov_scale + uv.y * up * input.fov_scale\n    );\n    return Ray(camera_pos, ray_direction);\n}\n\nfn get_material(hit: Intersection, obj: Object) -> Material {\n    switch obj.material_index {\n        case 0u: {\n            return Material(vec3f(0.2, 0.5, 1.0), 0, 0, 0, array(0,0));\n        }\n        case 1u: {\n            return Material(vec3f(0.8, 0.8, 0.8), 0, 0, 0, array(0,0));\n        }\n        default: {\n            return Material(vec3f(0.95, 0.95, 1.0), 0, 0, 0, array(0,0));\n        }\n    }\n}\n\nfn compute_color(ray: Ray, hit: Intersection) -> vec3f {\n    if hit.object_index < 0 {\n        return vec3f(0.95, 0.95, 1.0);\n    }\n    let obj = objects[hit.object_index];\n    let material = get_material(hit, obj);\n    let hit_point = ray.origin + ray.direction * hit.distance;\n    let light_pos = vec3f(20.0, 30.0, 10.0);\n    let light_dir = normalize(light_pos - hit_point);\n    let diffuse = max(dot(hit.normal, light_dir), 0.0);\n    let ambient = 0.15;\n    return material.color * (ambient + diffuse * 0.85);\n}\n\n@compute @workgroup_size(8, 8)\nfn computeMain(\n    @builtin(global_invocation_id) global_id: vec3u,\n) {\n    let dims = textureDimensions(output_texture);\n    if (global_id.x >= dims.x || global_id.y >= dims.y) { return; }\n\n    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5, vec2f(dims));\n    var iterations: u32;\n    let hit = intersect_scene(ray, &iterations);\n    var color = compute_color(ray, hit);\n\n    // Debug iteration visualization: override color with heatmap\n    if (input.debug_iterations == 1u) {\n        let heat = clamp(f32(iterations) / 128.0, 0.0, 1.0);\n        color = vec3f(0.0, heat, 0.0);\n    }\n\n    textureStore(output_texture, global_id.xy, vec4f(color, 1.0));\n}\n\n// --- PBR ---\n\nconst PI: f32 = 3.14159265359;\n\nfn distributionGGX(n: vec3f, h: vec3f, roughness: f32) -> f32 {\n  let a = roughness * roughness;\n  let a2 = a * a;\n  let nDotH = max(dot(n, h), 0.0);\n  let nDotH2 = nDotH * nDotH;\n  var denom = (nDotH2 * (a2 - 1.0) + 1.0);\n  denom = PI * denom * denom;\n  return a2 / denom;\n}\n\nfn geometrySchlickGGX(nDotV: f32, roughness: f32) -> f32 {\n  let r = (roughness + 1.0);\n  let k = (r * r) / 8.0;\n  return nDotV / (nDotV * (1.0 - k) + k);\n}\n\nfn geometrySmith(n: vec3f, v: vec3f, l: vec3f, roughness: f32) -> f32 {\n  let nDotV = max(dot(n, v), 0.0);\n  let nDotL = max(dot(n, l), 0.0);\n  let ggx2 = geometrySchlickGGX(nDotV, roughness);\n  let ggx1 = geometrySchlickGGX(nDotL, roughness);\n  return ggx1 * ggx2;\n}\n\nfn fresnelSchlick(cosTheta: f32, f0: vec3f) -> vec3f {\n  return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);\n}\n\nfn fresnelSchlickRoughness(cosTheta: f32, f0: vec3f, roughness: f32) -> vec3f {\n  return f0 + (max(vec3(1.0 - roughness), f0) - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);\n}\n\n// http://holger.dammertz.org/stuff/notes_HammersleyOnHemisphere.html\n// efficient VanDerCorpus calculation.\nfn radicalInverseVdC(bits: u32) -> f32 {\n  var result = bits;\n  result = (bits << 16u) | (bits >> 16u);\n  result = ((result & 0x55555555u) << 1u) | ((result & 0xAAAAAAAAu) >> 1u);\n  result = ((result & 0x33333333u) << 2u) | ((result & 0xCCCCCCCCu) >> 2u);\n  result = ((result & 0x0F0F0F0Fu) << 4u) | ((result & 0xF0F0F0F0u) >> 4u);\n  result = ((result & 0x00FF00FFu) << 8u) | ((result & 0xFF00FF00u) >> 8u);\n  return f32(result) * 2.3283064365386963e-10;\n}\n\nfn hammersley(i: u32, n: u32) -> vec2f {\n  return vec2f(f32(i) / f32(n), radicalInverseVdC(i));\n}\n\nfn importanceSampleGGX(xi: vec2f, n: vec3f, roughness: f32) -> vec3f {\n  let a = roughness * roughness;\n\n  let phi = 2.0 * PI * xi.x;\n  let cosTheta = sqrt((1.0 - xi.y) / (1.0 + (a * a - 1.0) * xi.y));\n  let sinTheta = sqrt(1.0 - cosTheta * cosTheta);\n\n  // from spherical coordinates to cartesian coordinates - halfway vector\n  let h = vec3f(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);\n\n  // from tangent-space H vector to world-space sample vector\n  let up: vec3f = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(n.z) < 0.999);\n  let tangent = normalize(cross(up, n));\n  let bitangent = cross(n, tangent);\n\n  let sampleVec = tangent * h.x + bitangent * h.y + n * h.z;\n  return normalize(sampleVec);\n}\n\n  // toneMapping implements lottes.\nfn toneMapping(color: vec3f) -> vec3f {\n    let a = vec3f(1.6);\n    let d = vec3f(0.977);\n    let hdrMax = vec3f(8.0);\n    let midIn = vec3f(0.18);\n    let midOut = vec3f(0.267);\n\n    let b = (-pow(midIn, a) + pow(hdrMax, a) * midOut) / ((pow(hdrMax, a * d) - pow(midIn, a * d)) * midOut);\n    let c = (pow(hdrMax, a * d) * pow(midIn, a) - pow(hdrMax, a) * pow(midIn, a * d) * midOut) / ((pow(hdrMax, a * d) - pow(midIn, a * d)) * midOut);\n\n    return pow(color, a) / (pow(color, a * d) * b + c);\n}\n";
 
 // ../picovdb.wgsl
 var picovdb_default = `
@@ -3860,7 +3860,7 @@ fn picovdbHDDAUpdate(
 fn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {
     // Determine which axis has the nearest boundary
     let next = (*hdda).next;
-    if (next.x < next.y && next.x < next.z) { // X is smallest
+    if (next.x <= next.y && next.x <= next.z) { // X is smallest
         (*hdda).tmin = (*hdda).next.x;
         (*hdda).next.x += (*hdda).delta.x;
         (*hdda).voxel.x += (*hdda).dim * (*hdda).step.x;
@@ -3945,7 +3945,7 @@ fn picovdbHDDAZeroCrossing(
     picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
 
     var step_count = 0u;
-    for (var i = 0; i < 256; i++) { // Fixed loop limit for GPU safety
+    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
         step_count += 1u;
         let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
         let target_dim = picovdbDimForLevel[result.level];
@@ -4004,12 +4004,10 @@ fn picovdbSampleStencil(
     ijk: vec3i
 ) -> PicoVDBStencil {
     var s: PicoVDBStencil;
-    // Plane Z=0
     s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 0), grid).count);
     s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 0), grid).count);
     s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 0), grid).count);
     s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 1, 0), grid).count);
-    // Plane Z=1
     s.v001 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 0, 1), grid).count);
     s.v101 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(1, 0, 1), grid).count);
     s.v011 = picovdbGetValue(grid, picovdbReadAccessorGetLevelCount(acc, ijk + vec3i(0, 1, 1), grid).count);
@@ -4068,45 +4066,6 @@ fn picovdbSampleTrilinear(
     let uvw = fract(pos);
     let s = picovdbSampleStencil(acc, grid, ijk);
     return picovdbTrilinearInterpolation(uvw, s);
-}
-
-fn picovdbHDDAIsOccluded(
-    acc: ptr<function, PicoVDBReadAccessor>,
-    grid: PicoVDBGrid,
-    origin: vec3f,
-    tmin: f32,
-    direction: vec3f,
-    tmax: f32
-) -> bool {
-    let direction_inv = 1 / direction;
-    var tmin_mut = tmin;
-    var tmax_mut = tmax;
-    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
-        return false;
-    }
-
-    var hdda: PicoVDBHDDA;
-    // Shadow rays can start at a coarser level (e.g., dim 8) to skip empty space faster
-    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, 8);
-
-    for (var i = 0; i < 256; i++) { // Shadow rays usually need fewer steps
-        let result = picovdbReadAccessorGetLevelCount(acc, hdda.voxel, grid);
-        let target_dim = picovdbDimForLevel[result.level];
-
-        if (hdda.dim != target_dim) {
-            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
-            continue;
-        }
-
-        // For SDFs, active leaf usually means "near or inside the surface"
-        if (hdda.dim == 1 && picovdbIsActive(result)) {
-            let val = picovdbGetValue(grid, result.count);
-            if (val <= 0.0) { return true; } // Inside or on the surface
-        }
-
-        if (!picovdbHDDAStep(&hdda)) { break; }
-    }
-    return false;
 }
 
 // ============================================================================
@@ -6609,7 +6568,9 @@ var width = canvas.width;
 var height = canvas.height;
 var raytracedTexture;
 var displayBindGroup;
-var computeBindGroup;
+var perFrameBindGroup;
+var dataBindGroup;
+var passBindGroup;
 function resizeCanvas() {
   const pixelRatio = controls.highDPI ? window.devicePixelRatio : 1;
   canvas.width = window.innerWidth * pixelRatio;
@@ -6627,11 +6588,13 @@ highDPIController.onChange(() => {
   resizeCanvas();
   updatePixelRadius();
 });
-var supportsTimestampQueries = adapter?.features.has("timestamp-query");
-var device = await adapter.requestDevice({
-  // We request a device that has support for timestamp queries
-  requiredFeatures: supportsTimestampQueries ? ["timestamp-query"] : []
-});
+var timestampQueryFeature = "timestamp-query";
+var supportsTimestampQueries = adapter?.features.has(timestampQueryFeature);
+var requiredFeatures = [];
+if (supportsTimestampQueries) {
+  requiredFeatures.push(timestampQueryFeature);
+}
+var device = await adapter.requestDevice({ requiredFeatures });
 device.addEventListener("uncapturederror", (event) => {
   console.log(event.error);
 });
@@ -6662,11 +6625,9 @@ var vertices = new Float32Array([
   -1
 ]);
 var vertexBuffer = device.createBuffer({
-  // Labels are useful for debugging.
   label: "Display vertices",
-  // 4 bytes * 6 vertices = 24 bytes.
   size: vertices.byteLength,
-  // The buffer will be used as the source of vertex data.
+  // 4 bytes * 6 vertices = 24 bytes.
   usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST
 });
 device.queue.writeBuffer(
@@ -6698,68 +6659,35 @@ function createGPUResources() {
     label: "Display bind group",
     layout: displayPipeline.getBindGroupLayout(0),
     entries: [
-      {
-        binding: 0,
-        // Corresponds to @binding(0) in the shader.
-        resource: raytracedTexture.createView()
-      },
-      {
-        binding: 1,
-        // Corresponds to @binding(1) in the shader.
-        resource: displaySampler
-      }
+      { binding: 0, resource: raytracedTexture.createView() },
+      { binding: 1, resource: displaySampler }
     ]
   });
-  computeBindGroup = device.createBindGroup({
-    label: "Raytracing Bind Group",
-    layout: computeBindGroupLayout,
+  perFrameBindGroup = device.createBindGroup({
+    label: "Per-frame bind group",
+    layout: perFrameBindGroupLayout,
     entries: [
-      {
-        binding: 0,
-        resource: raytracedTexture.createView()
-      },
-      {
-        binding: 1,
-        resource: {
-          buffer: inputBuffer
-        }
-      },
-      {
-        binding: 2,
-        resource: {
-          buffer: gridsBuffer
-        }
-      },
-      {
-        binding: 3,
-        resource: {
-          buffer: rootsBuffer
-        }
-      },
-      {
-        binding: 4,
-        resource: {
-          buffer: uppersBuffer
-        }
-      },
-      {
-        binding: 5,
-        resource: {
-          buffer: lowersBuffer
-        }
-      },
-      {
-        binding: 6,
-        resource: {
-          buffer: leavesBuffer
-        }
-      },
-      {
-        binding: 7,
-        resource: {
-          buffer: dataBuffer
-        }
-      }
+      { binding: 0, resource: { buffer: inputBuffer } },
+      { binding: 1, resource: { buffer: objectsBuffer } }
+    ]
+  });
+  dataBindGroup = device.createBindGroup({
+    label: "Data bind group",
+    layout: dataBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: gridsBuffer } },
+      { binding: 1, resource: { buffer: rootsBuffer } },
+      { binding: 2, resource: { buffer: uppersBuffer } },
+      { binding: 3, resource: { buffer: lowersBuffer } },
+      { binding: 4, resource: { buffer: leavesBuffer } },
+      { binding: 5, resource: { buffer: dataBuffer } }
+    ]
+  });
+  passBindGroup = device.createBindGroup({
+    label: "Pass bind group",
+    layout: passBindGroupLayout,
+    entries: [
+      { binding: 0, resource: raytracedTexture.createView() }
     ]
   });
 }
@@ -6842,43 +6770,71 @@ controls.resetCamera = () => {
     target: initialCameraTarget
   });
 };
-var InputValues = new ArrayBuffer(256);
-var InputViews = {
-  camera_matrix: new Float32Array(InputValues, 0, 16),
-  fov_scale: new Float32Array(InputValues, 64, 1),
-  time_delta: new Float32Array(InputValues, 68, 1),
-  pixel_radius: new Float32Array(InputValues, 72, 1),
-  debug_iterations: new Uint32Array(InputValues, 76, 1),
-  transform_matrix: new Float32Array(InputValues, 80, 16),
-  transform_inverse_matrix: new Float32Array(InputValues, 144, 16)
+var inputValues = new ArrayBuffer(80);
+var inputViews = {
+  camera_matrix: new Float32Array(inputValues, 0, 16),
+  fov_scale: new Float32Array(inputValues, 64, 1),
+  time_delta: new Float32Array(inputValues, 68, 1),
+  pixel_radius: new Float32Array(inputValues, 72, 1),
+  debug_iterations: new Uint32Array(inputValues, 76, 1)
 };
 var inputBuffer = device.createBuffer({
   label: "Input Uniforms",
-  size: InputValues.byteLength,
+  size: inputValues.byteLength,
   usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
 });
-InputViews.fov_scale[0] = fovScaled;
+inputViews.fov_scale[0] = fovScaled;
+var OBJECT_STRUCT_SIZE = 144;
+var OBJECT_COUNT = 2;
+var objectsData = new ArrayBuffer(OBJECT_STRUCT_SIZE * OBJECT_COUNT);
+var objectsBuffer = device.createBuffer({
+  label: "Objects",
+  size: objectsData.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+});
+var objectViews = [];
+for (let index = 0; index < OBJECT_COUNT; index++) {
+  const offset = OBJECT_STRUCT_SIZE * index;
+  objectViews.push({
+    object_type: new Uint32Array(objectsData, offset + 0, 1),
+    type_index: new Uint32Array(objectsData, offset + 4, 1),
+    material_index: new Uint32Array(objectsData, offset + 8, 1),
+    _pad: new Uint32Array(objectsData, offset + 12, 1),
+    transform: new Float32Array(objectsData, offset + 16, 16),
+    transform_inverse: new Float32Array(objectsData, offset + 80, 16)
+  });
+}
+var bunnyObjectView = objectViews[0];
+bunnyObjectView.object_type[0] = 1;
+bunnyObjectView.type_index[0] = 0;
+bunnyObjectView.material_index[0] = 0;
+var groundObjectView = objectViews[1];
+groundObjectView.object_type[0] = 2;
+groundObjectView.type_index[0] = 0;
+groundObjectView.material_index[0] = 1;
+groundObjectView.transform.set(mat4.translation(vec3.create(0, 2, 0)));
+groundObjectView.transform_inverse.set(mat4.translation(vec3.create(0, -2, 0)));
 function computePixelRadius(fov_y_radians, resolution_height) {
   const fov_scale = Math.tan(fov_y_radians * 0.5);
   return 2 * fov_scale / resolution_height;
 }
 function updatePixelRadius() {
-  InputViews.pixel_radius[0] = computePixelRadius(fov, height);
+  inputViews.pixel_radius[0] = computePixelRadius(fov, height);
 }
 updatePixelRadius();
-function updateTransformMatrices() {
+function updateObjects() {
   const transformMatrix = mat4.identity();
   mat4.translation(vec3.create(-40, 240, 0), transformMatrix);
   mat4.scale(transformMatrix, vec3.create(120, 120, 120), transformMatrix);
   const rotationRadians = controls.bunnyRotation * Math.PI / 180;
   mat4.rotateY(transformMatrix, rotationRadians, transformMatrix);
-  const transformInverseMatrix = mat4.inverse(transformMatrix);
-  InputViews.transform_matrix.set(transformMatrix);
-  InputViews.transform_inverse_matrix.set(transformInverseMatrix);
+  bunnyObjectView.transform.set(transformMatrix);
+  bunnyObjectView.transform_inverse.set(mat4.inverse(transformMatrix));
+  device.queue.writeBuffer(objectsBuffer, 0, objectsData);
 }
-updateTransformMatrices();
+updateObjects();
 rotationController.onChange(() => {
-  updateTransformMatrices();
+  updateObjects();
 });
 var sizeMB = (picoVDBFile.getSize() / 1024 / 1024).toFixed(1);
 var grid = picoVDBFile.getGrid(0);
@@ -6892,13 +6848,18 @@ bunny.pvdb ${sizeMB}MB
 Grid: ${bboxSize[0]} \xD7 ${bboxSize[1]} \xD7 ${bboxSize[2]} units
 Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime) {
-  InputViews.time_delta[0] = deltaTime;
-  InputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
+  inputViews.time_delta[0] = deltaTime;
+  inputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
   camera.update(deltaTime, inputHandler());
-  InputViews.camera_matrix.set(camera.matrix);
-  device.queue.writeBuffer(inputBuffer, 0, InputValues);
+  inputViews.camera_matrix.set(camera.matrix);
+  device.queue.writeBuffer(inputBuffer, 0, inputValues);
 }
-var combinedShader = picovdb_default + "\n" + compute_default;
+var combinedShader = (
+  /* wgsl */
+  `// Hello GPU
+${picovdb_default}
+${compute_default}`
+);
 var computeShaderModule = device.createShaderModule({
   label: "Raytracing Compute Shader",
   code: combinedShader
@@ -6913,86 +6874,48 @@ if (shaderInfo.messages.length > 0) {
     }
   }
 }
-var computeBindGroupLayout = device.createBindGroupLayout({
-  label: "Compute Bind Group Layout",
+var perFrameBindGroupLayout = device.createBindGroupLayout({
+  label: "Per-frame Bind Group Layout",
+  entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }
+  ]
+});
+var dataBindGroupLayout = device.createBindGroupLayout({
+  label: "Data Bind Group Layout",
+  entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }
+  ]
+});
+var passBindGroupLayout = device.createBindGroupLayout({
+  label: "Pass Bind Group Layout",
   entries: [
     {
       binding: 0,
       visibility: GPUShaderStage.COMPUTE,
-      storageTexture: {
-        access: "write-only",
-        format: "rgba8unorm",
-        viewDimension: "2d"
-      }
-    },
-    {
-      binding: 1,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "uniform"
-      }
-    },
-    {
-      binding: 2,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "read-only-storage"
-      }
-    },
-    {
-      binding: 3,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "read-only-storage"
-      }
-    },
-    {
-      binding: 4,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "read-only-storage"
-      }
-    },
-    {
-      binding: 5,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "read-only-storage"
-      }
-    },
-    {
-      binding: 6,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "read-only-storage"
-      }
-    },
-    {
-      binding: 7,
-      visibility: GPUShaderStage.COMPUTE,
-      buffer: {
-        type: "read-only-storage"
-      }
+      storageTexture: { access: "write-only", format: "rgba8unorm", viewDimension: "2d" }
     }
   ]
 });
 var computePipelineLayout = device.createPipelineLayout({
   label: "Compute Pipeline Layout",
-  bindGroupLayouts: [computeBindGroupLayout]
+  bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, passBindGroupLayout]
 });
 var computePipeline = await device.createComputePipelineAsync({
-  label: "Raytracing Compute Pipeline",
+  label: "Compute Pipeline",
   layout: computePipelineLayout,
-  compute: {
-    module: computeShaderModule,
-    entryPoint: "computeMain"
-  }
+  compute: { module: computeShaderModule, entryPoint: "computeMain" }
 }).catch((error) => {
   console.error("Pipeline creation failed:", error);
   alert(`Pipeline error: ${error.message}`);
   throw error;
 });
-console.log("Pipeline created, getting bind group layout...");
+console.log("Pipeline created.");
 var computePassDescriptor = {
   label: "Compute pass"
 };
@@ -7020,10 +6943,10 @@ function requestFrame() {
   const encoder = device.createCommandEncoder({ label: "Command Encoder" });
   const computePass = encoder.beginComputePass(computePassDescriptor);
   computePass.setPipeline(computePipeline);
-  computePass.setBindGroup(0, computeBindGroup);
-  const workgroups_x = Math.ceil(width / 16);
-  const workgroups_y = Math.ceil(height / 16);
-  computePass.dispatchWorkgroups(workgroups_x, workgroups_y, 1);
+  computePass.setBindGroup(0, perFrameBindGroup);
+  computePass.setBindGroup(1, dataBindGroup);
+  computePass.setBindGroup(2, passBindGroup);
+  computePass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8), 1);
   computePass.end();
   colorAttachment.view = context.getCurrentTexture().createView();
   const displayPass = encoder.beginRenderPass(renderPassDescriptor);
