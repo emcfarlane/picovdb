@@ -6,6 +6,7 @@ import { loadPicoVDB } from './lib/loader';
 import { createOrbitCamera } from './lib/camera';
 import { createInputHandler } from "./lib/input";
 import { controls, pauseController, highDPIController, rotationController } from './lib/gui';
+import { createSkyState } from "./lib/hw_skymodel";
 import { TimestampQueryManager } from './lib/TimestampQueryManager';
 import { Stats } from './lib/Stats';
 
@@ -151,6 +152,7 @@ function createGPUResources() {
     entries: [
       { binding: 0, resource: { buffer: inputBuffer } },
       { binding: 1, resource: { buffer: objectsBuffer } },
+      { binding: 2, resource: { buffer: skyStateBuffer } },
     ]
   });
 
@@ -299,6 +301,7 @@ const objectsBuffer = device.createBuffer({
   size: objectsData.byteLength,
   usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
 });
+new Array(27).slice()
 const objectViews = [];
 for (let index = 0; index < OBJECT_COUNT; index++) {
   const offset = OBJECT_STRUCT_SIZE * index;
@@ -324,6 +327,37 @@ groundObjectView.material_index[0] = 1;
 groundObjectView.transform.set(mat4.translation(vec3.create(0, 2, 0)));
 groundObjectView.transform_inverse.set(mat4.translation(vec3.create(0, -2, 0)));
 
+// --- Sky buffer ---
+const sunZenith = 30.0 * Math.PI / 180;
+const sunAzimuth = 0.0;
+const sunDirection = vec3.create(
+  Math.sin(sunZenith) * Math.cos(sunAzimuth),
+  Math.cos(sunZenith),
+  - Math.sin(sunZenith) * Math.sin(sunAzimuth),
+);
+const skyState = createSkyState({
+  elevation: 0.5 * Math.PI - sunZenith,
+  turbidity: 2.0,
+  albedo: [0.3, 0.3, 0.3],
+})
+const skyStateData = new ArrayBuffer(144);
+const skyStateBuffer = device.createBuffer({
+  label: 'SkyState',
+  size: skyStateData.byteLength,
+  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+});
+const skyStateView = {
+  sunDirection: new Float32Array(skyStateData, 0, 3),
+  params: new Float32Array(skyStateData, 12, 27),
+  skyRadiances: new Float32Array(skyStateData, 120, 3),
+  solarRadiances: new Float32Array(skyStateData, 132, 3),
+};
+skyStateView.sunDirection.set(sunDirection);
+skyStateView.params.set(skyState.params);
+skyStateView.skyRadiances.set(skyState.skyRadiances);
+skyStateView.solarRadiances.set(skyState.solarRadiances);
+console.log("SKY STATE", skyState);
+device.queue.writeBuffer(skyStateBuffer, 0, skyStateData);
 
 // Calculate pixel radius for cone tracing: how much ray spreads per unit distance
 // pixel_radius = fov_scale / resolution_height (in normalized coordinates)
@@ -354,6 +388,7 @@ function updateObjects() {
   bunnyObjectView.transform_inverse.set(mat4.inverse(transformMatrix));
 
   device.queue.writeBuffer(objectsBuffer, 0, objectsData);
+  device.queue.writeBuffer(skyStateBuffer, 0, skyStateData);
 }
 
 // Initial object setup
@@ -419,6 +454,7 @@ const perFrameBindGroupLayout = device.createBindGroupLayout({
   entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
   ]
 });
 

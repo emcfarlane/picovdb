@@ -18,10 +18,7 @@ struct FragmentInput {
 fn vertexMain(input: VertexInput) -> VertexOutput {
     // Convert from [-1,1] to [0,1] for UV coordinates
     let uv = input.position * 0.5 + 0.5;
-    return VertexOutput(
-        vec4f(input.position, 0.0, 1.0),
-        uv
-    );
+    return VertexOutput(vec4f(input.position, 0.0, 1.0), uv);
 }
 
 @fragment
