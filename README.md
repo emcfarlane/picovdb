@@ -2,6 +2,8 @@
 
 Compact sparse volumetric data format optimized for WebGPU real-time rendering.
 
+![WebGPU PicoVDB](bunny.png)
+
 **[Live Demo →](https://emcfarlane.github.io/picovdb/demo/)**
 
 > [!WARNING]
