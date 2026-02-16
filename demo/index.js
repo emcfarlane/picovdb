@@ -4599,7 +4599,7 @@ function createInputHandler(window2, canvas2) {
       const dist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
       const midX = (p[0].clientX + p[1].clientX) / 2;
       const midY = (p[0].clientY + p[1].clientY) / 2;
-      analog.zoom += (dist - prevDist) * 0.05;
+      analog.zoom -= (dist - prevDist) * 0.05;
       analog.x += midX - prevMidX;
       analog.y += midY - prevMidY;
       analog.panning = true;

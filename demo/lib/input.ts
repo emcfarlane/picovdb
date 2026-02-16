@@ -84,7 +84,7 @@ export function createInputHandler(window: Window, canvas: HTMLCanvasElement): I
       const midX = (p[0].clientX + p[1].clientX) / 2;
       const midY = (p[0].clientY + p[1].clientY) / 2;
 
-      analog.zoom += (dist - prevDist) * 0.05; // Pinch Zoom
+      analog.zoom -= (dist - prevDist) * 0.05; // Pinch Zoom
       analog.x += midX - prevMidX;             // 2-finger Pan (midpoint delta)
       analog.y += midY - prevMidY;
       analog.panning = true;
