@@ -27,6 +27,8 @@ export function createInputHandler(window: Window, canvas: HTMLCanvasElement): I
   // State
   const pointers = new Map<number, PointerEvent>();
   let prevDist = 0;
+  let prevMidX = 0;
+  let prevMidY = 0;
   let isAlt = false;
 
   // Keyboard
@@ -54,33 +56,46 @@ export function createInputHandler(window: Window, canvas: HTMLCanvasElement): I
       // Init pinch
       const p = [...pointers.values()];
       prevDist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+      prevMidX = (p[0].clientX + p[1].clientX) / 2;
+      prevMidY = (p[0].clientY + p[1].clientY) / 2;
     }
   });
 
-  canvas.addEventListener('pointerup', e => {
+  const removePointer = (e: PointerEvent) => {
     canvas.releasePointerCapture(e.pointerId);
     pointers.delete(e.pointerId);
-  });
+  };
+  canvas.addEventListener('pointerup', removePointer);
+  canvas.addEventListener('pointercancel', removePointer);
 
   canvas.addEventListener('pointermove', e => {
-    if (!pointers.has(e.pointerId)) return;
+    const prev = pointers.get(e.pointerId);
+    if (!prev) return;
     pointers.set(e.pointerId, e); // Update cache
+
+    // Compute deltas manually (movementX/Y unreliable on iOS Safari touch)
+    const mdx = e.clientX - prev.clientX;
+    const mdy = e.clientY - prev.clientY;
 
     // Multi-touch (Pinch + Pan)
     if (pointers.size === 2) {
       const p = [...pointers.values()];
       const dist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+      const midX = (p[0].clientX + p[1].clientX) / 2;
+      const midY = (p[0].clientY + p[1].clientY) / 2;
 
-      analog.zoom += (dist - prevDist) * 0.01; // Pinch Zoom
-      analog.x += e.movementX;                 // 2-finger Pan
-      analog.y += e.movementY;
+      analog.zoom += (dist - prevDist) * 0.05; // Pinch Zoom
+      analog.x += midX - prevMidX;             // 2-finger Pan (midpoint delta)
+      analog.y += midY - prevMidY;
       analog.panning = true;
       prevDist = dist;
+      prevMidX = midX;
+      prevMidY = midY;
     }
     // Single Touch / Mouse
     else if (pointers.size === 1) {
-      analog.x += e.movementX;
-      analog.y += e.movementY;
+      analog.x += mdx;
+      analog.y += mdy;
       // Pan if Middle Mouse (4) or Alt held
       analog.panning = (e.buttons & 4) !== 0 || isAlt;
     }

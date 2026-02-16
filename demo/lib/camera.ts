@@ -87,7 +87,7 @@ export function createOrbitCamera(options?: {
 			} else if (dx || dy) {
 				const orbitSpeed = 0.005;
 				targetTheta -= dx * orbitSpeed;
-				targetPhi = Math.max(-1.5, Math.min(1.5, targetPhi - dy * orbitSpeed));
+				targetPhi = Math.max(-1.5, Math.min(1.5, targetPhi + dy * orbitSpeed));
 			}
 
 			if (dz) {

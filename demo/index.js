@@ -4505,7 +4505,7 @@ function createOrbitCamera(options) {
       } else if (dx || dy) {
         const orbitSpeed = 5e-3;
         targetTheta -= dx * orbitSpeed;
-        targetPhi = Math.max(-1.5, Math.min(1.5, targetPhi - dy * orbitSpeed));
+        targetPhi = Math.max(-1.5, Math.min(1.5, targetPhi + dy * orbitSpeed));
       }
       if (dz) {
         targetRadius *= Math.pow(1.1, dz * 0.5);
@@ -4543,6 +4543,8 @@ function createInputHandler(window2, canvas2) {
   const analog = { x: 0, y: 0, zoom: 0, touching: false, panning: false };
   const pointers = /* @__PURE__ */ new Map();
   let prevDist = 0;
+  let prevMidX = 0;
+  let prevMidY = 0;
   let isAlt = false;
   const setKey = (e, v) => {
     if (e.key === "Alt") isAlt = v;
@@ -4576,26 +4578,37 @@ function createInputHandler(window2, canvas2) {
     if (pointers.size === 2) {
       const p = [...pointers.values()];
       prevDist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
+      prevMidX = (p[0].clientX + p[1].clientX) / 2;
+      prevMidY = (p[0].clientY + p[1].clientY) / 2;
     }
   });
-  canvas2.addEventListener("pointerup", (e) => {
+  const removePointer = (e) => {
     canvas2.releasePointerCapture(e.pointerId);
     pointers.delete(e.pointerId);
-  });
+  };
+  canvas2.addEventListener("pointerup", removePointer);
+  canvas2.addEventListener("pointercancel", removePointer);
   canvas2.addEventListener("pointermove", (e) => {
-    if (!pointers.has(e.pointerId)) return;
+    const prev = pointers.get(e.pointerId);
+    if (!prev) return;
     pointers.set(e.pointerId, e);
+    const mdx = e.clientX - prev.clientX;
+    const mdy = e.clientY - prev.clientY;
     if (pointers.size === 2) {
       const p = [...pointers.values()];
       const dist = Math.hypot(p[0].clientX - p[1].clientX, p[0].clientY - p[1].clientY);
-      analog.zoom += (dist - prevDist) * 0.01;
-      analog.x += e.movementX;
-      analog.y += e.movementY;
+      const midX = (p[0].clientX + p[1].clientX) / 2;
+      const midY = (p[0].clientY + p[1].clientY) / 2;
+      analog.zoom += (dist - prevDist) * 0.05;
+      analog.x += midX - prevMidX;
+      analog.y += midY - prevMidY;
       analog.panning = true;
       prevDist = dist;
+      prevMidX = midX;
+      prevMidY = midY;
     } else if (pointers.size === 1) {
-      analog.x += e.movementX;
-      analog.y += e.movementY;
+      analog.x += mdx;
+      analog.y += mdy;
       analog.panning = (e.buttons & 4) !== 0 || isAlt;
     }
   });
@@ -10305,7 +10318,10 @@ if (!canvas) {
   throw new Error("No canvas found.");
 }
 if (!navigator.gpu) {
-  throw new Error("WebGPU not supported on this browser.");
+  const isInsecure = window.isSecureContext === false;
+  throw new Error(
+    isInsecure ? "WebGPU requires a secure context (HTTPS or localhost). Current origin is not secure." : "WebGPU not supported on this browser."
+  );
 }
 console.log("WebGPU is supported!");
 var adapter = await navigator.gpu.requestAdapter({

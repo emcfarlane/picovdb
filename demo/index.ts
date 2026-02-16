@@ -17,7 +17,12 @@ if (!canvas) {
   throw new Error("No canvas found.");
 }
 if (!navigator.gpu) {
-  throw new Error("WebGPU not supported on this browser.");
+  const isInsecure = window.isSecureContext === false;
+  throw new Error(
+    isInsecure
+      ? "WebGPU requires a secure context (HTTPS or localhost). Current origin is not secure."
+      : "WebGPU not supported on this browser."
+  );
 }
 console.log("WebGPU is supported!");
 
