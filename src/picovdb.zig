@@ -50,67 +50,72 @@ pub const PicoVDBRoot = extern struct {
     key: [2]u32, // 64-bit coordinate key (8 bytes)
 };
 
-// Node mask structure (16 bytes)
-// Encoding: inside=0,value=0 -> outside implicit (background at index 0)
-//           inside=0,value=1 -> stored value (explicit tile)
-//           inside=1,value=0 -> inside implicit (inside value at index 1)
-//           inside=1,value=1 -> child node reference
-pub const PicoVDBNodeMask = extern struct {
-    inside: u32, // Inside mask bits (4 bytes)
-    value: u32, // Value mask bits (4 bytes)
-    value_offset: u32, // Prefix sum offset of values (4 bytes)
-    child_offset: u32, // Prefix sum offset of children (4 bytes)
+// Node mask structure (12 bytes)
+// Encoding: inside=0,active=0 -> outside implicit (background at index 0)
+//           inside=0,active=1 -> stored value (explicit tile)
+//           inside=1,active=0 -> inside implicit (inside value at index 1)
+//           inside=1,active=1 -> child node reference
+pub const PicoVDBNodeElement = extern struct {
+    inside_mask: u32, // Inside mask bits (4 bytes)
+    active_mask: u32, // Active mask bits (4 bytes)
+    packed_local_index: u32, // (local_inside_u16 << 16) | local_active_u16 (4 bytes)
 
-    pub inline fn isValue(self: PicoVDBNodeMask, index: u5) bool {
-        return (self.value >> index) & 1 != 0;
+    pub inline fn isActive(self: PicoVDBNodeElement, index: u5) bool {
+        return (self.active_mask >> index) & 1 != 0;
     }
-    pub inline fn isInside(self: PicoVDBNodeMask, index: u5) bool {
-        return (self.inside >> index) & 1 != 0;
+    pub inline fn isInside(self: PicoVDBNodeElement, index: u5) bool {
+        return (self.inside_mask >> index) & 1 != 0;
     }
-    pub inline fn valueIndex(self: PicoVDBNodeMask, index: u5) u32 {
-        const value_mask = self.value & ~self.inside;
-        return rankQuery(value_mask, self.value_offset, index);
+    pub inline fn localInsideIndex(self: PicoVDBNodeElement) u16 {
+        return @intCast(self.packed_local_index >> 16);
     }
-    pub inline fn childIndex(self: PicoVDBNodeMask, index: u5) u32 {
-        const child_mask = self.value & self.inside;
-        return rankQuery(child_mask, self.child_offset, index);
+    pub inline fn localActiveIndex(self: PicoVDBNodeElement) u16 {
+        return @intCast(self.packed_local_index & 0xFFFF);
+    }
+    /// Count of (active & inside) bits before bit_index in this word
+    pub inline fn childPrecedingCount(self: PicoVDBNodeElement, index: u5) u32 {
+        const child_mask = self.active_mask & self.inside_mask;
+        const bit_mask = (@as(u32, 1) << index) - 1;
+        return @popCount(child_mask & bit_mask);
+    }
+    /// Count of (active & ~inside) bits before bit_index in this word
+    pub inline fn valuePrecedingCount(self: PicoVDBNodeElement, index: u5) u32 {
+        const value_mask = self.active_mask & ~self.inside_mask;
+        const bit_mask = (@as(u32, 1) << index) - 1;
+        return @popCount(value_mask & bit_mask);
     }
 };
 
-// Leaf mask structure (12 bytes)
-// Encoding: inside=0,value=0 -> outside implicit (background at index 0)
-//           inside=0,value=1 -> stored value (explicit tile)
-//           inside=1,value=0 -> inside implicit (inside value at index 1)
-// Note: inside=1,value=1 is not valid for leaves (no children)
-pub const PicoVDBLeafMask = extern struct {
-    inside: u32, // Inside mask bits (4 bytes)
-    value: u32, // Value mask bits (4 bytes)
-    value_offset: u32, // Prefix sum offset of values (4 bytes)
-
-    pub inline fn isValue(self: PicoVDBLeafMask, index: u5) bool {
-        return (self.value >> index) & 1 != 0;
-    }
-    pub inline fn isInside(self: PicoVDBLeafMask, index: u5) bool {
-        return (self.inside >> index) & 1 != 0;
-    }
-    pub inline fn valueIndex(self: PicoVDBLeafMask, index: u5) u32 {
-        return rankQuery(self.value, self.value_offset, index);
-    }
-};
-
-// Upper internal node (16384 bytes = 1024 * 16)
+// Upper internal node (12304 bytes = 16 + 1024 * 12)
 pub const PicoVDBUpper = extern struct {
-    mask: [1024]PicoVDBNodeMask,
+    base_inside_index: u64, // low u32 = WGSL baseInsideIndex, high u32 = pad (always 0 in current format)
+    base_active_index: u64, // low u32 = WGSL baseActiveIndex, high u32 = pad (always 0 in current format)
+    elements: [1024]PicoVDBNodeElement,
 };
 
-// Lower internal node (2048 bytes = 128 * 16)
+// Lower internal node (1552 bytes = 16 + 128 * 12)
 pub const PicoVDBLower = extern struct {
-    mask: [128]PicoVDBNodeMask,
+    base_inside_index: u64,
+    base_active_index: u64,
+    elements: [128]PicoVDBNodeElement,
 };
 
-// Leaf node (192 bytes = 16 * 12)
+// Leaf node (208 bytes = 16 + 16 * 12)
 pub const PicoVDBLeaf = extern struct {
-    mask: [16]PicoVDBLeafMask,
+    base_inside_index: u64,
+    base_active_index: u64,
+    elements: [16]PicoVDBNodeElement,
+
+    /// Compute the value index for a given word and bit position.
+    /// Uses the pre-computed local active index from packed_local_index (low u16)
+    /// plus popcount of preceding active bits within the word.
+    /// @intCast asserts the result fits in u32 (current format constraint).
+    pub inline fn valueIndex(self: *const PicoVDBLeaf, word_index: u32, bit_index: u5) u32 {
+        const mask = &self.elements[word_index];
+        const local_index = mask.localActiveIndex();
+        const preceding = mask.valuePrecedingCount(bit_index);
+        return @intCast(self.base_active_index + local_index + preceding);
+    }
 };
 
 // Read accessor (32 bytes)
@@ -122,11 +127,11 @@ pub const PicoVDBReadAccessor = extern struct {
     leaf: u32, // Leaf node index (4 bytes)
     _pad: u32, // Padding to 32 bytes (4 bytes)
 
-    const LevelCount = struct {
+    const LevelIndex = struct {
         // Level of value found.
         level: u32,
-        // Count offset. 0 = background, 1 = inside implicit.
-        count: u32,
+        // Index into data buffer. 0 = background, 1 = inside implicit.
+        index: u32,
     };
 
     pub fn init(grid: u32) PicoVDBReadAccessor {
@@ -190,112 +195,119 @@ pub const PicoVDBReadAccessor = extern struct {
     }
 
     // Get level and count from leaf node and update cache - 1 branch (no children)
-    fn leafGetLevelCountAndCache(
+    fn leafGetLevelIndexAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
-    ) LevelCount {
+    ) LevelIndex {
         const leaf = &picovdb_file.leaves[grid.leaf_start + self.leaf];
         const n = leafCoordToOffset(ijk);
         const word_index = n / 32;
         const bit_index: u5 = @intCast(n % 32);
-        const mask = &leaf.mask[word_index];
+        const mask = &leaf.elements[word_index];
 
-        const is_value = mask.isValue(bit_index);
+        const is_active = mask.isActive(bit_index);
         const is_inside = mask.isInside(bit_index);
 
-        if (is_value) {
+        if (is_active) {
             self.key = ijk;
-            const value_index = mask.valueIndex(bit_index);
-            return LevelCount{ .level = 0, .count = value_index };
+            return LevelIndex{ .level = 0, .index = leaf.valueIndex(word_index, bit_index) };
         }
-        return LevelCount{ .level = 0, .count = @intFromBool(is_inside) };
+        return LevelIndex{ .level = 0, .index = @intFromBool(is_inside) };
     }
 
     // Get value and level from lower node and update cache - 2 branches (child, value)
-    fn lowerGetLevelCountAndCache(
+    fn lowerGetLevelIndexAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
-    ) LevelCount {
+    ) LevelIndex {
         const lower = &picovdb_file.lowers[grid.lower_start + self.lower];
         const n = lowerCoordToOffset(ijk);
         const word_index = n / 32;
         const bit_index: u5 = @intCast(n % 32);
-        const mask = &lower.mask[word_index];
+        const mask = &lower.elements[word_index];
 
-        const is_value = mask.isValue(bit_index);
+        const is_active = mask.isActive(bit_index);
         const is_inside = mask.isInside(bit_index);
 
-        if (is_value and is_inside) {
-            self.leaf = mask.childIndex(bit_index);
+        if (!is_active) {
+            return LevelIndex{ .level = 1, .index = @intFromBool(is_inside) };
+        }
+        if (is_inside) {
+            // Child reference: active && inside
+            const preceding = mask.childPrecedingCount(bit_index);
+            self.leaf = @intCast(lower.base_inside_index + mask.localInsideIndex() + preceding);
             self.key = ijk;
-            return self.leafGetLevelCountAndCache(ijk, grid, picovdb_file);
+            return self.leafGetLevelIndexAndCache(ijk, grid, picovdb_file);
         }
-        if (is_value) {
-            const value_index = mask.valueIndex(bit_index);
-            return LevelCount{ .level = 1, .count = value_index };
-        }
-        return LevelCount{ .level = 1, .count = @intFromBool(is_inside) };
+        // Stored value: active && !inside
+        const preceding = mask.valuePrecedingCount(bit_index);
+        const index: u32 = @intCast(lower.base_active_index + mask.localActiveIndex() + preceding);
+        return LevelIndex{ .level = 1, .index = index };
     }
 
     // Get level and count from upper node and update cache - 2 branches (child, value)
-    fn upperGetLevelCountAndCache(
+    fn upperGetLevelIndexAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
-    ) LevelCount {
+    ) LevelIndex {
         const upper = &picovdb_file.uppers[grid.upper_start + self.upper];
         const n = upperCoordToOffset(ijk);
         const word_index = n / 32;
         const bit_index: u5 = @intCast(n % 32);
-        const mask = &upper.mask[word_index];
+        const mask = &upper.elements[word_index];
 
-        const is_value = mask.isValue(bit_index);
+        const is_active = mask.isActive(bit_index);
         const is_inside = mask.isInside(bit_index);
 
-        if (is_value and is_inside) {
-            self.lower = mask.childIndex(bit_index);
+        if (!is_active) {
+            return LevelIndex{ .level = 2, .index = @intFromBool(is_inside) };
+        }
+        if (is_inside) {
+            // Child reference: active && inside
+            const preceding = mask.childPrecedingCount(bit_index);
+            self.lower = @intCast(upper.base_inside_index + mask.localInsideIndex() + preceding);
             self.key = ijk;
-            return self.lowerGetLevelCountAndCache(ijk, grid, picovdb_file);
+            return self.lowerGetLevelIndexAndCache(ijk, grid, picovdb_file);
         }
-        if (is_value) {
-            const value_index = mask.valueIndex(bit_index);
-            return LevelCount{ .level = 2, .count = value_index };
-        }
-        return LevelCount{ .level = 2, .count = @intFromBool(is_inside) };
+        // Stored value: active && !inside
+        const preceding = mask.valuePrecedingCount(bit_index);
+        const index: u32 = @intCast(upper.base_active_index + mask.localActiveIndex() + preceding);
+        return LevelIndex{ .level = 2, .index = index };
     }
 
-    fn rootGetLevelCountAndCache(
+    fn rootGetLevelIndexAndCache(
         self: *PicoVDBReadAccessor,
         ijk: [3]i32,
         grid: *const PicoVDBGrid,
         picovdb_file: *const PicoVDBFile,
-    ) LevelCount {
+    ) LevelIndex {
         const upper_index = findUpperIndex(ijk, grid, picovdb_file);
         if (upper_index == null) {
             // No matching root tile, return background value
-            return LevelCount{ .level = 4, .count = 0 };
+            return LevelIndex{ .level = 4, .index = 0 };
         }
         // Roots are 1:1 with uppers, so upper_index works for both
         self.upper = upper_index.?;
         self.key = ijk;
-        return self.upperGetLevelCountAndCache(ijk, grid, picovdb_file);
+        return self.upperGetLevelIndexAndCache(ijk, grid, picovdb_file);
     }
 
-    pub fn getLevelCount(self: *PicoVDBReadAccessor, ijk: [3]i32, grid: *const PicoVDBGrid, picovdb_file: *const PicoVDBFile) LevelCount {
+    pub fn getLevelIndex(self: *PicoVDBReadAccessor, ijk: [3]i32, grid: *const PicoVDBGrid, picovdb_file: *const PicoVDBFile) LevelIndex {
         const dirty = self.computeDirty(ijk);
         if (self.isCachedLeaf(dirty)) {
-            return self.leafGetLevelCountAndCache(ijk, grid, picovdb_file);
+            return self.leafGetLevelIndexAndCache(ijk, grid, picovdb_file);
         } else if (self.isCachedLower(dirty)) {
-            return self.lowerGetLevelCountAndCache(ijk, grid, picovdb_file);
+            return self.lowerGetLevelIndexAndCache(ijk, grid, picovdb_file);
         } else if (self.isCachedUpper(dirty)) {
-            return self.upperGetLevelCountAndCache(ijk, grid, picovdb_file);
+            return self.upperGetLevelIndexAndCache(ijk, grid, picovdb_file);
         } else {
-            return self.rootGetLevelCountAndCache(ijk, grid, picovdb_file);
+            return self.rootGetLevelIndexAndCache(ijk, grid, picovdb_file);
         }
     }
 };

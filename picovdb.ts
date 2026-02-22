@@ -10,11 +10,11 @@ export const GRID_TYPE_SDF_UINT8 = 2;
 export const PICOVDB_FILE_HEADER_SIZE = 32;
 export const PICOVDB_GRID_SIZE = 64;
 export const PICOVDB_ROOT_SIZE = 8;
-export const PICOVDB_NODE_MASK_SIZE = 16;
-export const PICOVDB_LEAF_MASK_SIZE = 12;
-export const PICOVDB_UPPER_SIZE = 16384;
-export const PICOVDB_LOWER_SIZE = 2048;
-export const PICOVDB_LEAF_SIZE = 192;
+export const PICOVDB_NODE_MASK_SIZE = 12;
+export const PICOVDB_LEAF_MASK_SIZE = 8;
+export const PICOVDB_UPPER_SIZE = 12304; //16384;
+export const PICOVDB_LOWER_SIZE = 1552; //2048;
+export const PICOVDB_LEAF_SIZE = 208; //192;
 export const PICOVDB_DATA_SIZE = 16;
 
 export interface PicoVDBFileHeader {
@@ -43,29 +43,28 @@ export interface PicoVDBRoot {
   key: [number, number]; // 64-bit coordinate key (8 bytes)
 }
 
-export interface PicoVDBNodeMask {
-  inside: number;
-  value: number;
-  valueOffset: number;
-  childOffset: number;
-}
-
-export interface PicoVDBLeafMask {
-  inside: number;
-  value: number;
-  valueOffset: number;
+export interface PicoVDBNodeElement {
+  insideMask: number;
+  activeMask: number;
+  packedLocalIndex: number; // (localInside_u16 << 16) | localActive_u16
 }
 
 export interface PicoVDBUpper {
-  mask: PicoVDBNodeMask[]; // 1024 elements
+  baseInsideIndex: number;
+  baseActiveIndex: number;
+  elements: PicoVDBNodeElement[]; // 1024 elements
 }
 
 export interface PicoVDBLower {
-  mask: PicoVDBNodeMask[]; // 128 elements
+  baseInsideIndex: number;
+  baseActiveIndex: number;
+  elements: PicoVDBNodeElement[]; // 128 elements
 }
 
 export interface PicoVDBLeaf {
-  mask: PicoVDBLeafMask[]; // 16 elements
+  baseInsideIndex: number;
+  baseActiveIndex: number;
+  elements: PicoVDBNodeElement[]; // 16 elements
 }
 
 export class PicoVDBFile {
@@ -187,19 +186,23 @@ export class PicoVDBFile {
       this.getRootCountPadded() * PICOVDB_ROOT_SIZE +
       index * PICOVDB_UPPER_SIZE;
 
-    const masks: PicoVDBNodeMask[] = [];
+    let offset = baseOffset;
+    const baseInsideIndex = this.view.getUint32(offset + 0, true);
+    console.assert(this.view.getUint32(offset + 4, true) === 0, 'baseInsideIndex high u32 must be 0');
+    const baseActiveIndex = this.view.getUint32(offset + 8, true);
+    console.assert(this.view.getUint32(offset + 12, true) === 0, 'baseActiveIndex high u32 must be 0');
+    offset += 16;
+
+    const elements: PicoVDBNodeElement[] = [];
     for (let i = 0; i < 1024; i++) {
-      const maskOffset = baseOffset + i * PICOVDB_NODE_MASK_SIZE;
-      masks.push({
-        inside: this.view.getUint32(maskOffset + 0, true),
-        value: this.view.getUint32(maskOffset + 4, true),
-        valueOffset: this.view.getUint32(maskOffset + 8, true),
-        childOffset: this.view.getUint32(maskOffset + 12, true),
+      const maskOffset = offset + i * PICOVDB_NODE_MASK_SIZE;
+      elements.push({
+        insideMask: this.view.getUint32(maskOffset + 0, true),
+        activeMask: this.view.getUint32(maskOffset + 4, true),
+        packedLocalIndex: this.view.getUint32(maskOffset + 8, true),
       });
     }
-    return {
-      mask: masks,
-    };
+    return { baseInsideIndex, baseActiveIndex, elements };
   }
 
   getLower(index: number): PicoVDBLower {
@@ -213,19 +216,23 @@ export class PicoVDBFile {
       this.header.upperCount * PICOVDB_UPPER_SIZE +
       index * PICOVDB_LOWER_SIZE;
 
-    const masks: PicoVDBNodeMask[] = [];
+    let offset = baseOffset;
+    const baseInsideIndex = this.view.getUint32(offset + 0, true);
+    console.assert(this.view.getUint32(offset + 4, true) === 0, 'baseInsideIndex high u32 must be 0');
+    const baseActiveIndex = this.view.getUint32(offset + 8, true);
+    console.assert(this.view.getUint32(offset + 12, true) === 0, 'baseActiveIndex high u32 must be 0');
+    offset += 16;
+
+    const elements: PicoVDBNodeElement[] = [];
     for (let i = 0; i < 128; i++) {
-      const maskOffset = baseOffset + i * PICOVDB_NODE_MASK_SIZE;
-      masks.push({
-        inside: this.view.getUint32(maskOffset + 0, true),
-        value: this.view.getUint32(maskOffset + 4, true),
-        valueOffset: this.view.getUint32(maskOffset + 8, true),
-        childOffset: this.view.getUint32(maskOffset + 12, true),
+      const maskOffset = offset + i * PICOVDB_NODE_MASK_SIZE;
+      elements.push({
+        insideMask: this.view.getUint32(maskOffset + 0, true),
+        activeMask: this.view.getUint32(maskOffset + 4, true),
+        packedLocalIndex: this.view.getUint32(maskOffset + 8, true),
       });
     }
-    return {
-      mask: masks,
-    };
+    return { baseInsideIndex, baseActiveIndex, elements };
   }
 
   getLeaf(index: number): PicoVDBLeaf {
@@ -240,18 +247,23 @@ export class PicoVDBFile {
       this.header.lowerCount * PICOVDB_LOWER_SIZE +
       index * PICOVDB_LEAF_SIZE;
 
-    const masks: PicoVDBLeafMask[] = [];
+    let offset = baseOffset;
+    const baseInsideIndex = this.view.getUint32(offset + 0, true);
+    console.assert(this.view.getUint32(offset + 4, true) === 0, 'baseInsideIndex high u32 must be 0');
+    const baseActiveIndex = this.view.getUint32(offset + 8, true);
+    console.assert(this.view.getUint32(offset + 12, true) === 0, 'baseActiveIndex high u32 must be 0');
+    offset += 16;
+
+    const elements: PicoVDBNodeElement[] = [];
     for (let i = 0; i < 16; i++) {
-      const maskOffset = baseOffset + i * PICOVDB_LEAF_MASK_SIZE;
-      masks.push({
-        inside: this.view.getUint32(maskOffset + 0, true),
-        value: this.view.getUint32(maskOffset + 4, true),
-        valueOffset: this.view.getUint32(maskOffset + 8, true),
+      const maskOffset = offset + i * PICOVDB_NODE_MASK_SIZE;
+      elements.push({
+        insideMask: this.view.getUint32(maskOffset + 0, true),
+        activeMask: this.view.getUint32(maskOffset + 4, true),
+        packedLocalIndex: this.view.getUint32(maskOffset + 8, true),
       });
     }
-    return {
-      mask: masks,
-    };
+    return { baseInsideIndex, baseActiveIndex, elements };
   }
 
   getVoxelCount(): number {
