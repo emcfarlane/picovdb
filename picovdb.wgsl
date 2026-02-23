@@ -43,10 +43,13 @@ struct PicoVDBRoot {
   key: vec2u,  // 64-bit coordinate key (8 bytes)
 }
 
+// Node element encoding:
+//   state=0,value=0 -> outside implicit    state=0,value=1 -> value explicit
+//   state=1,value=0 -> inside implicit     state=1,value=1 -> child/surface reference
 struct PicoVDBNodeElement {
-  insideMask: u32,
-  activeMask: u32,
-  packedLocalIndicies: u32, // (localInside_u16 << 16) | localActive_u16
+  stateMask: u32,
+  valueMask: u32,
+  packedLocalIndicies: u32, // stateOffset: u16 | valueOffset: u16
 }
 
 struct PicoVDBUpper {
@@ -76,6 +79,7 @@ struct PicoVDBLeaf {
 struct PicoVDBLevelIndex {
   level: u32,  // Level of value found
   index: u32,  // Index into values (0/1 means no active values/background)
+  isSurface: bool,
 }
 
 struct PicoVDBReadAccessor {
@@ -180,28 +184,26 @@ fn picovdbReadAccessorLeafGetLevelIndexAndCache(
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelIndex {
     let n = picovdbLeafCoordToOffset(ijk);
-    let word_index = n >> 5u; // Fast divide by 32
-    let bit_index = n & 31u; // Fast modulo 32
-    let leaf_index = grid.leafStart + (*acc).leaf;
+    let word_index = n >> 5u;
+    let bit_index = n & 31u;
+    let leaf = &picovdb_leaves[grid.leafStart + (*acc).leaf];
+    let elem = (*leaf).elements[word_index];
 
-    let inside_mask = picovdb_leaves[leaf_index].elements[word_index].insideMask;
-    let active_mask = picovdb_leaves[leaf_index].elements[word_index].activeMask;
-    let packed = picovdb_leaves[leaf_index].elements[word_index].packedLocalIndicies;
+    let bit = 1u << bit_index;
+    let is_value = (elem.valueMask & bit) != 0u;
+    let is_state = (elem.stateMask & bit) != 0u;
 
-    let bit_at_pos = 1u << bit_index;
-    let is_inside = (inside_mask & bit_at_pos) != 0u;
-    let is_active = (active_mask & bit_at_pos) != 0u;
-
-    let base_index = picovdb_leaves[leaf_index].baseActiveIndex;
-    let local_index = packed & 0xFFFFu;
-    let preceding_bits = extractBits(active_mask & ~inside_mask, 0u, bit_index);
+    // Branchless: value -> base + local + preceding, else -> 0 or 1 (state)
+    // At leaf level, ALL value voxels (both surface and non-surface) store values,
+    // so we count all value bits (not value & ~state).
+    let preceding_mask = elem.valueMask & ((1u << bit_index) - 1u);
     let index = select(
-        u32(is_inside),
-        base_index + local_index + countOneBits(preceding_bits),
-        is_active
+        u32(is_state),
+        (*leaf).baseActiveIndex + (elem.packedLocalIndicies & 0xFFFFu) + countOneBits(preceding_mask),
+        is_value
     );
-    (*acc).key = ijk;
-    return PicoVDBLevelIndex(0u, index);
+    (*acc).key = select((*acc).key, ijk, is_value);
+    return PicoVDBLevelIndex(0u, index, is_value && is_state);
 }
 
 fn picovdbReadAccessorLowerGetLevelIndexAndCache(
@@ -210,31 +212,29 @@ fn picovdbReadAccessorLowerGetLevelIndexAndCache(
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelIndex {
     let n = picovdbLowerCoordToOffset(ijk);
-    let word_index = n >> 5u; // Fast divide by 32
-    let bit_index = n & 31u; // Fast modulo 32
-    let lower_index = grid.lowerStart + (*acc).lower;
+    let word_index = n >> 5u;
+    let bit_index = n & 31u;
+    let lower = &picovdb_lowers[grid.lowerStart + (*acc).lower];
+    let elem = (*lower).elements[word_index];
 
-    let inside_mask = picovdb_lowers[lower_index].elements[word_index].insideMask;
-    let active_mask = picovdb_lowers[lower_index].elements[word_index].activeMask;
-    let packed = picovdb_lowers[lower_index].elements[word_index].packedLocalIndicies;
-
-    let bit_at_pos = 1u << bit_index;
-    let is_inside = (inside_mask & bit_at_pos) != 0u;
-    let is_active = (active_mask & bit_at_pos) != 0u;
-    if (!is_active) {
-        return PicoVDBLevelIndex(1u, u32(is_inside)); // fast path
+    let bit = 1u << bit_index;
+    let is_value = (elem.valueMask & bit) != 0u;
+    let is_state = (elem.stateMask & bit) != 0u;
+    if (!is_value) {
+        return PicoVDBLevelIndex(1u, u32(is_state), false);
     }
-    if (!is_inside) {
-        let base_index = picovdb_lowers[lower_index].baseActiveIndex;
-        let local_index = packed & 0xFFFFu;
-        let preceding_bits = extractBits(active_mask & ~inside_mask, 0u, bit_index);
-        let index = base_index + local_index + countOneBits(preceding_bits);
-        return PicoVDBLevelIndex(1u, index);
+    let preceding_mask = (1u << bit_index) - 1u;
+    if (!is_state) {
+        // Stored value: value & ~state
+        let index = (*lower).baseActiveIndex
+            + (elem.packedLocalIndicies & 0xFFFFu)
+            + countOneBits(elem.valueMask & ~elem.stateMask & preceding_mask);
+        return PicoVDBLevelIndex(1u, index, false);
     }
-    let base_index = picovdb_lowers[lower_index].baseInsideIndex;
-    let local_index = packed >> 16u;
-    let preceding_bits = extractBits(active_mask & inside_mask, 0u, bit_index);
-    (*acc).leaf = base_index + local_index + countOneBits(preceding_bits);
+    // Child reference: value & state
+    (*acc).leaf = (*lower).baseInsideIndex
+        + (elem.packedLocalIndicies >> 16u)
+        + countOneBits(elem.valueMask & elem.stateMask & preceding_mask);
     (*acc).key = ijk;
     return picovdbReadAccessorLeafGetLevelIndexAndCache(acc, ijk, grid);
 }
@@ -245,31 +245,29 @@ fn picovdbReadAccessorUpperGetLevelIndexAndCache(
     grid: PicoVDBGrid,
 ) -> PicoVDBLevelIndex {
     let n = picovdbUpperCoordToOffset(ijk);
-    let word_index = n >> 5u; // Fast divide by 32
-    let bit_index = n & 31u; // Fast modulo 32
-    let upper_index = grid.upperStart + (*acc).upper;
+    let word_index = n >> 5u;
+    let bit_index = n & 31u;
+    let upper = &picovdb_uppers[grid.upperStart + (*acc).upper];
+    let elem = (*upper).elements[word_index];
 
-    let inside_mask = picovdb_uppers[upper_index].elements[word_index].insideMask;
-    let active_mask = picovdb_uppers[upper_index].elements[word_index].activeMask;
-    let packed = picovdb_uppers[upper_index].elements[word_index].packedLocalIndicies;
-
-    let bit_at_pos = 1u << bit_index;
-    let is_inside = (inside_mask & bit_at_pos) != 0u;
-    let is_active = (active_mask & bit_at_pos) != 0u;
-    if (!is_active) {
-        return PicoVDBLevelIndex(2u, u32(is_inside)); // fast path
+    let bit = 1u << bit_index;
+    let is_value = (elem.valueMask & bit) != 0u;
+    let is_state = (elem.stateMask & bit) != 0u;
+    if (!is_value) {
+        return PicoVDBLevelIndex(2u, u32(is_state), false);
     }
-    if (!is_inside) {
-        let base_index = picovdb_uppers[upper_index].baseActiveIndex;
-        let local_index = packed & 0xFFFFu;
-        let preceding_bits = extractBits(active_mask & ~inside_mask, 0u, bit_index);
-        let index = base_index + local_index + countOneBits(preceding_bits);
-        return PicoVDBLevelIndex(2u, index);
+    let preceding_mask = (1u << bit_index) - 1u;
+    if (!is_state) {
+        // Stored value: value & ~state
+        let index = (*upper).baseActiveIndex
+            + (elem.packedLocalIndicies & 0xFFFFu)
+            + countOneBits(elem.valueMask & ~elem.stateMask & preceding_mask);
+        return PicoVDBLevelIndex(2u, index, false);
     }
-    let base_index = picovdb_uppers[upper_index].baseInsideIndex;
-    let local_index = packed >> 16u;
-    let preceding_bits = extractBits(active_mask & inside_mask, 0u, bit_index);
-    (*acc).lower = base_index + local_index + countOneBits(preceding_bits);
+    // Child reference: value & state
+    (*acc).lower = (*upper).baseInsideIndex
+        + (elem.packedLocalIndicies >> 16u)
+        + countOneBits(elem.valueMask & elem.stateMask & preceding_mask);
     (*acc).key = ijk;
     return picovdbReadAccessorLowerGetLevelIndexAndCache(acc, ijk, grid);
 }
@@ -283,7 +281,7 @@ fn picovdbReadAccessorRootGetLevelIndexAndCache(
     let rootIndex = picovdbReadAccessorFindUpperIndex(ijk, grid);
     if (rootIndex == -1) {
         // No matching root tile, return background
-        return PicoVDBLevelIndex(3u, 0u);
+        return PicoVDBLevelIndex(3u, 0u, false);
     }
     (*acc).upper = u32(rootIndex);
     (*acc).key = ijk;
@@ -425,15 +423,35 @@ fn picovdbHDDARayClip(
 // Level 3 (Root) -> 4096 (2^12)
 const picovdbDimForLevel = array(1, 8, 128, 4096);
 
-// Check if voxel is active (count > 1 means has value)
-fn picovdbIsActive(level_count: PicoVDBLevelIndex) -> bool {
-    return level_count.index > 1u;
-}
 // Get float value from data buffer using grid offset and value index
 fn picovdbGetValue(grid: PicoVDBGrid, count: u32) -> f32 {
     // dataStart is in 16-byte units, multiply by 4 to get u32 index (16 bytes = 4 u32s)
     let u32Index = grid.dataStart * 4u + count;
     return bitcast<f32>(picovdb_buffer[u32Index]);
+}
+
+// Check if a voxel at the given coordinate is a surface voxel (value=1, state=1 at leaf level).
+// The accessor's leaf cache must already be set (call after getLevelIndex returns level 0).
+fn picovdbIsSurface(acc: ptr<function, PicoVDBReadAccessor>, grid: PicoVDBGrid, ijk: vec3i) -> bool {
+    let n = picovdbLeafCoordToOffset(ijk);
+    let leaf = &picovdb_leaves[grid.leafStart + (*acc).leaf];
+    let elem = (*leaf).elements[n >> 5u];
+    let bit = 1u << (n & 31u);
+    return (elem.valueMask & elem.stateMask & bit) != 0u;
+}
+
+// Get the surface/texture index for a surface voxel (value=1, state=1 at leaf level).
+// Only valid when picovdbIsSurface returns true.
+fn picovdbGetSurfaceIndex(acc: ptr<function, PicoVDBReadAccessor>, grid: PicoVDBGrid, ijk: vec3i) -> u32 {
+    let n = picovdbLeafCoordToOffset(ijk);
+    let word_index = n >> 5u;
+    let bit_index = n & 31u;
+    let leaf = &picovdb_leaves[grid.leafStart + (*acc).leaf];
+    let elem = (*leaf).elements[word_index];
+    let preceding = elem.valueMask & elem.stateMask & ((1u << bit_index) - 1u);
+    return (*leaf).baseInsideIndex
+        + (elem.packedLocalIndicies >> 16u)
+        + countOneBits(preceding);
 }
 
 // Zero-crossing detection for level set raymarching.
@@ -477,31 +495,28 @@ fn picovdbHDDAZeroCrossing(
             continue; // Re-evaluate with the new aligned voxel
         }
 
-        if (hdda.dim == 1 && picovdbIsActive(result)) {
-            let val = picovdbGetValue(grid, result.index);
-            if ((val <= 0.0) != (v0 <= 0.0)) {
-                let cone_radius = hdda.tmin * pixel_radius;
-                if (cone_radius < 0.5) {
-                    // Voxel projects larger than a pixel — use analytical cubic solver
-                    // for smooth, sub-voxel accurate intersection.
-                    let stencil = picovdbSampleStencil(acc, grid, hdda.voxel);
-                    let o_local = origin + direction * hdda.tmin - vec3f(hdda.voxel);
-                    let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z) - hdda.tmin;
-                    let hit = picovdbVoxelIntersect(o_local, direction, t_exit, stencil);
-                    if (hit.hit) {
-                        *out_distance = hdda.tmin + hit.t;
-                        *out_normal = hit.normal;
-                        *out_iterations = step_count;
-                        return true;
-                    }
-                } else {
-                    let stencil = picovdbSampleStencil(acc, grid, hdda.voxel);
-                    let p_local = fract(origin + direction * hdda.tmin);
-                    *out_distance = hdda.tmin;
-                    *out_normal = picovdbTrilinearGradient(p_local, stencil);
+        if (hdda.dim == 1 && result.isSurface) {
+            let stencil = picovdbSampleStencil(acc, grid, hdda.voxel);
+            let cone_radius = hdda.tmin * pixel_radius;
+            if (cone_radius < 0.5) {
+                // Voxel projects larger than a pixel — use analytical cubic solver
+                // for smooth, sub-voxel accurate intersection.
+                //let o_local = origin + direction * hdda.tmin - vec3f(hdda.voxel);
+                let o_local = clamp(origin + direction * hdda.tmin - vec3f(hdda.voxel), vec3f(0.0), vec3f(1.0));
+                let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z) - hdda.tmin;
+                let hit = picovdbVoxelIntersect(o_local, direction, t_exit, stencil);
+                if (hit.hit) {
+                    *out_distance = hdda.tmin + hit.t;
+                    *out_normal = hit.normal;
                     *out_iterations = step_count;
                     return true;
                 }
+            } else {
+                let p_local = fract(origin + direction * hdda.tmin);
+                *out_distance = hdda.tmin;
+                *out_normal = picovdbTrilinearGradient(p_local, stencil);
+                *out_iterations = step_count;
+                return true;
             }
         }
         // Step to next boundary
@@ -522,10 +537,10 @@ struct PicoVDBStencil {
 fn picovdbSampleStencil(
     acc: ptr<function, PicoVDBReadAccessor>,
     grid: PicoVDBGrid,
-    ijk: vec3i
+    ijk: vec3i,
 ) -> PicoVDBStencil {
     var s: PicoVDBStencil;
-    s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk + vec3i(0, 0, 0), grid).index);
+    s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk, grid).index);
     s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk + vec3i(1, 0, 0), grid).index);
     s.v010 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk + vec3i(0, 1, 0), grid).index);
     s.v110 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk + vec3i(1, 1, 0), grid).index);
@@ -708,8 +723,10 @@ fn picovdbVoxelIntersect(
         if (disc >= 0.0) {
             let inv2A = 0.5 / qA;
             let sqrtDisc = sqrt(disc);
-            r0 = (-qB - sqrtDisc) * inv2A;
-            r1 = (-qB + sqrtDisc) * inv2A;
+            let ra = (-qB - sqrtDisc) * inv2A;
+            let rb = (-qB + sqrtDisc) * inv2A;
+            r0 = min(ra, rb);
+            r1 = max(ra, rb);
         }
     } else if (abs(qB) > 1e-8) {
         r0 = -qC / qB;
@@ -719,12 +736,12 @@ fn picovdbVoxelIntersect(
     // Up to 3 intervals: [0, r0], [r0, r1], [last_boundary, t_far]
     // Walk front-to-back, return at first sign change.
     var t_start = 0.0;
-    var g_start = c.x;  // Already computed, reuse
+    var g_start = c.x;
 
     // Interval 1: [0, r0]
     if (r0 > 0.0 && r0 < t_far) {
         let g_r0 = ((c.w * r0 + c.z) * r0 + c.y) * r0 + c.x;
-        if (g_start * g_r0 <= 0.0) {
+        if ((g_start <= 0.0) != (g_r0 <= 0.0)) {
             return picovdbSolveNewton(c, t_start, r0, g_start, g_r0, o, d, stencil);
         }
         t_start = r0;
@@ -734,7 +751,7 @@ fn picovdbVoxelIntersect(
     // Interval 2: [r0, r1]
     if (r1 > t_start && r1 < t_far) {
         let g_r1 = ((c.w * r1 + c.z) * r1 + c.y) * r1 + c.x;
-        if (g_start * g_r1 <= 0.0) {
+        if ((g_start <= 0.0) != (g_r1 <= 0.0)) {
             return picovdbSolveNewton(c, t_start, r1, g_start, g_r1, o, d, stencil);
         }
         t_start = r1;

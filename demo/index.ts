@@ -5,7 +5,15 @@ import PicoVDBShader from "./../picovdb.wgsl";
 import { loadPicoVDB } from './lib/loader';
 import { createOrbitCamera } from './lib/camera';
 import { createInputHandler } from "./lib/input";
-import { controls, pauseController, highDPIController, rotationController } from './lib/gui';
+import { initGUI } from './lib/gui';
+import type { ModelConfig } from './lib/gui';
+
+const models: ModelConfig[] = [
+  { name: 'Bunny', url: './bunny.pvdb.gz', translation: [-40, 240, 0], scale: 120 },
+  { name: 'Sphere', url: './sphere.pvdb.gz', translation: [0, 0, 0], scale: 60 },
+];
+
+const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models);
 import { createSkyState } from "./lib/hw_skymodel";
 import { TimestampQueryManager } from './lib/TimestampQueryManager';
 import { Stats } from './lib/Stats';
@@ -129,6 +137,15 @@ const vertexBufferLayout: GPUVertexBufferLayout = {
   }],
 };
 
+// GPU buffers for PicoVDB data (reassigned on model load)
+let gridsBuffer: GPUBuffer;
+let rootsBuffer: GPUBuffer;
+let uppersBuffer: GPUBuffer;
+let lowersBuffer: GPUBuffer;
+let leavesBuffer: GPUBuffer;
+let dataBuffer: GPUBuffer;
+let currentModelConfig: ModelConfig = models[0];
+
 // Create size-dependent GPU resources
 function createGPUResources() {
   if (raytracedTexture) { raytracedTexture.destroy(); }
@@ -162,18 +179,20 @@ function createGPUResources() {
   });
 
   // Bind group 1: data
-  dataBindGroup = device.createBindGroup({
-    label: 'Data bind group',
-    layout: dataBindGroupLayout,
-    entries: [
-      { binding: 0, resource: { buffer: gridsBuffer } },
-      { binding: 1, resource: { buffer: rootsBuffer } },
-      { binding: 2, resource: { buffer: uppersBuffer } },
-      { binding: 3, resource: { buffer: lowersBuffer } },
-      { binding: 4, resource: { buffer: leavesBuffer } },
-      { binding: 5, resource: { buffer: dataBuffer } },
-    ]
-  });
+  if (gridsBuffer) {
+    dataBindGroup = device.createBindGroup({
+      label: 'Data bind group',
+      layout: dataBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: gridsBuffer } },
+        { binding: 1, resource: { buffer: rootsBuffer } },
+        { binding: 2, resource: { buffer: uppersBuffer } },
+        { binding: 3, resource: { buffer: lowersBuffer } },
+        { binding: 4, resource: { buffer: leavesBuffer } },
+        { binding: 5, resource: { buffer: dataBuffer } },
+      ]
+    });
+  }
 
   // Bind group 2: pass
   passBindGroup = device.createBindGroup({
@@ -217,51 +236,97 @@ const displayPipeline = device.createRenderPipeline({
 
 const inputHandler = createInputHandler(window, canvas);
 
-// Load PicoVDB data
-infoTextElement.textContent = "Loading bunny.pvdb.gz...";
-const picoVDBFile = await loadPicoVDB('./bunny.pvdb.gz');
+// Load a PicoVDB model and create GPU buffers
+async function loadModel(config: ModelConfig) {
+  infoTextElement.textContent = `Loading ${config.name}...`;
 
-const gridsBuffer = device.createBuffer({
-  label: 'PicoVDB Grids',
-  size: picoVDBFile.gridsBuffer.byteLength,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-});
-device.queue.writeBuffer(gridsBuffer, 0, picoVDBFile.gridsBuffer);
+  const picoVDBFile = await loadPicoVDB(config.url);
 
-const rootsBuffer = device.createBuffer({
-  label: 'PicoVDB Roots',
-  size: picoVDBFile.rootsBuffer.byteLength,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-});
-device.queue.writeBuffer(rootsBuffer, 0, picoVDBFile.rootsBuffer);
+  // Destroy old GPU buffers
+  if (gridsBuffer) {
+    gridsBuffer.destroy();
+    rootsBuffer.destroy();
+    uppersBuffer.destroy();
+    lowersBuffer.destroy();
+    leavesBuffer.destroy();
+    dataBuffer.destroy();
+  }
 
-const uppersBuffer = device.createBuffer({
-  label: 'PicoVDB Uppers',
-  size: picoVDBFile.uppersBuffer.byteLength,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-});
-device.queue.writeBuffer(uppersBuffer, 0, picoVDBFile.uppersBuffer);
+  // Create new GPU buffers
+  gridsBuffer = device.createBuffer({
+    label: 'PicoVDB Grids',
+    size: picoVDBFile.gridsBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(gridsBuffer, 0, picoVDBFile.gridsBuffer);
 
-const lowersBuffer = device.createBuffer({
-  label: 'PicoVDB Lowers',
-  size: picoVDBFile.lowersBuffer.byteLength,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-});
-device.queue.writeBuffer(lowersBuffer, 0, picoVDBFile.lowersBuffer);
+  rootsBuffer = device.createBuffer({
+    label: 'PicoVDB Roots',
+    size: picoVDBFile.rootsBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(rootsBuffer, 0, picoVDBFile.rootsBuffer);
 
-const leavesBuffer = device.createBuffer({
-  label: 'PicoVDB Leaves',
-  size: picoVDBFile.leavesBuffer.byteLength,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-});
-device.queue.writeBuffer(leavesBuffer, 0, picoVDBFile.leavesBuffer);
+  uppersBuffer = device.createBuffer({
+    label: 'PicoVDB Uppers',
+    size: picoVDBFile.uppersBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(uppersBuffer, 0, picoVDBFile.uppersBuffer);
 
-const dataBuffer = device.createBuffer({
-  label: 'PicoVDB Data',
-  size: picoVDBFile.dataBuffer.byteLength,
-  usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-});
-device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
+  lowersBuffer = device.createBuffer({
+    label: 'PicoVDB Lowers',
+    size: picoVDBFile.lowersBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(lowersBuffer, 0, picoVDBFile.lowersBuffer);
+
+  leavesBuffer = device.createBuffer({
+    label: 'PicoVDB Leaves',
+    size: picoVDBFile.leavesBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(leavesBuffer, 0, picoVDBFile.leavesBuffer);
+
+  dataBuffer = device.createBuffer({
+    label: 'PicoVDB Data',
+    size: picoVDBFile.dataBuffer.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
+
+  currentModelConfig = config;
+
+  // Recreate data bind group with new buffers
+  dataBindGroup = device.createBindGroup({
+    label: 'Data bind group',
+    layout: dataBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: gridsBuffer } },
+      { binding: 1, resource: { buffer: rootsBuffer } },
+      { binding: 2, resource: { buffer: uppersBuffer } },
+      { binding: 3, resource: { buffer: lowersBuffer } },
+      { binding: 4, resource: { buffer: leavesBuffer } },
+      { binding: 5, resource: { buffer: dataBuffer } },
+    ]
+  });
+
+  // Update transform for new model
+  updateObjects();
+
+  // Update info display
+  const sizeMB = (picoVDBFile.getSize() / 1024 / 1024).toFixed(1);
+  const grid = picoVDBFile.getGrid(0);
+  const bboxSize = [
+    (grid.indexBoundsMax[0] - grid.indexBoundsMin[0]),
+    (grid.indexBoundsMax[1] - grid.indexBoundsMin[1]),
+    (grid.indexBoundsMax[2] - grid.indexBoundsMin[2])
+  ];
+  infoTextElement.textContent = `PicoVDB
+${config.name} ${sizeMB}MB
+Grid: ${bboxSize[0]} × ${bboxSize[1]} × ${bboxSize[2]} units
+Voxels: ${picoVDBFile.getVoxelCount()}`;
+}
 
 const fov = (2 * Math.PI) / 5; // 72 degrees
 const fovScaled = Math.tan(fov / 2);
@@ -319,11 +384,11 @@ for (let index = 0; index < OBJECT_COUNT; index++) {
     transform_inverse: new Float32Array(objectsData, offset + 80, 16),
   });
 }
-// Bunny
-const bunnyObjectView = objectViews[0];
-bunnyObjectView.object_type[0] = 1; // VDB
-bunnyObjectView.type_index[0] = 0; // first volume
-bunnyObjectView.material_index[0] = 0;
+// VDB object
+const vdbObjectView = objectViews[0];
+vdbObjectView.object_type[0] = 1; // VDB
+vdbObjectView.type_index[0] = 0; // first volume
+vdbObjectView.material_index[0] = 0;
 // Ground plane
 const groundObjectView = objectViews[1];
 groundObjectView.object_type[0] = 2; // SDF
@@ -383,14 +448,16 @@ updatePixelRadius();
 // Update VDB object transform (object 0)
 function updateObjects() {
   const transformMatrix = mat4.identity();
-  mat4.translation(vec3.create(-40, 240, 0), transformMatrix);
-  mat4.scale(transformMatrix, vec3.create(120, 120, 120), transformMatrix);
+  const [tx, ty, tz] = currentModelConfig.translation;
+  const s = currentModelConfig.scale;
+  mat4.translation(vec3.create(tx, ty, tz), transformMatrix);
+  mat4.scale(transformMatrix, vec3.create(s, s, s), transformMatrix);
 
-  const rotationRadians = (controls.bunnyRotation * Math.PI) / 180;
+  const rotationRadians = (controls.rotation * Math.PI) / 180;
   mat4.rotateY(transformMatrix, rotationRadians, transformMatrix);
 
-  bunnyObjectView.transform.set(transformMatrix);
-  bunnyObjectView.transform_inverse.set(mat4.inverse(transformMatrix));
+  vdbObjectView.transform.set(transformMatrix);
+  vdbObjectView.transform_inverse.set(mat4.inverse(transformMatrix));
 
   device.queue.writeBuffer(objectsBuffer, 0, objectsData);
   device.queue.writeBuffer(skyStateBuffer, 0, skyStateData);
@@ -404,18 +471,6 @@ rotationController.onChange(() => {
   updateObjects();
 });
 
-// Update info display
-const sizeMB = (picoVDBFile.getSize() / 1024 / 1024).toFixed(1);
-const grid = picoVDBFile.getGrid(0);
-const bboxSize = [
-  (grid.indexBoundsMax[0] - grid.indexBoundsMin[0]),
-  (grid.indexBoundsMax[1] - grid.indexBoundsMin[1]),
-  (grid.indexBoundsMax[2] - grid.indexBoundsMin[2])
-]
-infoTextElement.textContent = `PicoVDB
-bunny.pvdb ${sizeMB}MB
-Grid: ${bboxSize[0]} × ${bboxSize[1]} × ${bboxSize[2]} units
-Voxels: ${picoVDBFile.getVoxelCount()}`;
 function updateInput(deltaTime: number) {
   // Update time delta
   inputViews.time_delta[0] = deltaTime;
@@ -512,8 +567,17 @@ timestampQueryManager.addTimestampWrite(computePassDescriptor);
 // Initial creation of GPU resources (after all dependencies are defined)
 createGPUResources();
 
+// Load initial model
+await loadModel(models[0]);
+
+// Wire up model switching
+modelController.onChange(async (name: string) => {
+  const config = models.find(m => m.name === name)!;
+  await loadModel(config);
+});
+
 const colorAttachment: GPURenderPassColorAttachment = {
-  view: context.getCurrentTexture().createView(), // Assigned on render 
+  view: context.getCurrentTexture().createView(), // Assigned on render
   clearValue: { r: 0, g: 0, b: 0, a: 1 },
   loadOp: 'clear',
   storeOp: 'store',
@@ -566,7 +630,7 @@ function requestFrame() {
   stats.end();
 }
 
-// Pause/resume functionality. UserequestAnimationFrame for optimal frame timing.
+// Pause/resume functionality. Use requestAnimationFrame for optimal frame timing.
 let animationId: number | null = null;
 
 function renderLoop() {

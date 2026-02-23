@@ -20,6 +20,7 @@ pub const PicoVDBFile = picovdb.PicoVDBFile;
 pub const PicoVDBFileMutable = picovdb.PicoVDBFileMutable;
 pub const coordToKey = picovdb.coordToKey;
 pub const getGridFloat = picovdb.getGridFloat;
+pub const leafCoordToOffset = picovdb.leafCoordToOffset;
 
 // Grid type constants
 pub const GRID_TYPE_SDF_FLOAT = picovdb.GRID_TYPE_SDF_FLOAT;

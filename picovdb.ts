@@ -43,10 +43,16 @@ export interface PicoVDBRoot {
   key: [number, number]; // 64-bit coordinate key (8 bytes)
 }
 
+// Node element encoding (upper/lower levels):
+//   state=0,value=0 -> outside implicit    state=0,value=1 -> stored value
+//   state=1,value=0 -> inside implicit     state=1,value=1 -> child reference
+// Leaf-level encoding:
+//   state=0,value=0 -> outside implicit    state=0,value=1 -> narrow-band (non-surface)
+//   state=1,value=0 -> inside implicit     state=1,value=1 -> surface/cross-over voxel
 export interface PicoVDBNodeElement {
-  insideMask: number;
-  activeMask: number;
-  packedLocalIndex: number; // (localInside_u16 << 16) | localActive_u16
+  stateMask: number;
+  valueMask: number;
+  packedLocalIndex: number; // (localState_u16 << 16) | localValue_u16
 }
 
 export interface PicoVDBUpper {
@@ -197,8 +203,8 @@ export class PicoVDBFile {
     for (let i = 0; i < 1024; i++) {
       const maskOffset = offset + i * PICOVDB_NODE_MASK_SIZE;
       elements.push({
-        insideMask: this.view.getUint32(maskOffset + 0, true),
-        activeMask: this.view.getUint32(maskOffset + 4, true),
+        stateMask: this.view.getUint32(maskOffset + 0, true),
+        valueMask: this.view.getUint32(maskOffset + 4, true),
         packedLocalIndex: this.view.getUint32(maskOffset + 8, true),
       });
     }
@@ -227,8 +233,8 @@ export class PicoVDBFile {
     for (let i = 0; i < 128; i++) {
       const maskOffset = offset + i * PICOVDB_NODE_MASK_SIZE;
       elements.push({
-        insideMask: this.view.getUint32(maskOffset + 0, true),
-        activeMask: this.view.getUint32(maskOffset + 4, true),
+        stateMask: this.view.getUint32(maskOffset + 0, true),
+        valueMask: this.view.getUint32(maskOffset + 4, true),
         packedLocalIndex: this.view.getUint32(maskOffset + 8, true),
       });
     }
@@ -258,8 +264,8 @@ export class PicoVDBFile {
     for (let i = 0; i < 16; i++) {
       const maskOffset = offset + i * PICOVDB_NODE_MASK_SIZE;
       elements.push({
-        insideMask: this.view.getUint32(maskOffset + 0, true),
-        activeMask: this.view.getUint32(maskOffset + 4, true),
+        stateMask: this.view.getUint32(maskOffset + 0, true),
+        valueMask: this.view.getUint32(maskOffset + 4, true),
         packedLocalIndex: this.view.getUint32(maskOffset + 8, true),
       });
     }

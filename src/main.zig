@@ -208,12 +208,25 @@ fn convertRootTiles(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, tree_ha
         // If this tile has children (upper nodes), traverse them
         if (child_offset != 0) {
             const upper_handle = c.pnanovdb_root_get_child(grid_type, buf, root_handle, tile_handle);
-            try convertUpperNodesFromHandle(allocator, buf, grid_type, upper_handle, picovdb_file, picovdb_grid);
+            // Recover the 4096-aligned upper origin from the root tile key.
+            // coordToKey encodes: iu = x>>12, ju = y>>12, ku = z>>12
+            //   key[0] = ku | (ju << 21)
+            //   key[1] = (iu << 10) | (ju >> 11)
+            const pico_key = pico_root.key;
+            const ku = pico_key[0] & 0x1FFFFF;
+            const ju = (pico_key[0] >> 21) | ((pico_key[1] & 0x3FF) << 11);
+            const iu = pico_key[1] >> 10;
+            const upper_origin = [3]i32{
+                @bitCast(iu << 12),
+                @bitCast(ju << 12),
+                @bitCast(ku << 12),
+            };
+            try convertUpperNodesFromHandle(allocator, buf, grid_type, upper_handle, root_handle, picovdb_file, picovdb_grid, upper_origin);
         }
     }
 }
 
-fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, grid_type: u32, upper_handle: c.pnanovdb_upper_handle_t, picovdb_file: *picovdb.PicoVDBFileMutable, picovdb_grid: *picovdb.PicoVDBGrid) !void {
+fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, grid_type: u32, upper_handle: c.pnanovdb_upper_handle_t, root_handle: c.pnanovdb_root_handle_t, picovdb_file: *picovdb.PicoVDBFileMutable, picovdb_grid: *picovdb.PicoVDBGrid, upper_origin: [3]i32) !void {
     var element_array: [1024]picovdb.PicoVDBNodeElement = undefined;
 
     // Read value and child masks from NanoVDB
@@ -226,16 +239,16 @@ fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
     const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
 
     // Cumulative local counts within this node
-    var local_inside_count: u32 = 0; // (active & inside) = children
-    var local_active_count: u32 = 0; // (active & ~inside) = values
+    var local_state_count: u32 = 0; // (value & state) = children
+    var local_value_count: u32 = 0; // (value & ~state) = values
 
     for (0..1024) |i| {
         const nano_child_word = c.pnanovdb_read_uint32(buf, c.pnanovdb_address_offset(child_mask_addr, @intCast(i * 4)));
         const nano_value_word = c.pnanovdb_read_uint32(buf, c.pnanovdb_address_offset(value_mask_addr, @intCast(i * 4)));
 
-        // Build inside and active bitmasks
-        var inside_word: u32 = 0;
-        var active_word: u32 = 0;
+        // Build state and value bitmasks
+        var state_word: u32 = 0;
+        var value_word: u32 = 0;
 
         for (0..32) |bit_index| {
             const bit: u5 = @intCast(bit_index);
@@ -244,10 +257,10 @@ fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
             const has_nano_child = (nano_child_word >> bit) & 1 != 0;
 
             if (has_nano_child) {
-                inside_word |= (@as(u32, 1) << bit);
-                active_word |= (@as(u32, 1) << bit);
+                state_word |= (@as(u32, 1) << bit);
+                value_word |= (@as(u32, 1) << bit);
             } else if (has_nano_value) {
-                active_word |= (@as(u32, 1) << bit);
+                value_word |= (@as(u32, 1) << bit);
                 const value_address = c.pnanovdb_upper_get_table_address(grid_type, buf, upper_handle, n);
                 const value = c.pnanovdb_read_float(buf, value_address);
                 try picovdb_file.data_buffer.appendSlice(allocator, std.mem.asBytes(&value));
@@ -255,21 +268,21 @@ fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
                 const value_address = c.pnanovdb_upper_get_table_address(grid_type, buf, upper_handle, n);
                 const value = c.pnanovdb_read_float(buf, value_address);
                 if (value < 0.0) {
-                    inside_word |= (@as(u32, 1) << bit);
+                    state_word |= (@as(u32, 1) << bit);
                 }
             }
         }
 
         // Store mask with packed local index (counts from preceding words)
         element_array[i] = picovdb.PicoVDBNodeElement{
-            .inside_mask = inside_word,
-            .active_mask = active_word,
-            .packed_local_index = (local_inside_count << 16) | local_active_count,
+            .state_mask = state_word,
+            .value_mask = value_word,
+            .packed_local_index = (local_state_count << 16) | local_value_count,
         };
 
         // Update cumulative counts after storing (so they reflect preceding words only)
-        local_inside_count += @popCount(active_word & inside_word);
-        local_active_count += @popCount(active_word & ~inside_word);
+        local_state_count += @popCount(value_word & state_word);
+        local_value_count += @popCount(value_word & ~state_word);
 
         // Process children after building the mask
         for (0..32) |bit_index| {
@@ -277,7 +290,14 @@ fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
             if ((nano_child_word >> bit) & 1 != 0) {
                 const n = i * 32 + bit_index;
                 const lower_handle = c.pnanovdb_upper_get_child(grid_type, buf, upper_handle, @intCast(n));
-                try convertLowerNodesFromHandle(allocator, buf, grid_type, lower_handle, picovdb_file, picovdb_grid);
+                // Compute lower node origin from upper origin + child offset
+                // Upper coord layout: child_x = (n >> 10) & 31, child_y = (n >> 5) & 31, child_z = n & 31
+                const lower_origin = [3]i32{
+                    upper_origin[0] + @as(i32, @intCast((n >> 10) & 31)) * 128,
+                    upper_origin[1] + @as(i32, @intCast((n >> 5) & 31)) * 128,
+                    upper_origin[2] + @as(i32, @intCast(n & 31)) * 128,
+                };
+                try convertLowerNodesFromHandle(allocator, buf, grid_type, lower_handle, root_handle, picovdb_file, picovdb_grid, lower_origin);
             }
         }
     }
@@ -291,7 +311,7 @@ fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
     try picovdb_file.uppers.append(allocator, pico_upper);
 }
 
-fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, grid_type: u32, lower_handle: c.pnanovdb_lower_handle_t, picovdb_file: *picovdb.PicoVDBFileMutable, picovdb_grid: *picovdb.PicoVDBGrid) !void {
+fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, grid_type: u32, lower_handle: c.pnanovdb_lower_handle_t, root_handle: c.pnanovdb_root_handle_t, picovdb_file: *picovdb.PicoVDBFileMutable, picovdb_grid: *picovdb.PicoVDBGrid, lower_origin: [3]i32) !void {
     var element_array: [128]picovdb.PicoVDBNodeElement = undefined;
 
     const value_mask_addr = c.pnanovdb_address_offset(lower_handle.address, c.PNANOVDB_LOWER_OFF_VALUE_MASK);
@@ -302,15 +322,15 @@ fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
     const data_elem_size = 4;
     const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
 
-    var local_inside_count: u32 = 0;
-    var local_active_count: u32 = 0;
+    var local_state_count: u32 = 0;
+    var local_value_count: u32 = 0;
 
     for (0..128) |i| {
         const nano_child_word = c.pnanovdb_read_uint32(buf, c.pnanovdb_address_offset(child_mask_addr, @intCast(i * 4)));
         const nano_value_word = c.pnanovdb_read_uint32(buf, c.pnanovdb_address_offset(value_mask_addr, @intCast(i * 4)));
 
-        var inside_word: u32 = 0;
-        var active_word: u32 = 0;
+        var state_word: u32 = 0;
+        var value_word: u32 = 0;
 
         for (0..32) |bit_index| {
             const bit: u5 = @intCast(bit_index);
@@ -319,10 +339,10 @@ fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
             const has_nano_child = (nano_child_word >> bit) & 1 != 0;
 
             if (has_nano_child) {
-                inside_word |= (@as(u32, 1) << bit);
-                active_word |= (@as(u32, 1) << bit);
+                state_word |= (@as(u32, 1) << bit);
+                value_word |= (@as(u32, 1) << bit);
             } else if (has_nano_value) {
-                active_word |= (@as(u32, 1) << bit);
+                value_word |= (@as(u32, 1) << bit);
                 const value_address = c.pnanovdb_lower_get_table_address(grid_type, buf, lower_handle, n);
                 const value = c.pnanovdb_read_float(buf, value_address);
                 try picovdb_file.data_buffer.appendSlice(allocator, std.mem.asBytes(&value));
@@ -330,19 +350,19 @@ fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
                 const value_address = c.pnanovdb_lower_get_table_address(grid_type, buf, lower_handle, n);
                 const value = c.pnanovdb_read_float(buf, value_address);
                 if (value < 0.0) {
-                    inside_word |= (@as(u32, 1) << bit);
+                    state_word |= (@as(u32, 1) << bit);
                 }
             }
         }
 
         element_array[i] = picovdb.PicoVDBNodeElement{
-            .inside_mask = inside_word,
-            .active_mask = active_word,
-            .packed_local_index = (local_inside_count << 16) | local_active_count,
+            .state_mask = state_word,
+            .value_mask = value_word,
+            .packed_local_index = (local_state_count << 16) | local_value_count,
         };
 
-        local_inside_count += @popCount(active_word & inside_word);
-        local_active_count += @popCount(active_word & ~inside_word);
+        local_state_count += @popCount(value_word & state_word);
+        local_value_count += @popCount(value_word & ~state_word);
 
         // Process children after building the mask
         for (0..32) |bit_index| {
@@ -350,7 +370,14 @@ fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
             if ((nano_child_word >> bit) & 1 != 0) {
                 const n = i * 32 + bit_index;
                 const leaf_handle = c.pnanovdb_lower_get_child(grid_type, buf, lower_handle, @intCast(n));
-                try convertLeafNodesFromHandle(allocator, buf, grid_type, leaf_handle, picovdb_file, picovdb_grid);
+                // Compute leaf origin from lower origin + child offset
+                // Lower coord layout: child_x = (n >> 8) & 15, child_y = (n >> 4) & 15, child_z = n & 15
+                const leaf_origin = [3]i32{
+                    lower_origin[0] + @as(i32, @intCast((n >> 8) & 15)) * 8,
+                    lower_origin[1] + @as(i32, @intCast((n >> 4) & 15)) * 8,
+                    lower_origin[2] + @as(i32, @intCast(n & 15)) * 8,
+                };
+                try convertLeafNodesFromHandle(allocator, buf, grid_type, leaf_handle, root_handle, picovdb_file, picovdb_grid, leaf_origin);
             }
         }
     }
@@ -364,53 +391,142 @@ fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
     try picovdb_file.lowers.append(allocator, pico_lower);
 }
 
-fn convertLeafNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, grid_type: u32, leaf_handle: c.pnanovdb_leaf_handle_t, picovdb_file: *picovdb.PicoVDBFileMutable, picovdb_grid: *picovdb.PicoVDBGrid) !void {
+fn convertLeafNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_t, grid_type: u32, leaf_handle: c.pnanovdb_leaf_handle_t, root_handle: c.pnanovdb_root_handle_t, picovdb_file: *picovdb.PicoVDBFileMutable, picovdb_grid: *picovdb.PicoVDBGrid, leaf_origin: [3]i32) !void {
     var element_array: [16]picovdb.PicoVDBNodeElement = undefined;
 
     const value_mask_addr = c.pnanovdb_address_offset(leaf_handle.address, c.PNANOVDB_LEAF_OFF_VALUE_MASK);
 
-    // Base offset at the start of this leaf (grid-relative)
-    const data_elem_size = 4;
-    const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
-
-    var local_active_count: u32 = 0;
+    // Phase 1: Read all 512 values and build value/state masks
+    var values: [512]f32 = undefined;
+    var value_bits: [16]u32 = undefined;
+    var state_bits: [16]u32 = undefined;
 
     for (0..16) |i| {
         const nano_value_word = c.pnanovdb_read_uint32(buf, c.pnanovdb_address_offset(value_mask_addr, @intCast(i * 4)));
 
-        var inside_word: u32 = 0;
-        var active_word: u32 = 0;
+        var value_word: u32 = 0;
+        var state_word: u32 = 0;
 
         for (0..32) |bit_index| {
             const bit: u5 = @intCast(bit_index);
             const n: u32 = @intCast(i * 32 + bit_index);
             const has_nano_value = (nano_value_word >> bit) & 1 != 0;
 
+            const value_addr = c.pnanovdb_leaf_get_table_address(grid_type, buf, leaf_handle, n);
+            const value = c.pnanovdb_read_float(buf, value_addr);
+            values[n] = value;
+
             if (has_nano_value) {
-                active_word |= (@as(u32, 1) << bit);
-                const value_addr = c.pnanovdb_leaf_get_table_address(grid_type, buf, leaf_handle, n);
-                const value = c.pnanovdb_read_float(buf, value_addr);
-                try picovdb_file.data_buffer.appendSlice(allocator, std.mem.asBytes(&value));
+                value_word |= (@as(u32, 1) << bit);
             } else {
-                const value_addr = c.pnanovdb_leaf_get_table_address(grid_type, buf, leaf_handle, n);
-                const value = c.pnanovdb_read_float(buf, value_addr);
                 if (value < 0.0) {
-                    inside_word |= (@as(u32, 1) << bit);
+                    state_word |= (@as(u32, 1) << bit);
                 }
             }
         }
 
+        value_bits[i] = value_word;
+        state_bits[i] = state_word; // Initially only marks inactive negative voxels
+    }
+
+    // Phase 2: Cross-over detection — mark surface voxels (value=1, state=1)
+    // For each value voxel, check the 7 positive-direction stencil corners for sign change.
+    var nano_accessor = std.mem.zeroes(c.pnanovdb_readaccessor_t);
+    c.pnanovdb_readaccessor_init(&nano_accessor, root_handle);
+
+    const neighbor_offsets = [7][3]i32{
+        .{ 1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, 0, 1 },
+        .{ 1, 1, 0 }, .{ 1, 0, 1 }, .{ 0, 1, 1 },
+        .{ 1, 1, 1 },
+    };
+
+    for (0..16) |i| {
+        var surface_word: u32 = 0;
+        const value_word = value_bits[i];
+
+        for (0..32) |bit_index| {
+            const bit: u5 = @intCast(bit_index);
+            if ((value_word >> bit) & 1 == 0) continue;
+
+            const n: u32 = @intCast(i * 32 + bit_index);
+            const value = values[n];
+
+            // Decode linear offset n back to local (x, y, z) within 8x8x8 leaf
+            // n = x*64 + y*8 + z
+            const lx: i32 = @intCast(n >> 6);
+            const ly: i32 = @intCast((n >> 3) & 7);
+            const lz: i32 = @intCast(n & 7);
+
+            var is_surface = false;
+            for (neighbor_offsets) |off| {
+                const nx = lx + off[0];
+                const ny = ly + off[1];
+                const nz = lz + off[2];
+
+                var neighbor_value: f32 = undefined;
+                if (nx >= 0 and nx < 8 and ny >= 0 and ny < 8 and nz >= 0 and nz < 8) {
+                    // Neighbor is within this leaf — read directly from values array
+                    const nn: u32 = @intCast(@as(u32, @intCast(nx)) * 64 + @as(u32, @intCast(ny)) * 8 + @as(u32, @intCast(nz)));
+                    neighbor_value = values[nn];
+                } else {
+                    // Cross-leaf lookup via NanoVDB accessor using origin from tree traversal
+                    const global_coord = c.pnanovdb_coord_t{
+                        .x = leaf_origin[0] + nx,
+                        .y = leaf_origin[1] + ny,
+                        .z = leaf_origin[2] + nz,
+                    };
+                    const neighbor_addr = c.pnanovdb_readaccessor_get_value_address(grid_type, buf, &nano_accessor, &global_coord);
+                    neighbor_value = c.pnanovdb_read_float(buf, neighbor_addr);
+                }
+
+                const sign_strict = (value < 0.0) != (neighbor_value < 0.0);
+                const sign_nonstrict = (value <= 0.0) != (neighbor_value <= 0.0);
+                if (sign_strict or sign_nonstrict) {
+                    is_surface = true;
+                    break;
+                }
+            }
+
+            if (is_surface) {
+                surface_word |= (@as(u32, 1) << bit);
+            }
+        }
+
+        // For value voxels: state_bits marks surface voxels (value & state = surface)
+        // For non-value voxels: state_bits already marks negative (inside implicit)
+        state_bits[i] = (state_bits[i] & ~value_bits[i]) | (surface_word & value_bits[i]);
+    }
+
+    // Phase 3: Build elements and write values
+    const data_elem_size = 4;
+    const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
+
+    var local_value_count: u32 = 0;
+    var local_state_count: u32 = 0;
+
+    for (0..16) |i| {
         element_array[i] = picovdb.PicoVDBNodeElement{
-            .inside_mask = inside_word,
-            .active_mask = active_word,
-            .packed_local_index = local_active_count, // low 16 bits = active value count before this word
+            .state_mask = state_bits[i],
+            .value_mask = value_bits[i],
+            .packed_local_index = (local_state_count << 16) | local_value_count,
         };
 
-        local_active_count += @popCount(active_word & ~inside_word);
+        local_value_count += @popCount(value_bits[i]);
+        local_state_count += @popCount(value_bits[i] & state_bits[i]);
+
+        // Write SDF values for ALL value voxels (both surface and non-surface)
+        for (0..32) |bit_index| {
+            const bit: u5 = @intCast(bit_index);
+            if ((value_bits[i] >> bit) & 1 != 0) {
+                const n: u32 = @intCast(i * 32 + bit_index);
+                const value = values[n];
+                try picovdb_file.data_buffer.appendSlice(allocator, std.mem.asBytes(&value));
+            }
+        }
     }
 
     const pico_leaf = picovdb.PicoVDBLeaf{
-        .base_inside_index = 0,
+        .base_inside_index = 0, // Will be set in post-pass by fixupLeafSurfaceIndices
         .base_active_index = base_value_offset,
         .elements = element_array,
     };
@@ -491,6 +607,22 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
     };
 
     try convertRootTiles(allocator, pnanovdb_buf, tree_handle, picovdb_file, &picovdb_grid);
+
+    // Post-pass: fixup leaf base_inside_index for surface texture indexing
+    {
+        var surface_count: u64 = 0;
+        const leaf_start = picovdb_grid.leaf_start;
+        const leaf_end = picovdb_file.leaves.items.len;
+        for (leaf_start..leaf_end) |i| {
+            picovdb_file.leaves.items[i].base_inside_index = surface_count;
+            // Count surface voxels (value & state) in this leaf
+            for (0..16) |j| {
+                const elem = picovdb_file.leaves.items[i].elements[j];
+                surface_count += @popCount(elem.value_mask & elem.state_mask);
+            }
+        }
+        std.debug.print("  Surface voxels: {}\n", .{surface_count});
+    }
 
     // Calculate data_elem_count (number of f32 values for this grid)
     const data_end_bytes = picovdb_file.data_buffer.items.len;
