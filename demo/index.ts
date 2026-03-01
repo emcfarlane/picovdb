@@ -16,7 +16,7 @@ const models: ModelConfig[] = [
   { name: 'Bunny', url: `${MODEL_BASE}bunny.pvdb.gz`, translation: [-40, 240, 0], scale: 120 },
   { name: 'Bunny u8', url: `${MODEL_BASE}bunny.u8.pvdb.gz`, translation: [-40, 240, 0], scale: 120 },
   { name: 'Dragon u8', url: `${MODEL_BASE}dragon.u8.pvdb.gz`, translation: [0, 80, 0], scale: 240 },
-  //{ name: 'Smoke', url: `${MODEL_BASE}smoke.pvdb.gz`, translation: [0, 0, 0], scale: 30 },
+  //{ name: 'Smoke', url: `${MODEL_BASE}smoke.pvdb.gz`, translation: [0, 0, 0], scale: 60 },
   { name: 'Sphere', url: `${MODEL_BASE}sphere.pvdb.gz`, translation: [0, 0, 0], scale: 30 },
 ];
 

@@ -1,6 +1,6 @@
 {
   "name": "picovdb",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "type": "module",
   "exports": {
     ".": "./picovdb.ts",
@@ -8,10 +8,10 @@
   },
   "scripts": {
     "build": "esbuild picovdb.ts --bundle --outfile=dist/picovdb.js --format=esm --loader:.wgsl=text",
-    "build:demo": "esbuild demo/index.ts --bundle --outfile=dist/index.js --format=esm --loader:.wgsl=text && cp demo/index.html dist/index.html",
-    "watch:demo": "esbuild demo/index.ts --bundle --outfile=dist/index.js --format=esm --loader:.wgsl=text --watch=forever",
-    "serve": "http-server dist -p 8000 -o -c-1",
-    "dev": "mkdir -p dist/models && cp demo/index.html dist/ && cp data/*.pvdb.gz dist/models/ && (npm run watch:demo & npm run serve)",
+    "build:demo": "esbuild demo/index.ts --bundle --outfile=demo/index.js --format=esm --loader:.wgsl=text",
+    "watch:demo": "esbuild demo/index.ts --bundle --outfile=demo/index.js --format=esm --loader:.wgsl=text --watch=forever",
+    "serve": "http-server demo -p 8000 -o -c-1",
+    "dev": "mkdir -p demo/models && cp data/*.pvdb.gz demo/models/ && (npm run watch:demo & npm run serve)",
     "check": "tsc"
   },
   "devDependencies": {

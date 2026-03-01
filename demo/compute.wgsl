@@ -128,7 +128,11 @@ fn intersect_scene(world_ray: Ray, iterations: ptr<function, u32>) -> Intersecti
         var hit_iterations = 0u;
         switch obj.object_type {
             case OBJECT_TYPE_VDB: {
-                hit = intersect_picovdb(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);
+                // Skip fog grids during surface intersection — they use volumetric marching instead
+                let vdb_grid = picovdb_grids[obj.type_index];
+                if (vdb_grid.gridType != GRID_TYPE_FOG_FLOAT) {
+                    hit = intersect_picovdb(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);
+                }
             }
             case OBJECT_TYPE_SDF: {
                 hit = intersect_sdf(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);
@@ -314,6 +318,25 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     let hit = intersect_scene(ray, &iterations);
 
     var color = computeColor(ray, hit);
+
+    //// Fog volume compositing (HDR, before tone mapping)
+    //for (var i = 0i; i < i32(arrayLength(&objects)); i++) {
+    //    let obj = objects[i];
+    //    if (obj.object_type != OBJECT_TYPE_VDB) { continue; }
+    //    let fog_grid = picovdb_grids[obj.type_index];
+    //    if (fog_grid.gridType != GRID_TYPE_FOG_FLOAT) { continue; }
+
+    //    let idx_origin     = (obj.transform * vec4f(ray.origin, 1.0)).xyz;
+    //    let idx_dir_unnorm = (obj.transform * vec4f(ray.direction, 0.0)).xyz;
+    //    let idx_direction  = normalize(idx_dir_unnorm);
+
+    //    var fog_acc: PicoVDBReadAccessor;
+    //    picovdbReadAccessorInit(&fog_acc, u32(obj.type_index));
+
+    //    let fog = picovdbFogMarch(&fog_acc, fog_grid, idx_origin, idx_direction, 0.0, 1e6);
+    //    color = fog.color + fog.transmittance * color;
+    //}
+
     color = toneMapping(color);
     color = pow(color, vec3f(1.0 / 2.2));  // Gamma correction
 

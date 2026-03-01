@@ -1,0 +1,10 @@
+node_modules/
+dist/
+demo/node_modules/
+demo/index.js
+demo/models/
+*.pvdb
+*.pvdb.gz
+*.nvdb
+*.nvdb.gz
+*.vdb
