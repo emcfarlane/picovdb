@@ -2,19 +2,28 @@ import { vec3, mat4 } from 'wgpu-matrix';
 import DisplayShader from "./blit.wgsl";
 import ComputeShader from "./compute.wgsl";
 import PicoVDBShader from "./../picovdb.wgsl";
-import { loadPicoVDB } from './lib/loader';
+import { fetchPicoVDB } from '../picovdb.ts';
 import { createOrbitCamera } from './lib/camera';
 import { createInputHandler } from "./lib/input";
 import { initGUI } from './lib/gui';
 import type { ModelConfig } from './lib/gui';
 
+const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+const MODEL_BASE = isLocal
+  ? './models/'
+  : 'https://github.com/emcfarlane/picovdb/releases/latest/download/';
 const models: ModelConfig[] = [
-  { name: 'Bunny', url: './bunny.pvdb.gz', translation: [-40, 240, 0], scale: 120 },
-  { name: 'Bunny u8', url: './bunny.u8.pvdb.gz', translation: [-40, 240, 0], scale: 120 },
-  { name: 'Sphere', url: './sphere.pvdb.gz', translation: [0, 0, 0], scale: 30 },
+  { name: 'Bunny', url: `${MODEL_BASE}bunny.pvdb.gz`, translation: [-40, 240, 0], scale: 120 },
+  { name: 'Bunny u8', url: `${MODEL_BASE}bunny.u8.pvdb.gz`, translation: [-40, 240, 0], scale: 120 },
+  { name: 'Dragon u8', url: `${MODEL_BASE}dragon.u8.pvdb.gz`, translation: [0, 80, 0], scale: 240 },
+  //{ name: 'Smoke', url: `${MODEL_BASE}smoke.pvdb.gz`, translation: [0, 0, 0], scale: 30 },
+  { name: 'Sphere', url: `${MODEL_BASE}sphere.pvdb.gz`, translation: [0, 0, 0], scale: 30 },
 ];
 
-const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models);
+const modelParam = new URLSearchParams(window.location.search).get('model');
+const initialModel = models.find(m => m.url.endsWith('/' + modelParam)) ?? models[0];
+
+const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models, initialModel.name);
 import { createSkyState } from "./lib/hw_skymodel";
 import { TimestampQueryManager } from './lib/TimestampQueryManager';
 import { Stats } from './lib/Stats';
@@ -241,7 +250,20 @@ const inputHandler = createInputHandler(window, canvas);
 async function loadModel(config: ModelConfig) {
   infoTextElement.textContent = `Loading ${config.name}...`;
 
-  const picoVDBFile = await loadPicoVDB(config.url);
+  const picoVDBFile = await fetchPicoVDB(config.url);
+  console.log('PicoVDB File loaded successfully:');
+  console.log('PicoVDB File Header:');
+  console.log(`  Magic: [0x${picoVDBFile.header.magic[0].toString(16)}, 0x${picoVDBFile.header.magic[1].toString(16)}]`);
+  console.log(`  Version: ${picoVDBFile.header.version}`);
+  console.log(`  Grid Count: ${picoVDBFile.header.gridCount}`);
+  console.log(`  Upper Count: ${picoVDBFile.header.upperCount}`);
+  console.log(`  Lower Count: ${picoVDBFile.header.lowerCount}`);
+  console.log(`  Leaf Count: ${picoVDBFile.header.leafCount}`);
+  console.log(`  Data Count: ${picoVDBFile.header.dataCount} bytes`);
+  console.log(`  Voxel Count: ${picoVDBFile.getVoxelCount()}`);
+  if (picoVDBFile.header.gridCount === 0) {
+    throw new Error('PicoVDB file contains no grids');
+  }
 
   // Destroy old GPU buffers
   if (gridsBuffer) {
@@ -568,12 +590,16 @@ timestampQueryManager.addTimestampWrite(computePassDescriptor);
 // Initial creation of GPU resources (after all dependencies are defined)
 createGPUResources();
 
-// Load initial model
-await loadModel(models[0]);
+// Load initial model (from URL param or first in list)
+await loadModel(initialModel);
 
-// Wire up model switching
+// Wire up model switching — update URL and load
 modelController.onChange(async (name: string) => {
   const config = models.find(m => m.name === name)!;
+  const filename = config.url.split('/').pop()!;
+  const url = new URL(window.location.href);
+  url.searchParams.set('model', filename);
+  history.replaceState(null, '', url);
   await loadModel(config);
 });
 

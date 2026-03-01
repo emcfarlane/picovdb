@@ -1,0 +1,28 @@
+{
+  "name": "picovdb",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./picovdb.ts",
+    "./picovdb.wgsl": "./picovdb.wgsl"
+  },
+  "scripts": {
+    "build": "esbuild picovdb.ts --bundle --outfile=dist/picovdb.js --format=esm --loader:.wgsl=text",
+    "build:demo": "esbuild demo/index.ts --bundle --outfile=dist/index.js --format=esm --loader:.wgsl=text && cp demo/index.html dist/index.html",
+    "watch:demo": "esbuild demo/index.ts --bundle --outfile=dist/index.js --format=esm --loader:.wgsl=text --watch=forever",
+    "serve": "http-server dist -p 8000 -o -c-1",
+    "dev": "mkdir -p dist/models && cp demo/index.html dist/ && cp data/*.pvdb.gz dist/models/ && (npm run watch:demo & npm run serve)",
+    "check": "tsc"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.49",
+    "esbuild": "0.27.0",
+    "http-server": "^14.1.1",
+    "prettier": "^3.3.3",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "lil-gui": "^0.21.0",
+    "wgpu-matrix": "^3.4.0"
+  }
+}

@@ -64,7 +64,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
 zig build
 
 # Convert NanoVDB to PicoVDB
-./zig-out/bin/picovdb input.nvdb output.picovdb
+./zig-out/bin/picovdb input.nvdb output.pvdb
 ```
 
 ## Related Projects

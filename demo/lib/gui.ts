@@ -26,7 +26,7 @@ export interface GUIControllers {
 	debugController: ReturnType<GUI['add']>;
 }
 
-export function initGUI(models: ModelConfig[]): GUIControllers {
+export function initGUI(models: ModelConfig[], initialModelName?: string): GUIControllers {
 	const gui = new GUI();
 
 	const controls: Controls = {
@@ -35,7 +35,7 @@ export function initGUI(models: ModelConfig[]): GUIControllers {
 		rotation: 0.0,
 		resetCamera: () => { },
 		debugIterations: false,
-		model: models[0].name,
+		model: initialModelName ?? models[0].name,
 	};
 
 	const modelController = gui.add(controls, 'model', models.map(m => m.name)).name('Model');

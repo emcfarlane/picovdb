@@ -12,9 +12,9 @@ export const PICOVDB_GRID_SIZE = 64;
 export const PICOVDB_ROOT_SIZE = 8;
 export const PICOVDB_NODE_MASK_SIZE = 12;
 export const PICOVDB_LEAF_MASK_SIZE = 8;
-export const PICOVDB_UPPER_SIZE = 12304; //16384;
-export const PICOVDB_LOWER_SIZE = 1552; //2048;
-export const PICOVDB_LEAF_SIZE = 208; //192;
+export const PICOVDB_UPPER_SIZE = 12304;
+export const PICOVDB_LOWER_SIZE = 1552;
+export const PICOVDB_LEAF_SIZE = 208;
 export const PICOVDB_DATA_SIZE = 16;
 
 export interface PicoVDBFileHeader {
@@ -114,28 +114,22 @@ export class PicoVDBFile {
     // Create buffer slices for WebGPU
     this.gridsBuffer = new Uint8Array(buffer, offset, this.header.gridCount * PICOVDB_GRID_SIZE);
     offset += this.header.gridCount * PICOVDB_GRID_SIZE;
-    console.log("GRIDS BUFFER", this.gridsBuffer.length)
 
     const rootCount = this.getRootCountPadded()
     this.rootsBuffer = new Uint8Array(buffer, offset, rootCount * PICOVDB_ROOT_SIZE);
     offset += rootCount * PICOVDB_ROOT_SIZE;
-    console.log("ROOTS BUFFER", this.rootsBuffer.length)
 
     this.uppersBuffer = new Uint8Array(buffer, offset, this.header.upperCount * PICOVDB_UPPER_SIZE);
     offset += this.header.upperCount * PICOVDB_UPPER_SIZE;
-    console.log("UPPERS BUFFER", this.uppersBuffer.length)
 
     this.lowersBuffer = new Uint8Array(buffer, offset, this.header.lowerCount * PICOVDB_LOWER_SIZE);
     offset += this.header.lowerCount * PICOVDB_LOWER_SIZE;
-    console.log("LOWERS BUFFER", this.lowersBuffer.length)
 
     this.leavesBuffer = new Uint8Array(buffer, offset, this.header.leafCount * PICOVDB_LEAF_SIZE);
     offset += this.header.leafCount * PICOVDB_LEAF_SIZE;
-    console.log("LEAVES BUFFER", this.leavesBuffer.length)
 
     this.dataBuffer = new Uint8Array(buffer, offset, this.header.dataCount * PICOVDB_DATA_SIZE);
     offset += this.header.dataCount * PICOVDB_DATA_SIZE;
-    console.log("DATA BUFFER", this.dataBuffer.length)
   }
 
   getSize(): number {
@@ -286,4 +280,56 @@ export class PicoVDBFile {
   //  const dataPtr = new Float32Array(this.dataBuffer.buffer, this.dataBuffer.byteOffset);
   //  return dataPtr[grid.dataIndex / 4 + index]; // dataIndex is in bytes, convert to float index
   //}
+}
+
+export async function fetchPicoVDB(
+  url: string,
+  options: RequestInit = {}
+): Promise<PicoVDBFile> {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Accept': 'application/octet-stream',
+      ...options.headers,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to load PicoVDB: ${response.status} ${response.statusText}`);
+  }
+
+  // We check the Content-Type, Content-Encoding, and the URL extension as a fallback
+  const contentType = response.headers.get('Content-Type') ?? '';
+  const contentEncoding = response.headers.get('Content-Encoding') ?? '';
+  const isGzipped =
+    url.endsWith('.gz') ||
+    contentType.includes('gzip') ||
+    contentEncoding.includes('gzip');
+
+  let buffer: ArrayBuffer;
+
+  // If the browser already handled decompression (via Content-Encoding),
+  // we don't need to do it manually.
+  if (isGzipped && contentEncoding !== 'gzip') {
+    if (typeof DecompressionStream === 'undefined') {
+      throw new Error('Gzip decompression requires DecompressionStream API support.');
+    }
+
+    const decompressionStream = new DecompressionStream('gzip');
+    const stream = response.body!.pipeThrough(decompressionStream);
+    buffer = await new Response(stream).arrayBuffer();
+  } else {
+    buffer = await response.arrayBuffer();
+  }
+
+  // Ensure 4-byte alignment.
+  const remainder = buffer.byteLength % 4;
+  const alignedBuffer = remainder === 0
+    ? buffer
+    : new ArrayBuffer(buffer.byteLength + (4 - remainder));
+
+  if (remainder !== 0) {
+    new Uint8Array(alignedBuffer).set(new Uint8Array(buffer));
+  }
+  return new PicoVDBFile(alignedBuffer);
 }
