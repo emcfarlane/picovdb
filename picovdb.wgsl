@@ -33,6 +33,7 @@ struct PicoVDBGrid {
 
 const GRID_TYPE_SDF_FLOAT = 1;
 const GRID_TYPE_SDF_UINT8 = 2;
+const GRID_TYPE_FOG_FLOAT = 3;
 
 // https://webgpufundamentals.org/webgpu/lessons/resources/wgsl-offset-computer.html
 

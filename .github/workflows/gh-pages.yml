@@ -3,12 +3,20 @@ name: Deploy Demo to GitHub Pages
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -17,10 +25,32 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - run: npm run build:demo
-      - uses: peaceiris/actions-gh-pages@v4
+      - name: Stage site
+        run: |
+          mkdir -p _stage/demo
+          cp README.md bunny.png _stage/
+          cp demo/index.html demo/index.js _stage/demo/
+      - name: Download models
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p _stage/demo/models
+          gh release download 0.0.1 --pattern '*.pvdb.gz' --dir _stage/demo/models
+      - uses: actions/configure-pages@v5
+      - uses: actions/jekyll-build-pages@v1
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./demo
-          destination_dir: demo
-          keep_files: true
-          enable_jekyll: true
+          source: ./_stage
+          destination: ./_site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./_site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

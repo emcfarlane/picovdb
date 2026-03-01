@@ -8,10 +8,7 @@ import { createInputHandler } from "./lib/input";
 import { initGUI } from './lib/gui';
 import type { ModelConfig } from './lib/gui';
 
-const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-const MODEL_BASE = isLocal
-  ? './models/'
-  : 'https://github.com/emcfarlane/picovdb/releases/latest/download/';
+const MODEL_BASE = './models/';
 const models: ModelConfig[] = [
   { name: 'Bunny', url: `${MODEL_BASE}bunny.pvdb.gz`, translation: [-40, 240, 0], scale: 120 },
   { name: 'Bunny u8', url: `${MODEL_BASE}bunny.u8.pvdb.gz`, translation: [-40, 240, 0], scale: 120 },
