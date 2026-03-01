@@ -27,6 +27,7 @@ pub const PicoVDBFileHeader = extern struct {
 // Grid constants
 pub const GRID_TYPE_SDF_FLOAT = 1;
 pub const GRID_TYPE_SDF_UINT8 = 2;
+pub const GRID_TYPE_FOG_FLOAT = 3;
 
 // Grid header (64 bytes)
 pub const PicoVDBGrid = extern struct {

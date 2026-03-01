@@ -6,6 +6,7 @@ export const PICOVDB_MAGIC = [0x6f636950, 0x30424456];
 // Grid type constants
 export const GRID_TYPE_SDF_FLOAT = 1;
 export const GRID_TYPE_SDF_UINT8 = 2;
+export const GRID_TYPE_FOG_FLOAT = 3;
 
 export const PICOVDB_FILE_HEADER_SIZE = 32;
 export const PICOVDB_GRID_SIZE = 64;

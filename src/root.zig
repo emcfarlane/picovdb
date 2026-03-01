@@ -27,4 +27,5 @@ pub const leafCoordToOffset = picovdb.leafCoordToOffset;
 // Grid type constants
 pub const GRID_TYPE_SDF_FLOAT = picovdb.GRID_TYPE_SDF_FLOAT;
 pub const GRID_TYPE_SDF_UINT8 = picovdb.GRID_TYPE_SDF_UINT8;
+pub const GRID_TYPE_FOG_FLOAT = picovdb.GRID_TYPE_FOG_FLOAT;
 pub const LEVEL_SET_HALF_WIDTH = picovdb.LEVEL_SET_HALF_WIDTH;
