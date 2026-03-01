@@ -332,6 +332,8 @@ pub const PicoVDBReadAccessor = extern struct {
     }
 };
 
+pub const LEVEL_SET_HALF_WIDTH: f32 = 3.0;
+
 pub fn getGridFloat(
     picovdb_file: *const PicoVDBFile,
     grid: *const PicoVDBGrid,
@@ -340,6 +342,28 @@ pub fn getGridFloat(
     const data_ptr: [*]const f32 = @ptrCast(@alignCast(picovdb_file.data_buffer.ptr));
     // data_start is in 16-byte units, multiply by 4 to get f32 index (16 bytes = 4 f32s)
     return data_ptr[grid.data_start * 4 + index];
+}
+
+pub fn getGridUint8(
+    picovdb_file: *const PicoVDBFile,
+    grid: *const PicoVDBGrid,
+    index: u32,
+) f32 {
+    const byte_offset = grid.data_start * 16 + index;
+    const raw = picovdb_file.data_buffer[byte_offset];
+    return (@as(f32, @floatFromInt(raw)) / 127.5 - 1.0) * LEVEL_SET_HALF_WIDTH;
+}
+
+pub fn getGridValue(
+    picovdb_file: *const PicoVDBFile,
+    grid: *const PicoVDBGrid,
+    index: u32,
+) f32 {
+    return switch (grid.grid_type) {
+        GRID_TYPE_SDF_FLOAT => getGridFloat(picovdb_file, grid, index),
+        GRID_TYPE_SDF_UINT8 => getGridUint8(picovdb_file, grid, index),
+        else => 0.0,
+    };
 }
 
 // Mutable container for building PicoVDB data
@@ -541,6 +565,22 @@ pub const PicoVDBFile = struct {
         const data_ptr: [*]const f32 = @ptrCast(@alignCast(self.data_buffer.ptr));
         // data_start is in 16-byte units, multiply by 4 to get f32 index (16 bytes = 4 f32s)
         return data_ptr[grid.data_start * 4 + index];
+    }
+
+    // Get u8 quantized value from data buffer (dequantizes to f32)
+    pub fn getGridUint8(self: *const PicoVDBFile, grid: *const PicoVDBGrid, index: u32) f32 {
+        const byte_offset = grid.data_start * 16 + index;
+        const raw = self.data_buffer[byte_offset];
+        return (@as(f32, @floatFromInt(raw)) / 127.5 - 1.0) * LEVEL_SET_HALF_WIDTH;
+    }
+
+    // Get value from data buffer, dispatching on grid_type
+    pub fn getGridValue(self: *const PicoVDBFile, grid: *const PicoVDBGrid, index: u32) f32 {
+        return switch (grid.grid_type) {
+            GRID_TYPE_SDF_FLOAT => self.getGridFloat(grid, index),
+            GRID_TYPE_SDF_UINT8 => self.getGridUint8(grid, index),
+            else => 0.0,
+        };
     }
 
     // Access grid by index

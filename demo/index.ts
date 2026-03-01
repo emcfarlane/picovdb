@@ -10,7 +10,8 @@ import type { ModelConfig } from './lib/gui';
 
 const models: ModelConfig[] = [
   { name: 'Bunny', url: './bunny.pvdb.gz', translation: [-40, 240, 0], scale: 120 },
-  { name: 'Sphere', url: './sphere.pvdb.gz', translation: [0, 0, 0], scale: 60 },
+  { name: 'Bunny u8', url: './bunny.u8.pvdb.gz', translation: [-40, 240, 0], scale: 120 },
+  { name: 'Sphere', url: './sphere.pvdb.gz', translation: [0, 0, 0], scale: 30 },
 ];
 
 const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models);

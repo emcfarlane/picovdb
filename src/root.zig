@@ -20,8 +20,11 @@ pub const PicoVDBFile = picovdb.PicoVDBFile;
 pub const PicoVDBFileMutable = picovdb.PicoVDBFileMutable;
 pub const coordToKey = picovdb.coordToKey;
 pub const getGridFloat = picovdb.getGridFloat;
+pub const getGridUint8 = picovdb.getGridUint8;
+pub const getGridValue = picovdb.getGridValue;
 pub const leafCoordToOffset = picovdb.leafCoordToOffset;
 
 // Grid type constants
 pub const GRID_TYPE_SDF_FLOAT = picovdb.GRID_TYPE_SDF_FLOAT;
 pub const GRID_TYPE_SDF_UINT8 = picovdb.GRID_TYPE_SDF_UINT8;
+pub const LEVEL_SET_HALF_WIDTH = picovdb.LEVEL_SET_HALF_WIDTH;

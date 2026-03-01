@@ -423,10 +423,21 @@ fn picovdbHDDARayClip(
 // Level 3 (Root) -> 4096 (2^12)
 const picovdbDimForLevel = array(1, 8, 128, 4096);
 
-// Get float value from data buffer using grid offset and value index
+// Get value from data buffer using grid offset and value index.
+// Dispatches on gridType for f32 or u8 dequantization.
 fn picovdbGetValue(grid: PicoVDBGrid, count: u32) -> f32 {
-    // dataStart is in 16-byte units, multiply by 4 to get u32 index (16 bytes = 4 u32s)
-    let u32Index = grid.dataStart * 4u + count;
+    if (grid.gridType == GRID_TYPE_SDF_UINT8) {
+        // The grid.dataStart is in 16-byte units. Multiple by 8 (shift by 4) to get byte offset.
+        let byteOffset = (grid.dataStart << 4u) + count;
+        let u32Index = byteOffset >> 2u;
+        let byteIndex = byteOffset & 3u;
+        let packed = picovdb_buffer[u32Index];
+        let value = unpack4x8unorm(packed)[byteIndex];
+        // Map [0,1] to [-3,3].
+        return fma(value, 6.0, -3.0);
+    }
+    // The grid.dataStart is in 16-byte units. Multiply by 4 (shift by 2) to get u32 index.
+    let u32Index = (grid.dataStart << 2u) + count;
     return bitcast<f32>(picovdb_buffer[u32Index]);
 }
 
