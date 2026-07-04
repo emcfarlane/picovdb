@@ -12,9 +12,11 @@
     "watch:demo": "esbuild demo/index.ts --bundle --outfile=demo/index.js --format=esm --loader:.wgsl=text --watch=forever",
     "serve": "http-server demo -p 8000 -o -c-1",
     "dev": "mkdir -p demo/models && cp data/*.pvdb.gz demo/models/ && (npm run watch:demo & npm run serve)",
-    "check": "tsc"
+    "check": "tsc",
+    "test": "node --test \"demo/**/*.test.ts\""
   },
   "devDependencies": {
+    "@types/node": "^26.1.0",
     "@webgpu/types": "^0.1.49",
     "esbuild": "0.27.0",
     "http-server": "^14.1.1",

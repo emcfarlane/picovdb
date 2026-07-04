@@ -74,6 +74,12 @@ export interface PicoVDBLeaf {
   elements: PicoVDBNodeElement[]; // 16 elements
 }
 
+function popcount32(v: number): number {
+  v = v - ((v >>> 1) & 0x55555555);
+  v = (v & 0x33333333) + ((v >>> 2) & 0x33333333);
+  return (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
 export class PicoVDBFile {
   private buffer: ArrayBuffer;
   private view: DataView;
@@ -273,6 +279,80 @@ export class PicoVDBFile {
       count += this.getGrid(i).dataElemCount - 2 // Minus background values
     }
     return count
+  }
+
+  /** Total surface (cross-over) voxels across all leaves: the size of the
+   * dense surface index used by paint and lighting caches. */
+  getSurfaceVoxelCount(): number {
+    let count = 0;
+    for (let i = 0; i < this.header.leafCount; i++) {
+      const leaf = this.getLeaf(i);
+      for (const elem of leaf.elements) {
+        count += popcount32(elem.stateMask & elem.valueMask);
+      }
+    }
+    return count;
+  }
+
+  /** Index-space origin of every leaf (leafCount x (x, y, z, pad)), derived
+   * by walking root -> upper -> lower once (leaves store no coordinates).
+   * Ordering matches the leaf array, so origins[i] belongs to getLeaf(i). */
+  getLeafOrigins(): Int32Array {
+    const origins = new Int32Array(this.header.leafCount * 4);
+    const assigned = new Uint8Array(this.header.leafCount);
+    for (let g = 0; g < this.header.gridCount; g++) {
+      const grid = this.getGrid(g);
+      const rootEnd = g + 1 < this.header.gridCount
+        ? this.getGrid(g + 1).upperStart
+        : this.header.upperCount;
+      for (let r = grid.upperStart; r < rootEnd; r++) {
+        const key = this.getRoot(r).key;
+        // Invert picovdbCoordToKey: 20-bit (coord >> 12) fields; shifting
+        // back sign-extends via | 0
+        const ku = key[0] & 0x1FFFFF;
+        const ju = ((key[0] >>> 21) & 0x7FF) | ((key[1] & 0x3FF) << 11);
+        const iu = (key[1] >>> 10) & 0xFFFFF;
+        const rootOrigin = [(iu << 12) | 0, (ju << 12) | 0, (ku << 12) | 0];
+        const upper = this.getUpper(r);
+        upper.elements.forEach((uElem, uWord) => {
+          const uChildren = uElem.stateMask & uElem.valueMask;
+          if (uChildren === 0) return;
+          for (let uBit = 0; uBit < 32; uBit++) {
+            if ((uChildren & (1 << uBit)) === 0) continue;
+            const un = uWord * 32 + uBit;
+            const lowerOrigin = [
+              rootOrigin[0] + ((un >>> 10) & 31) * 128,
+              rootOrigin[1] + ((un >>> 5) & 31) * 128,
+              rootOrigin[2] + (un & 31) * 128,
+            ];
+            const lowerRel = upper.baseInsideIndex + (uElem.packedLocalIndex >>> 16)
+              + popcount32(uChildren & ((1 << uBit) - 1));
+            const lower = this.getLower(grid.lowerStart + lowerRel);
+            lower.elements.forEach((lElem, lWord) => {
+              const lChildren = lElem.stateMask & lElem.valueMask;
+              if (lChildren === 0) return;
+              for (let lBit = 0; lBit < 32; lBit++) {
+                if ((lChildren & (1 << lBit)) === 0) continue;
+                const ln = lWord * 32 + lBit;
+                const leafRel = lower.baseInsideIndex + (lElem.packedLocalIndex >>> 16)
+                  + popcount32(lChildren & ((1 << lBit) - 1));
+                const leafIndex = grid.leafStart + leafRel;
+                origins[leafIndex * 4] = lowerOrigin[0] + ((ln >>> 8) & 15) * 8;
+                origins[leafIndex * 4 + 1] = lowerOrigin[1] + ((ln >>> 4) & 15) * 8;
+                origins[leafIndex * 4 + 2] = lowerOrigin[2] + (ln & 15) * 8;
+                assigned[leafIndex] = 1;
+              }
+            });
+          }
+        });
+      }
+    }
+    for (let i = 0; i < this.header.leafCount; i++) {
+      if (!assigned[i]) {
+        throw new Error(`Leaf ${i} unreachable from tree walk`);
+      }
+    }
+    return origins;
   }
 
   // TODO: this needs to use the dataStart to first slice the dataBuffer in 16 byte chunks

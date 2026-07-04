@@ -25,6 +25,6 @@
     "noPropertyAccessFromIndexSignature": false,
 
     // Custom
-    "types": ["@webgpu/types"]
+    "types": ["@webgpu/types", "node"]
   }
 }

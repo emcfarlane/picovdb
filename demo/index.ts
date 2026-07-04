@@ -1,12 +1,26 @@
+// Early error trap for headless debugging (before any async module work)
+window.addEventListener('error', (e) =>
+  ((window as any).__errs = ((window as any).__errs ?? [])).push(String(e.error?.stack ?? e.message)));
+window.addEventListener('unhandledrejection', (e) =>
+  ((window as any).__errs = ((window as any).__errs ?? [])).push('rejection: ' + String((e as PromiseRejectionEvent).reason?.stack ?? (e as PromiseRejectionEvent).reason)));
+
 import { vec3, mat4 } from 'wgpu-matrix';
 import DisplayShader from "./blit.wgsl";
 import ComputeShader from "./compute.wgsl";
+import SpectraShader from "./spectra.wgsl";
 import PicoVDBShader from "./../picovdb.wgsl";
 import { fetchPicoVDB } from '../picovdb.ts';
 import { createOrbitCamera } from './lib/camera';
+import { createModelHand } from './lib/hand';
 import { createInputHandler } from "./lib/input";
 import { initGUI } from './lib/gui';
 import type { ModelConfig } from './lib/gui';
+import { ILLUMINANTS, buildIlluminantLut, packFloat16 } from './lib/illuminants';
+import type { IlluminantLut } from './lib/illuminants';
+import { parseFourierLut, srgbToFourierSrgb } from './lib/fourier_lut';
+import { parseEnv, buildEnvCdfs } from './lib/env';
+import { buildPairingTexture } from './lib/pairing';
+import type { Vec3 } from './lib/spectra';
 
 const MODEL_BASE = './models/';
 const models: ModelConfig[] = [
@@ -20,7 +34,7 @@ const models: ModelConfig[] = [
 const modelParam = new URLSearchParams(window.location.search).get('model');
 const initialModel = models.find(m => m.url.endsWith('/' + modelParam)) ?? models[0];
 
-const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models, initialModel.name);
+const { controls, gui, modelController, pauseController, highDPIController, rotationController } = initGUI(models, ILLUMINANTS.map(i => i.name), initialModel.name);
 import { createSkyState } from "./lib/hw_skymodel";
 import { TimestampQueryManager } from './lib/TimestampQueryManager';
 import { Stats } from './lib/Stats';
@@ -50,11 +64,20 @@ if (!adapter) {
 
 let width = canvas.width;
 let height = canvas.height;
+// Path tracing runs at renderScale * canvas resolution; the blit pass
+// upscales with linear filtering.
+let renderWidth = width;
+let renderHeight = height;
 let raytracedTexture: GPUTexture;
+let accumulationBuffer: GPUBuffer;
+// ReSTIR reservoirs: two (A, B) texture pairs, ping-ponged between frames
+let reservoirTextures: GPUTexture[] = [];
+let reservoirsFresh = true;
 let displayBindGroup: GPUBindGroup;
 let perFrameBindGroup: GPUBindGroup;
 let dataBindGroup: GPUBindGroup;
-let passBindGroup: GPUBindGroup;
+// Two pass bind groups with the reservoir ping-pong swapped
+let passBindGroups: GPUBindGroup[] = [];
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
@@ -89,7 +112,16 @@ const supportsTimestampQueries = adapter?.features.has(timestampQueryFeature);
 const requiredFeatures: GPUFeatureName[] = [];
 if (supportsTimestampQueries) { requiredFeatures.push(timestampQueryFeature); }
 
-const device = await adapter.requestDevice({ requiredFeatures: requiredFeatures });
+// The path tracer binds 9 storage buffers (6 PicoVDB + objects + sky +
+// accumulation); the default limit is 8. Request whatever headroom the
+// adapter offers (a paint buffer will join later).
+const requiredLimits: Record<string, number> = {};
+if (adapter.limits.maxStorageBuffersPerShaderStage > 8) {
+  requiredLimits.maxStorageBuffersPerShaderStage =
+    Math.min(16, adapter.limits.maxStorageBuffersPerShaderStage);
+}
+
+const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
 device.addEventListener('uncapturederror', event => {
   console.log(event.error);
 });
@@ -156,14 +188,26 @@ let currentModelConfig: ModelConfig = models[0];
 // Create size-dependent GPU resources
 function createGPUResources() {
   if (raytracedTexture) { raytracedTexture.destroy(); }
+  if (accumulationBuffer) { accumulationBuffer.destroy(); }
+
+  renderWidth = Math.max(1, Math.floor(width * controls.renderScale));
+  renderHeight = Math.max(1, Math.floor(height * controls.renderScale));
 
   raytracedTexture = device.createTexture({
-    size: [width, height],
+    size: [renderWidth, renderHeight],
     format: 'rgba8unorm',
     usage: GPUTextureUsage.STORAGE_BINDING |
       GPUTextureUsage.TEXTURE_BINDING |
       GPUTextureUsage.COPY_SRC
   });
+
+  // Radiance sum per pixel (vec4f: rgb + count); restarted via frame_index
+  accumulationBuffer = device.createBuffer({
+    label: 'Accumulation',
+    size: renderWidth * renderHeight * 16,
+    usage: GPUBufferUsage.STORAGE,
+  });
+  resetAccumulation("gpu-resources");
 
   displayBindGroup = device.createBindGroup({
     label: "Display bind group",
@@ -182,6 +226,16 @@ function createGPUResources() {
       { binding: 0, resource: { buffer: inputBuffer } },
       { binding: 1, resource: { buffer: objectsBuffer } },
       { binding: 2, resource: { buffer: skyStateBuffer } },
+      { binding: 3, resource: { buffer: materialsBuffer } },
+      { binding: 4, resource: { buffer: lightsBuffer } },
+      { binding: 5, resource: illuminantTexture.createView() },
+      { binding: 6, resource: illuminantSampler },
+      { binding: 7, resource: environmentTexture.createView() },
+      { binding: 8, resource: envCdfConditionalTexture.createView() },
+      { binding: 9, resource: envCdfMarginalTexture.createView() },
+      { binding: 10, resource: pairingTextures[0].createView() },
+      { binding: 11, resource: pairingTextures[1].createView() },
+      { binding: 12, resource: pairingTextures[2].createView() },
     ]
   });
 
@@ -201,14 +255,31 @@ function createGPUResources() {
     });
   }
 
-  // Bind group 2: pass
-  passBindGroup = device.createBindGroup({
-    label: 'Pass bind group',
+  // ReSTIR reservoir + G-buffer ping-pong: [A0, B0, G0, A1, B1, G1]
+  reservoirTextures.forEach(t => t.destroy());
+  reservoirTextures = [0, 1, 2, 3, 4, 5].map(i => device.createTexture({
+    label: `Reservoir ${i}`,
+    size: [renderWidth, renderHeight],
+    format: 'rgba32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+  }));
+  reservoirsFresh = true;
+
+  // Bind group 2: pass (two variants with the reservoir ping-pong swapped)
+  passBindGroups = [0, 1].map(parity => device.createBindGroup({
+    label: `Pass bind group ${parity}`,
     layout: passBindGroupLayout,
     entries: [
       { binding: 0, resource: raytracedTexture.createView() },
+      { binding: 1, resource: { buffer: accumulationBuffer } },
+      { binding: 2, resource: reservoirTextures[parity * 3].createView() },
+      { binding: 3, resource: reservoirTextures[parity * 3 + 1].createView() },
+      { binding: 4, resource: reservoirTextures[(1 - parity) * 3].createView() },
+      { binding: 5, resource: reservoirTextures[(1 - parity) * 3 + 1].createView() },
+      { binding: 6, resource: reservoirTextures[parity * 3 + 2].createView() },
+      { binding: 7, resource: reservoirTextures[(1 - parity) * 3 + 2].createView() },
     ]
-  });
+  }));
 }
 
 // Create the sampler
@@ -316,6 +387,7 @@ async function loadModel(config: ModelConfig) {
   device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
 
   currentModelConfig = config;
+  resetAccumulation("model-load");
 
   // Recreate data bind group with new buffers
   dataBindGroup = device.createBindGroup({
@@ -342,11 +414,13 @@ async function loadModel(config: ModelConfig) {
     (grid.indexBoundsMax[1] - grid.indexBoundsMin[1]),
     (grid.indexBoundsMax[2] - grid.indexBoundsMin[2])
   ];
-  infoTextElement.textContent = `PicoVDB
+  modelInfoText = `PicoVDB
 ${config.name} ${sizeMB}MB
 Grid: ${bboxSize[0]} × ${bboxSize[1]} × ${bboxSize[2]} units
 Voxels: ${picoVDBFile.getVoxelCount()}`;
+  infoTextElement.textContent = modelInfoText;
 }
+let modelInfoText = '';
 
 const fov = (2 * Math.PI) / 5; // 72 degrees
 const fovScaled = Math.tan(fov / 2);
@@ -357,22 +431,42 @@ let camera = createOrbitCamera({
   target: initialCameraTarget,
 });
 
+// Model-in-hand: drag rotates/moves the model; the camera only dollies
+// (zoom), so the backdrop and lighting stay put.
+const modelHand = createModelHand();
+
 controls.resetCamera = () => {
   camera = createOrbitCamera({
     position: initialCameraPosition,
     target: initialCameraTarget,
   });
+  modelHand.reset();
+  updateObjects();
 };
 
 
-// Input uniform: camera_matrix(64) + fov_scale(4) + time_delta(4) + pixel_radius(4) + debug_iterations(4) = 80 bytes
-const inputValues = new ArrayBuffer(80);
+// Input uniform, must match struct Input in compute.wgsl (256 bytes)
+const inputValues = new ArrayBuffer(256);
 const inputViews = {
   camera_matrix: new Float32Array(inputValues, 0, 16),
   fov_scale: new Float32Array(inputValues, 64, 1),
   time_delta: new Float32Array(inputValues, 68, 1),
   pixel_radius: new Float32Array(inputValues, 72, 1),
   debug_iterations: new Uint32Array(inputValues, 76, 1),
+  frame_index: new Uint32Array(inputValues, 80, 1),
+  environment: new Uint32Array(inputValues, 84, 1),
+  max_bounces: new Uint32Array(inputValues, 88, 1),
+  emission_integral: new Float32Array(inputValues, 92, 1),
+  dome_integral: new Float32Array(inputValues, 96, 1),
+  exposure: new Float32Array(inputValues, 100, 1),
+  light_count: new Uint32Array(inputValues, 104, 1),
+  white_background: new Uint32Array(inputValues, 108, 1),
+  rng_frame: new Uint32Array(inputValues, 112, 1),
+  reservoir_valid: new Uint32Array(inputValues, 116, 1),
+  restir: new Uint32Array(inputValues, 120, 1),
+  prev_view: new Float32Array(inputValues, 128, 16),
+  pairing: new Uint32Array(inputValues, 192, 12),
+  prev_camera_pos: new Float32Array(inputValues, 240, 3),
 };
 const inputBuffer = device.createBuffer({
   label: 'Input Uniforms',
@@ -381,9 +475,148 @@ const inputBuffer = device.createBuffer({
 });
 inputViews.fov_scale[0] = fovScaled;
 
+// --- Materials buffer (matches struct Material in compute.wgsl, 32 bytes) ---
+// The palette is authored in linear sRGB; base colors are converted to
+// Fourier sRGB at load through the bundled 33^3 LUT (demo/lib/fourier_lut.ts).
+const MATERIALS = [
+  { // 0: model — saturated blue, glossy
+    rgb: [0.0, 0.1, 1.0],
+    roughness: 0.4, diffuseAlbedo: [1.0, 0.0], fresnel0: [0.0, 0.04],
+  },
+  { // 1: ground — near-white seamless studio sweep, matte
+    rgb: [0.82, 0.82, 0.82],
+    roughness: 0.9, diffuseAlbedo: [1.0, 0.0], fresnel0: [0.0, 0.04],
+  },
+  { // 2: brush cursor — warm orange, slightly glossy
+    rgb: [1.0, 0.45, 0.1],
+    roughness: 0.35, diffuseAlbedo: [1.0, 0.0], fresnel0: [0.0, 0.04],
+  },
+];
+const fourierLut = parseFourierLut(
+  await (await fetch('./srgb_to_fourier_srgb.lut')).arrayBuffer());
+// Uniform arrays with fixed WGSL-side capacity (MAX_MATERIALS / MAX_LIGHTS)
+const MATERIAL_STRUCT_SIZE = 32;
+const MAX_MATERIALS = 8;
+const materialsData = new ArrayBuffer(MATERIAL_STRUCT_SIZE * MAX_MATERIALS);
+MATERIALS.forEach((m, i) => {
+  const f32 = new Float32Array(materialsData, i * MATERIAL_STRUCT_SIZE, 8);
+  f32.set(srgbToFourierSrgb(fourierLut, m.rgb as Vec3), 0);
+  f32[3] = m.roughness;
+  f32.set(m.diffuseAlbedo, 4);
+  f32.set(m.fresnel0, 6);
+});
+const materialsBuffer = device.createBuffer({
+  label: 'Materials',
+  size: materialsData.byteLength,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(materialsBuffer, 0, materialsData);
+
+// --- Spherical lights (xyz = world center, w = radius) ---
+// Removed from the scene (2026-07-04): the studio look is environment-only;
+// the lamp machinery stays for a future artistic light rig.
+const MAX_LIGHTS = 8;
+const LIGHTS: number[][] = [];
+const lightsData = new Float32Array(MAX_LIGHTS * 4);
+lightsData.set(LIGHTS.flat());
+const lightsBuffer = device.createBuffer({
+  label: 'Spherical Lights',
+  size: lightsData.byteLength,
+  usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+});
+device.queue.writeBuffer(lightsBuffer, 0, lightsData);
+inputViews.light_count[0] = LIGHTS.length;
+
+// --- Illuminant wavelength-sampling LUT texture ---
+const ILLUMINANT_LUT_RESOLUTION = 1024;
+const illuminantTexture = device.createTexture({
+  label: 'Illuminant Spectrum LUT',
+  size: [ILLUMINANT_LUT_RESOLUTION, 1],
+  format: 'rgba16float',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+const illuminantSampler = device.createSampler({
+  addressModeU: 'clamp-to-edge',
+  magFilter: 'linear',
+  minFilter: 'linear',
+});
+// --- HDRI environment (studio_small_03, CC0 from polyhaven.com) ---
+const envMap = parseEnv(await (await fetch('./studio_small_03.env')).arrayBuffer());
+const environmentTexture = device.createTexture({
+  label: 'Environment HDRI',
+  size: [envMap.width, envMap.height],
+  format: 'rgba16float',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+device.queue.writeTexture(
+  { texture: environmentTexture },
+  envMap.rgba16,
+  { bytesPerRow: envMap.width * 8 },
+  [envMap.width, envMap.height],
+);
+// Luminance CDFs for importance sampling (see demo/lib/env.ts)
+const envCdfs = buildEnvCdfs(envMap);
+const envCdfConditionalTexture = device.createTexture({
+  label: 'Env CDF conditional',
+  size: [envMap.width, envMap.height],
+  format: 'r32float',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+device.queue.writeTexture(
+  { texture: envCdfConditionalTexture },
+  envCdfs.conditional,
+  { bytesPerRow: envMap.width * 4 },
+  [envMap.width, envMap.height],
+);
+const envCdfMarginalTexture = device.createTexture({
+  label: 'Env CDF marginal',
+  size: [envMap.height, 1],
+  format: 'r32float',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+device.queue.writeTexture(
+  { texture: envCdfMarginalTexture },
+  envCdfs.marginal,
+  { bytesPerRow: envMap.height * 4 },
+  [envMap.height, 1],
+);
+
+// --- Pairing textures for ReSTIR spatial reuse (rg8sint deltas) ---
+// Coprime-ish sizes avoid tiling-alignment correlation (paper's choice);
+// sigma 16 matches the classic 30px uniform-disk reuse radius.
+const PAIRING_SIZES = [254, 230, 210];
+const pairingTextures = PAIRING_SIZES.map((size, i) => {
+  const data = buildPairingTexture(size, 16.0);
+  const texture = device.createTexture({
+    label: `Pairing ${i}`,
+    size: [size, size],
+    format: 'rg8sint',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+  });
+  device.queue.writeTexture({ texture }, data, { bytesPerRow: size * 2 }, [size, size]);
+  return texture;
+});
+
+const illuminantLutCache = new Map<string, IlluminantLut>();
+function setIlluminant(name: string) {
+  const entry = ILLUMINANTS.find(i => i.name === name) ?? ILLUMINANTS[0];
+  let lut = illuminantLutCache.get(entry.name);
+  if (!lut) {
+    lut = buildIlluminantLut(entry.spd, ILLUMINANT_LUT_RESOLUTION);
+    illuminantLutCache.set(entry.name, lut);
+  }
+  device.queue.writeTexture(
+    { texture: illuminantTexture },
+    packFloat16(lut.rgbAndPhase),
+    { bytesPerRow: ILLUMINANT_LUT_RESOLUTION * 8 },
+    [ILLUMINANT_LUT_RESOLUTION, 1],
+  );
+}
+setIlluminant(controls.illuminant);
+
 // --- Object buffer ---
-// Object struct: object_type(4) + type_id(4) + material_id(4) + _pad(4) + transform(64) + transform_inverse(64) = 144 bytes
-const OBJECT_STRUCT_SIZE = 144;
+// Object struct: header(16) + transform(64) + transform_inverse(64) + motion(64) = 208 bytes
+const OBJECT_STRUCT_SIZE = 208;
 const OBJECT_COUNT = 2;
 const objectsData = new ArrayBuffer(OBJECT_STRUCT_SIZE * OBJECT_COUNT);
 const objectsBuffer = device.createBuffer({
@@ -391,18 +624,35 @@ const objectsBuffer = device.createBuffer({
   size: objectsData.byteLength,
   usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
 });
-new Array(27).slice()
-const objectViews = [];
-for (let index = 0; index < OBJECT_COUNT; index++) {
+const objectViews = Array.from({ length: OBJECT_COUNT }, (_, index) => {
   const offset = OBJECT_STRUCT_SIZE * index;
-  objectViews.push({
+  const view = {
     object_type: new Uint32Array(objectsData, offset + 0, 1),
     type_index: new Uint32Array(objectsData, offset + 4, 1),
     material_index: new Uint32Array(objectsData, offset + 8, 1),
     _pad: new Uint32Array(objectsData, offset + 12, 1),
     transform: new Float32Array(objectsData, offset + 16, 16),
     transform_inverse: new Float32Array(objectsData, offset + 80, 16),
+    motion: new Float32Array(objectsData, offset + 144, 16),
+  };
+  view.motion.set(mat4.identity());
+  return view;
+});
+// Last frame's world->index transforms, for per-object motion matrices
+const prevObjectTransforms = objectViews.map(() => new Float32Array(16));
+
+// Per-frame: motion maps a current world position on the object to its
+// world position last frame: M_prev_inverse * M_current (ReSTIR reprojection)
+function updateObjectMotion() {
+  objectViews.forEach((view, i) => {
+    if (prevObjectTransforms[i].every(v => v === 0)) {
+      prevObjectTransforms[i].set(view.transform); // first frame
+    }
+    const prevInverse = mat4.inverse(prevObjectTransforms[i]);
+    view.motion.set(mat4.multiply(prevInverse, view.transform));
+    prevObjectTransforms[i].set(view.transform);
   });
+  device.queue.writeBuffer(objectsBuffer, 0, objectsData);
 }
 // VDB object
 const vdbObjectView = objectViews[0];
@@ -457,9 +707,9 @@ function computePixelRadius(fov_y_radians: number, resolution_height: number) {
   return (2.0 * fov_scale) / resolution_height;
 }
 
-// Update pixel radius (call on resize)
+// Update pixel radius (call on resize / render-scale change)
 function updatePixelRadius() {
-  inputViews.pixel_radius[0] = computePixelRadius(fov, height);
+  inputViews.pixel_radius[0] = computePixelRadius(fov, renderHeight);
 }
 
 // Initialize cone constants
@@ -475,6 +725,8 @@ function updateObjects() {
 
   const rotationRadians = (controls.rotation * Math.PI) / 180;
   mat4.rotateY(transformMatrix, rotationRadians, transformMatrix);
+  // In-hand rotation/pan (world-space pre-image, see lib/hand.ts)
+  mat4.multiply(transformMatrix, modelHand.transform, transformMatrix);
 
   vdbObjectView.transform.set(transformMatrix);
   vdbObjectView.transform_inverse.set(mat4.inverse(transformMatrix));
@@ -491,6 +743,27 @@ rotationController.onChange(() => {
   updateObjects();
 });
 
+// Progressive accumulation: number of frames accumulated so far. Zero makes
+// the shader restart the running sum, so resetting is just a counter reset.
+// Once converged (MAX_ACCUM_FRAMES) the compute pass stops dispatching
+// entirely until something changes — an idle, converged image is free.
+const MAX_ACCUM_FRAMES = 65536;
+let accumFrameIndex = 0;
+let rngFrame = 0;
+// Last frame's world->camera matrix + camera position for ReSTIR
+const prevViewMatrix = new Float32Array(16);
+mat4.identity(prevViewMatrix);
+const prevCameraPos = new Float32Array(3);
+let shouldDispatch = true;
+const prevCameraMatrix = new Float32Array(16);
+let lastResetCause = 'init';
+function resetAccumulation(cause = 'unknown') {
+  accumFrameIndex = 0;
+  lastResetCause = cause;
+}
+// Debug introspection for headless testing
+(window as any).__dbg = () => ({ accumFrameIndex, shouldDispatch, lastResetCause });
+
 function updateInput(deltaTime: number) {
   // Update time delta
   inputViews.time_delta[0] = deltaTime;
@@ -498,17 +771,68 @@ function updateInput(deltaTime: number) {
   // Update debug flag
   inputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
 
-  // Update camera
-  camera.update(deltaTime, inputHandler());
+  // Drag rotates/pans the model in hand; the camera keeps only zoom (dolly
+  // along its fixed view direction), so backdrop and lights stay put.
+  const frameInput = inputHandler();
+  if (modelHand.update(deltaTime, frameInput, camera.matrix)) {
+    updateObjects();
+    resetAccumulation("hand-motion");
+  }
+  camera.update(deltaTime, {
+    digital: frameInput.digital,
+    analog: { ...frameInput.analog, x: 0, y: 0, panning: false },
+  });
+  for (let i = 0; i < 16; ++i) {
+    if (camera.matrix[i] !== prevCameraMatrix[i]) {
+      resetAccumulation("camera");
+      break;
+    }
+  }
+  prevCameraMatrix.set(camera.matrix);
   inputViews.camera_matrix.set(camera.matrix);
+
+  shouldDispatch = accumFrameIndex < MAX_ACCUM_FRAMES;
+  inputViews.frame_index[0] = accumFrameIndex;
+  if (shouldDispatch) { accumFrameIndex++; }
+  // Monotonic RNG frame + reservoir state: reservoirs survive accumulation
+  // resets (that's ReSTIR's point) but not texture recreation
+  inputViews.rng_frame[0] = rngFrame;
+  inputViews.reservoir_valid[0] = reservoirsFresh ? 0 : 1;
+  inputViews.restir[0] = controls.restir ? 1 : 0;
+  // ReSTIR reprojection state: last frame's view matrix + object motion
+  inputViews.prev_view.set(prevViewMatrix);
+  inputViews.prev_camera_pos.set(prevCameraPos);
+  mat4.inverse(camera.matrix, prevViewMatrix);
+  prevCameraPos.set([camera.matrix[12], camera.matrix[13], camera.matrix[14]]);
+  updateObjectMotion();
+  // Fresh random transform per pairing texture each frame (offset + flips)
+  PAIRING_SIZES.forEach((size, i) => {
+    inputViews.pairing.set([
+      (Math.random() * size) | 0, (Math.random() * size) | 0,
+      Math.random() < 0.5 ? 1 : 0, Math.random() < 0.5 ? 1 : 0,
+    ], i * 4);
+  });
+  if (shouldDispatch) {
+    rngFrame++;
+    reservoirsFresh = false;
+  }
+  const ENV_INDEX = { 'Studio': 0, 'Sky': 1, 'Studio HDRI': 2 } as const;
+  inputViews.environment[0] = ENV_INDEX[controls.environment];
+  inputViews.max_bounces[0] = controls.maxBounces;
+  // Lights and dome emit the illuminant spectrum at these intensities
+  inputViews.emission_integral[0] = controls.lightIntensity;
+  inputViews.dome_integral[0] = controls.domeIntensity;
+  inputViews.exposure[0] = controls.exposure;
+  inputViews.white_background[0] = controls.whiteBackdrop ? 1 : 0;
 
   // Write entire input buffer at once
   device.queue.writeBuffer(inputBuffer, 0, inputValues);
 }
 
-// Combine PicoVDB shader library with compute shader
+// Combine PicoVDB shader library, spectral module and compute shader
 const combinedShader = /* wgsl */ `// Hello GPU
 ${PicoVDBShader}
+${SpectraShader}
 ${ComputeShader}`
 
 const computeShaderModule = device.createShaderModule({
@@ -535,6 +859,16 @@ const perFrameBindGroupLayout = device.createBindGroupLayout({
     { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, sampler: { type: 'filtering' } },
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'sint', viewDimension: '2d' } },
+    { binding: 11, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'sint', viewDimension: '2d' } },
+    { binding: 12, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'sint', viewDimension: '2d' } },
   ]
 });
 
@@ -558,6 +892,22 @@ const passBindGroupLayout = device.createBindGroupLayout({
     {
       binding: 0, visibility: GPUShaderStage.COMPUTE,
       storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' },
+    },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    {
+      binding: 4, visibility: GPUShaderStage.COMPUTE,
+      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
+    },
+    {
+      binding: 5, visibility: GPUShaderStage.COMPUTE,
+      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
+    },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    {
+      binding: 7, visibility: GPUShaderStage.COMPUTE,
+      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
     },
   ]
 });
@@ -600,6 +950,24 @@ modelController.onChange(async (name: string) => {
   await loadModel(config);
 });
 
+// Any GUI change invalidates the accumulated image
+gui.onChange((event) => {
+  resetAccumulation("gui");
+  if (event.property === 'illuminant') {
+    setIlluminant(controls.illuminant);
+  } else if (event.property === 'environment') {
+    // Sensible exposure defaults per environment (sky radiances are huge)
+    controls.exposure = controls.environment === 'Sky' ? 0.05 : 1.0;
+    gui.controllersRecursive().forEach(c => c.updateDisplay());
+  } else if (event.property === 'renderScale') {
+    createGPUResources();
+    updatePixelRadius();
+  } else if (event.property === 'restir') {
+    // Stale reservoirs must not survive a toggle
+    reservoirsFresh = true;
+  }
+});
+
 const colorAttachment: GPURenderPassColorAttachment = {
   view: context.getCurrentTexture().createView(), // Assigned on render
   clearValue: { r: 0, g: 0, b: 0, a: 1 },
@@ -621,15 +989,27 @@ function requestFrame() {
   const deltaTime = (beginTime - lastFrameMS) / 1000;
   lastFrameMS = beginTime;
 
+  // Update uniforms first: queue writes land before this frame's passes
+  updateInput(deltaTime);
+
+  // Show accumulation progress so convergence state is always visible
+  if (accumFrameIndex % 15 === 0 && modelInfoText) {
+    infoTextElement.textContent = `${modelInfoText}\nSamples: ${accumFrameIndex}`;
+  }
+
   const encoder = device.createCommandEncoder({ label: "Command Encoder" });
 
-  const computePass = encoder.beginComputePass(computePassDescriptor);
-  computePass.setPipeline(computePipeline);
-  computePass.setBindGroup(0, perFrameBindGroup);
-  computePass.setBindGroup(1, dataBindGroup);
-  computePass.setBindGroup(2, passBindGroup);
-  computePass.dispatchWorkgroups(Math.ceil(width / 8), Math.ceil(height / 8), 1);
-  computePass.end();
+  // Skip path tracing entirely once the image has converged
+  if (shouldDispatch) {
+    const computePass = encoder.beginComputePass(computePassDescriptor);
+    computePass.setPipeline(computePipeline);
+    computePass.setBindGroup(0, perFrameBindGroup);
+    computePass.setBindGroup(1, dataBindGroup);
+    // rngFrame was already advanced for this frame in updateInput
+    computePass.setBindGroup(2, passBindGroups[(rngFrame - 1) & 1]);
+    computePass.dispatchWorkgroups(Math.ceil(renderWidth / 8), Math.ceil(renderHeight / 8), 1);
+    computePass.end();
+  }
 
   // Start a display pass.
   colorAttachment.view = context.getCurrentTexture().createView();
@@ -639,8 +1019,6 @@ function requestFrame() {
   displayPass.setBindGroup(0, displayBindGroup);
   displayPass.draw(3, 1, 0, 0);
   displayPass.end();
-
-  updateInput(deltaTime);
 
   // Resolve timestamp queries, so that their result is available in
   // a GPU-side buffer.
@@ -658,12 +1036,14 @@ function requestFrame() {
 let animationId: number | null = null;
 
 function renderLoop() {
+  (window as any).__loop = ((window as any).__loop ?? 0) + 1;
   if (animationId === null) return;
   requestFrame();
   animationId = requestAnimationFrame(renderLoop);
 }
 
 function startRenderLoop() {
+  (window as any).__started = true;
   animationId = requestAnimationFrame(renderLoop);
 }
 
