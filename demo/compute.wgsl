@@ -1542,8 +1542,12 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
         }
 
         if (k == 1u) {
+            // w = material + depth/16384 in [mat, mat+1): u32(w) decodes
+            // the material EXACTLY for any depth (the old material+4*depth
+            // packing was undecodable for fractional depths — validation
+            // passed on depth-contour bands only, the banding root cause)
             textureStore(gbuffer_out, pixel,
-                vec4f(s.normal, f32(obj.material_index) + 4.0 * hit.distance));
+                vec4f(s.normal, f32(obj.material_index) + clamp(hit.distance * (1.0 / 16384.0), 0.0, 0.9999)));
         }
 
         // Lamp NEE

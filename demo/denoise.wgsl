@@ -101,7 +101,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
 
     if (g.w >= 0.0) {
         let mat_idx = u32(g.w) & 3u;
-        let depth = (g.w - f32(mat_idx)) * 0.25;
+        let depth = (g.w - f32(mat_idx)) * 16384.0;
         let pos = world_pos(pixel, dims, depth);
         // Our two objects map 1:1 to materials (0 = model, 1 = ground)
         let obj = objects[min(mat_idx, 1u)];
@@ -216,7 +216,7 @@ fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
         return;
     }
     let mat_c = u32(g.w) & 3u;
-    let depth_c = (g.w - f32(mat_c)) * 0.25;
+    let depth_c = (g.w - f32(mat_c)) * 16384.0;
     let n_c = g.xyz;
     let pos_c = world_pos(gid.xy, dims, depth_c);
     let l_c = dn_luminance(center.rgb);
@@ -256,7 +256,7 @@ fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
             let h = kern[abs(dx)] * kern[abs(dy)];
             // Edge-stopping: plane distance (depth), normal cosine power,
             // variance-normalized luminance
-            let depth_q = (gq.w - f32(u32(gq.w) & 3u)) * 0.25;
+            let depth_q = (gq.w - f32(u32(gq.w) & 3u)) * 16384.0;
             let pos_q = world_pos(vec2u(q), dims, depth_q);
             let plane_d = abs(dot(n_c, pos_q - pos_c));
             let wz = exp(-plane_d / (SIGMA_Z * (0.01 * depth_c) + 1e-4));
