@@ -16,13 +16,13 @@ export interface Controls {
 	model: string;
 	environment: 'Studio' | 'Sky' | 'Studio HDRI';
 	whiteBackdrop: boolean;
+	lightingMode: 'Reference' | 'ReSTIR';
 	illuminant: string;
 	lightIntensity: number;
 	domeIntensity: number;
 	exposure: number;
 	maxBounces: number;
 	renderScale: number;
-	restir: boolean;
 }
 
 export interface GUIControllers {
@@ -49,6 +49,7 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		model: initialModelName ?? models[0].name,
 		environment: 'Studio HDRI',
 		whiteBackdrop: true,
+		lightingMode: 'Reference',
 		illuminant: illuminants[0],
 		lightIntensity: 15.0,
 		domeIntensity: 0.5,
@@ -58,7 +59,6 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		// Temporal + paired-spatial ReSTIR DI: measured at parity with the
 		// path tracer's 3-technique NEE on this scene while spending 1/3 of
 		// its direct shadow rays; pulls ahead as lights multiply
-		restir: true,
 	};
 
 	const modelController = gui.add(controls, 'model', models.map(m => m.name)).name('Model');
@@ -69,6 +69,8 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 	const debugController = gui.add(controls, 'debugIterations').name('Debug Iterations');
 
 	const lighting = gui.addFolder('Lighting');
+	// ReSTIR = ReSTIR PT (docs/restir-pt-plan.md); Reference = ground truth
+	lighting.add(controls, 'lightingMode', ['Reference', 'ReSTIR']).name('Lighting');
 	lighting.add(controls, 'environment', ['Studio HDRI', 'Studio', 'Sky']).name('Environment');
 	lighting.add(controls, 'whiteBackdrop').name('White Backdrop');
 	const illuminantController = lighting.add(controls, 'illuminant', illuminants).name('Illuminant');
@@ -77,7 +79,6 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 	lighting.add(controls, 'maxBounces', 1, 8, 1).name('Max Bounces');
 	lighting.add(controls, 'renderScale', { '25%': 0.25, '50%': 0.5, '100%': 1 }).name('Render Scale');
 	// ReSTIR DI for direct lighting; off = pure path-traced reference
-	lighting.add(controls, 'restir').name('ReSTIR');
 
 	return { controls, gui, modelController, pauseController, cameraController, highDPIController, rotationController, debugController, illuminantController };
 }

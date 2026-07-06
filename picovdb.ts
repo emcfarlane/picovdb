@@ -297,7 +297,7 @@ export class PicoVDBFile {
   /** Index-space origin of every leaf (leafCount x (x, y, z, pad)), derived
    * by walking root -> upper -> lower once (leaves store no coordinates).
    * Ordering matches the leaf array, so origins[i] belongs to getLeaf(i). */
-  getLeafOrigins(): Int32Array {
+  getLeafOrigins(): Int32Array<ArrayBuffer> {
     const origins = new Int32Array(this.header.leafCount * 4);
     const assigned = new Uint8Array(this.header.leafCount);
     for (let g = 0; g < this.header.gridCount; g++) {

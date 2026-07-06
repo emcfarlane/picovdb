@@ -478,6 +478,7 @@ fn picovdbHDDAZeroCrossing(
     out_distance: ptr<function, f32>,
     out_normal: ptr<function, vec3f>,
     out_iterations: ptr<function, u32>,
+    out_voxel: ptr<function, vec3i>,
 ) -> bool {
     let direction_inv = 1 / direction;
     var tmin_mut = tmin;
@@ -521,6 +522,7 @@ fn picovdbHDDAZeroCrossing(
                     *out_distance = hdda.tmin + hit.t;
                     *out_normal = hit.normal;
                     *out_iterations = step_count;
+                    *out_voxel = hdda.voxel;
                     return true;
                 }
             } else {
@@ -528,6 +530,7 @@ fn picovdbHDDAZeroCrossing(
                 *out_distance = hdda.tmin;
                 *out_normal = picovdbTrilinearGradient(p_local, stencil);
                 *out_iterations = step_count;
+                *out_voxel = hdda.voxel;
                 return true;
             }
         }

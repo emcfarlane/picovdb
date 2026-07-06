@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   projectFunction, projectUniform, projectEnvMap, rotateSh, evalIrradiance,
-  shBasis, SH_A0, SH_A1,
+  shBasis, SH_A, SH_COEFFS,
 } from "./sh.ts";
 import { parseEnv } from "./env.ts";
 
@@ -43,11 +43,12 @@ test("uniform radiance L gives irradiance pi*L at any normal", () => {
   }
 });
 
-test("L1-band-limited radiance: SH irradiance matches brute force exactly", () => {
-  // f = a + b*(k . d): exactly representable in L1
+test("L2-band-limited radiance: SH irradiance matches brute force exactly", () => {
+  // f = a + b*(k . d) + c*(k . d)^2: representable in L0..L2
   const k: V3 = [0.48, 0.6, 0.64];
   const f = (d: V3): V3 => {
-    const v = Math.max(0.5 + 0.3 * (k[0] * d[0] + k[1] * d[1] + k[2] * d[2]), 0);
+    const t = k[0] * d[0] + k[1] * d[1] + k[2] * d[2];
+    const v = Math.max(0.5 + 0.2 * t + 0.25 * t * t, 0);
     return [v, 0.5 * v, 2 * v];
   };
   const sh = projectFunction(f, 128, 256);
@@ -62,7 +63,11 @@ test("L1-band-limited radiance: SH irradiance matches brute force exactly", () =
 });
 
 test("rotating coefficients equals projecting the rotated function", () => {
-  const f = (d: V3): V3 => [Math.max(0.2 + 0.8 * d[1], 0), 0, 0];
+  // L2 content included: quadratic in a skewed direction
+  const f = (d: V3): V3 => {
+    const t = 0.36 * d[0] + 0.48 * d[1] + 0.8 * d[2];
+    return [Math.max(0.2 + 0.5 * d[1] + 0.4 * t * t, 0), 0, 0];
+  };
   const sh = projectFunction(f, 128, 256);
   // Rotation: 90 deg about x (column-major 3x3): y -> z, z -> -y
   const m = [1, 0, 0, 0, 0, 1, 0, -1, 0];
@@ -70,9 +75,33 @@ test("rotating coefficients equals projecting the rotated function", () => {
   // (R f)(d) = f(R^-1 d); R^-1 maps (x, y, z) -> (x, z, -y)
   const fRot = (d: V3): V3 => f([d[0], d[2], -d[1]]);
   const ref = projectFunction(fRot, 128, 256);
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < SH_COEFFS * 4; i++) {
     assert.ok(Math.abs(rotated[i] - ref[i]) < 1e-3,
       `coeff ${i}: ${rotated[i]} vs ${ref[i]}`);
+  }
+
+  // And an arbitrary-axis rotation (117 deg about a skewed axis) checked
+  // against numerical projection of the rotated function
+  const axis = [0.267, 0.535, 0.802];
+  const ang = (117 * Math.PI) / 180;
+  const [cx, sx] = [Math.cos(ang), Math.sin(ang)];
+  const [ux, uy, uz] = axis;
+  // Column-major rotation matrix
+  const m2 = [
+    cx + ux * ux * (1 - cx), uy * ux * (1 - cx) + uz * sx, uz * ux * (1 - cx) - uy * sx,
+    ux * uy * (1 - cx) - uz * sx, cx + uy * uy * (1 - cx), uz * uy * (1 - cx) + ux * sx,
+    ux * uz * (1 - cx) + uy * sx, uy * uz * (1 - cx) - ux * sx, cx + uz * uz * (1 - cx),
+  ];
+  const rotated2 = rotateSh(sh, m2);
+  const inv = (d: V3): V3 => [ // transpose = inverse for rotations
+    m2[0] * d[0] + m2[1] * d[1] + m2[2] * d[2],
+    m2[3] * d[0] + m2[4] * d[1] + m2[5] * d[2],
+    m2[6] * d[0] + m2[7] * d[1] + m2[8] * d[2],
+  ];
+  const ref2 = projectFunction((d) => f(inv(d)), 128, 256);
+  for (let i = 0; i < SH_COEFFS * 4; i++) {
+    assert.ok(Math.abs(rotated2[i] - ref2[i]) < 2e-3,
+      `arb coeff ${i}: ${rotated2[i]} vs ${ref2[i]}`);
   }
 });
 
@@ -85,10 +114,10 @@ test("transfer-dot identity: dot(L, T_unshadowed) = irradiance", () => {
     return [cos, cos, cos];
   }, 200, 400);
   const basis = shBasis(n);
-  const analytic = [SH_A0 * basis[0], SH_A1 * basis[1], SH_A1 * basis[2], SH_A1 * basis[3]];
-  for (let c = 0; c < 4; c++) {
-    assert.ok(Math.abs(tNumeric[c * 4] - analytic[c]) < 0.01,
-      `T coeff ${c}: numeric ${tNumeric[c * 4]} vs analytic ${analytic[c]}`);
+  for (let c = 0; c < SH_COEFFS; c++) {
+    const analytic = SH_A[c] * basis[c];
+    assert.ok(Math.abs(tNumeric[c * 4] - analytic) < 0.01,
+      `T coeff ${c}: numeric ${tNumeric[c * 4]} vs analytic ${analytic}`);
   }
 });
 
@@ -100,8 +129,11 @@ test("studio env projection: irradiance plumbing is consistent", () => {
   // isolates plumbing errors from L1 truncation (which is expected).
   const recon = (d: V3): V3 => {
     const b = shBasis(d);
-    return [0, 1, 2].map(ch =>
-      sh[0 + ch] * b[0] + sh[4 + ch] * b[1] + sh[8 + ch] * b[2] + sh[12 + ch] * b[3]) as V3;
+    return [0, 1, 2].map(ch => {
+      let s = 0;
+      for (let c = 0; c < SH_COEFFS; c++) s += sh[c * 4 + ch] * b[c];
+      return s;
+    }) as V3;
   };
   const e = evalIrradiance(sh, [0, 1, 0]);
   const ref = bruteIrradiance(recon, [0, 1, 0]);

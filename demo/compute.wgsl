@@ -33,21 +33,16 @@ struct Input {
     // Monotonic frame counter for RNG seeding (never resets, unlike
     // frame_index, so samples stay fresh while accumulation restarts)
     rng_frame: u32,
-    // 0 after the reservoir textures were recreated (resize/render scale)
-    reservoir_valid: u32,
-    // 1 = ReSTIR DI for direct lighting at the primary hit
-    restir: u32,
-    _pad: u32,
-    // Previous frame's view matrix (world -> camera) for ReSTIR temporal
-    // reprojection; combined with per-object motion matrices
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    // Previous frame's view matrix (world -> camera): temporal reprojection
+    // for the denoiser, combined with per-object motion matrices
     prev_view: mat4x4f,
-    // Per-frame random transform for each pairing texture:
-    // (offset.x, offset.y, flip.x, flip.y) — decorrelates spatial reuse
-    pairing: array<vec4u, 3>,
-    // Previous frame's camera position: reconstructs a spatial neighbor's
-    // view direction when evaluating their target function (pairwise MIS)
+    // Previous frame's camera position: source view directions when
+    // evaluating the reverse shift for temporal MIS
     prev_camera_pos: vec3f,
-    _pad2: f32,
+    _pad3: f32,
 }
 
 // --- Object types ---
@@ -100,13 +95,11 @@ const MAX_LIGHTS: u32 = 8u;
 // columns (W x H) and marginal CDF over rows (H x 1).
 @group(0) @binding(8) var env_cdf_conditional: texture_2d<f32>;
 @group(0) @binding(9) var env_cdf_marginal: texture_2d<f32>;
-// Pairing textures for ReSTIR paired spatial reuse (rg8sint deltas, tiled
-// over the screen; see demo/lib/pairing.ts). Different sizes avoid
-// tiling-alignment correlation.
-@group(0) @binding(10) var pairing_0: texture_2d<i32>;
-@group(0) @binding(11) var pairing_1: texture_2d<i32>;
-@group(0) @binding(12) var pairing_2: texture_2d<i32>;
-
+// sRGB -> Fourier sRGB LUT (33^3, sRGB-encoded u8) as a 3D texture: lets
+// the shader upsample arbitrary RGB radiance (environment light) into a
+// reflectance-style spectrum so env chroma multiplies paint chroma
+// spectrally instead of washing out through the RGB approximation
+@group(0) @binding(10) var fourier_lut_3d: texture_3d<f32>;
 // -- Bind group 1: data ---
 @group(1) @binding(0) var<storage> picovdb_grids: array<PicoVDBGrid>;
 @group(1) @binding(1) var<storage> picovdb_roots: array<PicoVDBRoot>;
@@ -119,18 +112,344 @@ const MAX_LIGHTS: u32 = 8u;
 @group(2) @binding(0) var output_texture: texture_storage_2d<rgba8unorm, write>;
 // Progressive accumulation: running radiance sum per pixel (rgb) + count (a)
 @group(2) @binding(1) var<storage, read_write> accumulation: array<vec4f>;
-// ReSTIR DI reservoirs, ping-ponged between frames:
-// A = (direction.xyz, W), B = (shading position.xyz, confidence M)
-@group(2) @binding(2) var reservoir_prev_a: texture_2d<f32>;
-@group(2) @binding(3) var reservoir_prev_b: texture_2d<f32>;
-@group(2) @binding(4) var reservoir_out_a: texture_storage_2d<rgba32float, write>;
-@group(2) @binding(5) var reservoir_out_b: texture_storage_2d<rgba32float, write>;
 // Primary-hit G-buffer (normal.xyz, material index; >= 900 marks a miss),
-// ping-ponged with the reservoirs: spatial reuse evaluates each neighbor's
-// target function at THEIR surface for pairwise-balance MIS. NOTE: this is
-// the 4th storage texture — the WebGPU per-stage limit.
-@group(2) @binding(6) var gbuffer_prev: texture_2d<f32>;
-@group(2) @binding(7) var gbuffer_out: texture_storage_2d<rgba32float, write>;
+// ping-ponged across frames for the denoiser's temporal pass
+@group(2) @binding(2) var gbuffer_prev: texture_2d<f32>;
+@group(2) @binding(3) var gbuffer_out: texture_storage_2d<rgba32float, write>;
+
+// ============================================================================
+// ReSTIR PT reservoirs (docs/restir-pt-plan.md, layout after ReSTIR PT
+// Enhanced supplemental Alg. 1, adapted to VDB primitives). One storage
+// buffer holds both ping-pong halves; the half written this frame is
+// selected by rng_frame parity.
+// ============================================================================
+
+struct Reservoir {
+    // Selected path contribution F (RGB, CMF-projected; the "RGB copy"
+    // spectral simplification per plan) and unbiased contribution weight
+    f: vec3f,
+    w: f32,
+    // Reconnection vertex: world position, or the env direction when the
+    // path reconnects at the environment (rc-is-env flag)
+    rc_pos: vec3f,
+    // Confidence weight (sample count analogue, capped in temporal reuse)
+    m: f32,
+    rc_normal_oct: u32,
+    // Suffix direction at the rc vertex (toward x_{k+1} / the light)
+    rc_wi_oct: u32,
+    // rng_frame that generated the path: with the owning pixel this
+    // reconstructs the full RNG stream for random replay
+    init_seed: u32,
+    // bits 0-3: path length d | bit 4: rc-is-env | bit 5: ends by NEE
+    path_flags: u32,
+    // Incident radiance at the rc vertex along rc_wi (RGB), excluding the
+    // rc vertex's own BSDF (re-evaluated at reuse)
+    rc_radiance: vec3f,
+    // Solid-angle pdf of sampling rc_wi at the rc vertex (Jacobian cache)
+    rc_pdf: f32,
+}
+
+const PATH_FLAG_RC_ENV = 16u;
+const PATH_FLAG_NEE = 32u;
+
+@group(2) @binding(4) var<storage, read_write> reservoirs: array<Reservoir>;
+
+// Regions: 0/1 = frame-final ping-pong (parity = rng_frame & 1),
+// 2 = this frame's post-temporal scratch that spatial reuse reads from
+fn reservoir_index(pixel: vec2u, dims: vec2u, region: u32) -> u32 {
+    return region * dims.x * dims.y + pixel.y * dims.x + pixel.x;
+}
+
+fn luminance(c: vec3f) -> f32 {
+    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+fn oct_wrap(v: vec2f) -> vec2f {
+    return (1.0 - abs(v.yx)) * select(vec2f(-1.0), vec2f(1.0), v >= vec2f(0.0));
+}
+
+fn oct_encode(n: vec3f) -> u32 {
+    var p = n.xy / max(abs(n.x) + abs(n.y) + abs(n.z), 1e-8);
+    if (n.z < 0.0) {
+        p = oct_wrap(p);
+    }
+    let e = vec2u(clamp(p * 0.5 + 0.5, vec2f(0.0), vec2f(1.0)) * 65535.0);
+    return e.x | (e.y << 16u);
+}
+
+fn oct_decode(bits: u32) -> vec3f {
+    let e = vec2f(vec2u(bits & 0xffffu, bits >> 16u)) * (2.0 / 65535.0) - 1.0;
+    var n = vec3f(e, 1.0 - abs(e.x) - abs(e.y));
+    if (n.z < 0.0) {
+        n = vec3f(oct_wrap(n.xy), n.z);
+    }
+    return normalize(n);
+}
+
+const TEMPORAL_CONFIDENCE_CAP = 20.0;
+const JACOBIAN_REJECT_THRESHOLD = 0.5;
+
+fn mis_balance(a: f32, b: f32) -> f32 {
+    return a / max(a + b, 1e-12);
+}
+
+// Light-technique pdf for an env direction (recomputable: env is static)
+fn env_light_pdf(dir: vec3f) -> f32 {
+    if (input.environment == ENVIRONMENT_HDRI) {
+        return get_environment_density(dir);
+    }
+    if (input.environment == ENVIRONMENT_SKY) {
+        return get_sun_density(dir);
+    }
+    return 0.0; // dome has no light-sampling technique
+}
+
+// MIS weight for a BSDF-sampled ray reaching the environment (matches the
+// initial/reference gating: sky only competes inside the sun cone)
+fn env_escape_mis(dir: vec3f, brdf_pdf: f32) -> f32 {
+    if (input.environment == ENVIRONMENT_HDRI) {
+        return mis_balance(brdf_pdf, get_environment_density(dir));
+    }
+    if (input.environment == ENVIRONMENT_SKY && dot(dir, skyState.sunDirection) >= SUN_CONE_COS) {
+        return mis_balance(brdf_pdf, get_sun_density(dir));
+    }
+    return 1.0;
+}
+
+fn make_shading_data(pos: vec3f, normal: vec3f, view_dir: vec3f, mat: Material) -> ShadingData {
+    var s: ShadingData;
+    s.pos = pos;
+    s.normal = normal;
+    s.out_dir = view_dir;
+    s.lambert_out = dot(normal, view_dir);
+    s.base_color = mat.base_color;
+    s.diffuse_albedo = mat.diffuse_albedo;
+    s.fresnel_0 = mat.fresnel_0;
+    s.roughness = mat.roughness;
+    return s;
+}
+
+struct ShiftResult {
+    f: vec3f,      // shifted integrand (as-if-sampled at the destination)
+    jacobian: f32, // PSS Jacobian; 0 marks the shift undefined
+}
+
+// Reconnection shift of a reservoir path onto a destination primary hit
+// (GRIS §7.4: reconnect at x2; direction copy for env suffixes — formulas
+// follow ReSTIR_PT Shift.slang::computeShiftedIntegrandReconnection).
+// Combined-lobe BSDF (lobe splitting arrives with the hybrid shift in P3).
+// use_prev evaluates in the previous frame's domain (the reverse shift for
+// temporal MIS): object-space rc data maps through the object's motion.
+// Visibility always uses the current scene (accepted approximation).
+// The RGB-copy spectral scheme: local BSDF weights are evaluated at the
+// frame's wavelengths and CMF-projected, then multiply the stored suffix
+// radiance componentwise.
+fn shift_reconnect(
+    r: Reservoir,
+    dst_s: ShadingData,
+    dst_reflectance: array<f32, WAVELENGTH_SAMPLE_COUNT>,
+    rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>,
+    src_s: ShadingData,
+    use_prev: bool,
+    iterations: ptr<function, u32>,
+) -> ShiftResult {
+    // RATIO composition: F_shift = F_src * (dst factors)/(src factors) for
+    // exactly the factors the shift changes (BSDFs, cosines, pdfs, MIS).
+    // Everything else (suffix radiance, RR compensation, wavelength set)
+    // cancels by construction — recomposing F from parts measured a
+    // systematic +1.2%/merge energy bias from estimator mismatch.
+    var out: ShiftResult;
+    out.f = vec3f(0.0);
+    out.jacobian = 0.0;
+    let d = r.path_flags & 15u;
+    if (d < 2u || !(r.w > 0.0)) {
+        return out;
+    }
+    let is_env_rc = (r.path_flags & PATH_FLAG_RC_ENV) != 0u;
+    let is_nee = (r.path_flags & PATH_FLAG_NEE) != 0u;
+
+    if (is_env_rc) {
+        // d = 2: x2 IS the environment — direction copy (world direction)
+        let wi = oct_decode(r.rc_wi_oct);
+        let lambert_dst = dot(dst_s.normal, wi);
+        let lambert_src = dot(src_s.normal, wi);
+        if (lambert_dst <= 0.0 || lambert_src <= 0.0) {
+            return out;
+        }
+        var vis_iter = 0u;
+        let occ = intersect_scene(Ray(dst_s.pos, wi), &vis_iter);
+        *iterations += vis_iter;
+        if (occ.object_index >= 0 || intersect_lights(Ray(dst_s.pos, wi)).index >= 0) {
+            return out;
+        }
+        let b_dst = frostbite_brdf(dst_s, wi);
+        // Component composition: destination factors x LUT-upsampled
+        // stored suffix radiance (ratio-to-source forms amplify source
+        // reconstruction error one-sidedly — measured energy inflation)
+        let l_w = spectral_env_weights(r.rc_radiance, rgb_and_phases);
+        var w_rgb = vec3f(0.0);
+        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+            w_rgb += (dst_reflectance[i] * b_dst.x + b_dst.y) * l_w[i] * rgb_and_phases[i].rgb;
+        }
+        w_rgb *= (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) * lambert_dst;
+        let pdf1_dst = get_frostbite_brdf_density(dst_s, wi);
+        let pdf1_src = get_frostbite_brdf_density(src_s, wi);
+        if (pdf1_src <= 0.0 || pdf1_dst <= 0.0) {
+            return out;
+        }
+        let lpdf = env_light_pdf(wi);
+        if (is_nee) {
+            if (lpdf <= 0.0) {
+                return out;
+            }
+            out.f = (w_rgb / lpdf) * mis_balance(lpdf, pdf1_dst);
+            out.jacobian = 1.0;
+        } else {
+            out.f = (w_rgb / pdf1_dst) * env_escape_mis(wi, pdf1_dst);
+            out.jacobian = pdf1_dst / pdf1_src;
+        }
+        if (!(out.jacobian > 0.0) || !(dot(out.f, vec3f(1.0)) < 1e20) || !(dot(out.f, vec3f(1.0)) >= 0.0)) {
+            out.f = vec3f(0.0);
+            out.jacobian = 0.0;
+        }
+        return out;
+    }
+
+    // Surface reconnection vertex, stored in its object's index space
+    let rc_obj = objects[(r.path_flags >> 8u) & 3u];
+    var rc_pos = (rc_obj.transform_inverse * vec4f(r.rc_pos, 1.0)).xyz;
+    var rc_n = normalize((rc_obj.transform_inverse * vec4f(oct_decode(r.rc_normal_oct), 0.0)).xyz);
+    var rc_wi = oct_decode(r.rc_wi_oct);
+    if (d >= 4u) {
+        rc_wi = normalize((rc_obj.transform_inverse * vec4f(rc_wi, 0.0)).xyz);
+    }
+    if (use_prev) {
+        rc_pos = (rc_obj.motion * vec4f(rc_pos, 1.0)).xyz;
+        rc_n = normalize((rc_obj.motion * vec4f(rc_n, 0.0)).xyz);
+        if (d >= 4u) {
+            rc_wi = normalize((rc_obj.motion * vec4f(rc_wi, 0.0)).xyz);
+        }
+    }
+
+    let dst_diff = rc_pos - dst_s.pos;
+    let dst_d2 = dot(dst_diff, dst_diff);
+    let dir = dst_diff * inverseSqrt(max(dst_d2, 1e-12));
+    let src_diff = rc_pos - src_s.pos;
+    let src_d2 = dot(src_diff, src_diff);
+    let src_dir = src_diff * inverseSqrt(max(src_d2, 1e-12));
+    let lambert_dst = dot(dst_s.normal, dir);
+    let lambert_src = dot(src_s.normal, src_dir);
+    // Grazing guard (symmetric => invertible => unbiased): near-parallel
+    // connections make the reconstruction ratio's denominator hinge on a
+    // tiny cosine whose relative error explodes — a one-sided (Jensen)
+    // energy inflation measured at silhouettes and the far ground. The
+    // footprint criteria (P3) subsume this with a principled bound.
+    const MIN_COS = 0.05;
+    if (lambert_dst <= MIN_COS || lambert_src <= MIN_COS || dst_d2 < 1e-6 || src_d2 < 1e-6) {
+        return out;
+    }
+
+    // Geometric Jacobian (GRIS Eq. 52): cosines at the rc vertex
+    let cos_dst = abs(dot(rc_n, dir));
+    let cos_src = abs(dot(rc_n, src_dir));
+    if (cos_src <= MIN_COS || cos_dst <= MIN_COS) {
+        return out;
+    }
+    var jacobian = (cos_dst / dst_d2) * (src_d2 / cos_src);
+
+    let pdf1_dst = get_frostbite_brdf_density(dst_s, dir);
+    let pdf1_src = get_frostbite_brdf_density(src_s, src_dir);
+    if (pdf1_dst <= 0.0 || pdf1_src <= 0.0) {
+        return out;
+    }
+    jacobian *= pdf1_dst / pdf1_src;
+
+    // rc shading data for both incomings
+    let rc_mat = materials[(r.path_flags >> 6u) & 3u];
+    // Back-facing reconnection is a shift FAILURE, not a normal flip: the
+    // initial sampler only ever produces front-facing x2 connections, so a
+    // flipped-normal evaluation manufactures energy the true integrand
+    // doesn't have (measured as +1.2%/merge concentrated at grazing
+    // geometry). Rejecting symmetrically keeps the shift invertible.
+    let rc_s = make_shading_data(rc_pos, rc_n, -dir, rc_mat);
+    if (rc_s.lambert_out <= 1e-4) {
+        return out;
+    }
+    let rc_src_s = make_shading_data(rc_pos, rc_n, -src_dir, rc_mat);
+    if (rc_src_s.lambert_out <= 1e-4) {
+        return out;
+    }
+    let lambert2_dst = dot(rc_s.normal, rc_wi);
+    let lambert2_src = dot(rc_src_s.normal, rc_wi);
+    if (lambert2_dst <= 0.0 || lambert2_src <= 0.0) {
+        return out;
+    }
+    var rc_refl: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    let rc_lagranges = prep_reflectance_real_lagrange_biased_3(fourier_srgb_to_fourier(rc_mat.base_color));
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        rc_refl[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, rc_lagranges);
+    }
+    let b1_dst = frostbite_brdf(dst_s, dir);
+    let b2_dst = frostbite_brdf(rc_s, rc_wi);
+    let l_w = spectral_env_weights(r.rc_radiance, rgb_and_phases);
+    var f_rgb = vec3f(0.0);
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        let w1d = dst_reflectance[i] * b1_dst.x + b1_dst.y;
+        let w2d = rc_refl[i] * b2_dst.x + b2_dst.y;
+        f_rgb += w1d * w2d * l_w[i] * rgb_and_phases[i].rgb;
+    }
+    f_rgb *= (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) * lambert_dst * lambert2_dst / pdf1_dst;
+
+    let pdf2_dst = get_frostbite_brdf_density(rc_s, rc_wi);
+    let pdf2_src = get_frostbite_brdf_density(rc_src_s, rc_wi);
+    if (is_nee && d == 3u) {
+        // Suffix = NEE at rc: light pdf is pixel-independent
+        let lpdf = env_light_pdf(rc_wi);
+        if (lpdf <= 0.0) {
+            return out;
+        }
+        f_rgb *= mis_balance(lpdf, pdf2_dst) / lpdf;
+    } else {
+        if (pdf2_dst <= 0.0 || pdf2_src <= 0.0) {
+            return out;
+        }
+        f_rgb /= pdf2_dst;
+        if (!is_nee && d == 3u) {
+            f_rgb *= env_escape_mis(rc_wi, pdf2_dst);
+        }
+        jacobian *= pdf2_dst / pdf2_src;
+    }
+
+    // Visibility: destination primary hit <-> rc vertex (current scene)
+    var vis_iter = 0u;
+    let occ = intersect_scene(Ray(dst_s.pos, dir), &vis_iter);
+    *iterations += vis_iter;
+    let dist = sqrt(dst_d2);
+    if (occ.distance < dist - max(0.01 * dist, 1e-3)) {
+        return out;
+    }
+    let l_hit = intersect_lights(Ray(dst_s.pos, dir));
+    if (l_hit.index >= 0 && l_hit.t < dist) {
+        return out;
+    }
+
+    // Jacobian rejection (ReSTIR_PT rejectShiftBasedOnJacobian): extreme
+    // reconnection Jacobians at voxel silhouettes carry a measurable energy
+    // bias; the rejection is symmetric in J <-> 1/J so both directions of
+    // the shift declare the same pairs undefined (unbiased)
+    if (max(jacobian, 1.0 / max(jacobian, 1e-9)) > 1.0 + JACOBIAN_REJECT_THRESHOLD) {
+        return out;
+    }
+    out.f = f_rgb;
+    out.jacobian = jacobian;
+    let fs = dot(out.f, vec3f(1.0));
+    if (!(out.jacobian > 0.0 && out.jacobian < 1e12) || !(fs < 1e20) || !(fs >= 0.0)) {
+        out.f = vec3f(0.0);
+        out.jacobian = 0.0;
+    }
+    return out;
+}
+
 
 const MAX_DIST: f32 = 1e7;
 const PI = 3.14159265359;
@@ -140,10 +459,13 @@ struct Intersection {
     object_index: i32,
     iterations: u32,
     normal: vec3f,
+    // Dense surface-voxel index at the hit (VDB objects; ~0u = none) for
+    // the paint and lighting caches
+    surface_index: u32,
 }
 
 fn no_intersection() -> Intersection {
-    return Intersection(MAX_DIST, -1, 0, vec3f(0));
+    return Intersection(MAX_DIST, -1, 0, vec3f(0), 0xffffffffu);
 }
 
 struct Ray {
@@ -157,6 +479,7 @@ fn intersect_picovdb(
     hit_distance: ptr<function, f32>,
     hit_normal: ptr<function, vec3f>,
     hit_iterations: ptr<function, u32>,
+    hit_surface: ptr<function, u32>,
 ) -> bool {
     let tmin = 0.0;
     let tmax = 10000.0;
@@ -173,9 +496,15 @@ fn intersect_picovdb(
         return true;
     }
 
-    return picovdbHDDAZeroCrossing(
-        &accessor, grid, ray.origin, tmin, ray.direction, tmax, input.pixel_radius, hit_distance, hit_normal, hit_iterations,
+    var hit_voxel = vec3i(0);
+    let hit = picovdbHDDAZeroCrossing(
+        &accessor, grid, ray.origin, tmin, ray.direction, tmax, input.pixel_radius, hit_distance, hit_normal, hit_iterations, &hit_voxel,
     );
+    if (hit && picovdbIsSurface(&accessor, grid, hit_voxel)) {
+        // The accessor's leaf cache is warm from the traversal at the hit
+        *hit_surface = picovdbGetSurfaceIndex(&accessor, grid, hit_voxel);
+    }
+    return hit;
 }
 
 // --- SDF primitives (local/index space) ---
@@ -258,12 +587,13 @@ fn intersect_scene(world_ray: Ray, iterations: ptr<function, u32>) -> Intersecti
         var hit_distance = MAX_DIST;
         var hit_normal = vec3f(0);
         var hit_iterations = 0u;
+        var hit_surface = 0xffffffffu;
         switch obj.object_type {
             case OBJECT_TYPE_VDB: {
                 // Skip fog grids during surface intersection — they use volumetric marching instead
                 let vdb_grid = picovdb_grids[obj.type_index];
                 if (vdb_grid.gridType != GRID_TYPE_FOG_FLOAT) {
-                    hit = intersect_picovdb(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);
+                    hit = intersect_picovdb(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations, &hit_surface);
                 }
             }
             case OBJECT_TYPE_SDF: {
@@ -287,6 +617,7 @@ fn intersect_scene(world_ray: Ray, iterations: ptr<function, u32>) -> Intersecti
         min_hit.distance = world_distance;
         min_hit.object_index = i;
         min_hit.normal = (obj.transform_inverse * vec4f(hit_normal, 0.0)).xyz;
+        min_hit.surface_index = hit_surface;
     }
     min_hit.normal = normalize(min_hit.normal);
     return min_hit;
@@ -580,168 +911,6 @@ fn intersect_lights(ray: Ray) -> LightHit {
     return best;
 }
 
-// ============================================================================
-// ReSTIR DI (temporal-only v1, see docs/restir-plan.md step R1)
-//
-// Per-pixel reservoirs over *direction* samples at the primary hit, in
-// solid-angle measure anchored at the shading point. Candidates come from
-// every light-sampling technique we have (lamps, HDRI CDF, sun cone, cosine
-// hemisphere, one BRDF sample) under their mixture pdf; temporal reuse
-// merges the previous frame's reservoir after a shading-position validation
-// (so the shift-mapping Jacobian is ~1 and reuse survives accumulation
-// resets). One shadow ray shades the winner. Spatial (paired) reuse and
-// unbiased MIS-weighted merging are follow-ups.
-// ============================================================================
-
-const RESTIR_LAMP_CANDIDATES: u32 = 4u;
-const RESTIR_ENV_CANDIDATES: u32 = 4u;
-const RESTIR_M_INIT: f32 = 9.0; // lamps + env + 1 BRDF candidate
-// Low cap = fast sample turnover: shading correlated (locked) reservoirs
-// into the accumulator freezes noise into the image
-const RESTIR_CONFIDENCE_CAP: f32 = 64.0;
-
-fn luminance(c: vec3f) -> f32 {
-    return dot(c, vec3f(0.2126, 0.7152, 0.0722));
-}
-
-// Unshadowed emitted radiance (RGB) reaching pos from direction dir:
-// analytic lamp hit or the environment. No rays traced.
-fn direct_radiance_rgb(pos: vec3f, dir: vec3f) -> vec3f {
-    let light_hit = intersect_lights(Ray(pos, dir));
-    if (light_hit.index >= 0) {
-        return vec3f(input.emission_integral);
-    }
-    if (input.environment == ENVIRONMENT_STUDIO) {
-        return vec3f(input.dome_integral);
-    }
-    return environment_rgb(dir);
-}
-
-// Scalar target function p-hat: luminance of the unshadowed contribution.
-fn restir_target(s: ShadingData, lum_albedo: f32, dir: vec3f) -> f32 {
-    let lambert = dot(s.normal, dir);
-    if (lambert <= 0.0) {
-        return 0.0;
-    }
-    let brdf = frostbite_brdf(s, dir);
-    return (lum_albedo * brdf.x + brdf.y) * lambert * luminance(direct_radiance_rgb(s.pos, dir));
-}
-
-// True mixture pdf of the initial-candidate pool for a direction.
-fn restir_source_pdf(s: ShadingData, total_light_importance: f32, dir: vec3f) -> f32 {
-    var m = f32(RESTIR_LAMP_CANDIDATES) * get_lights_density(total_light_importance, s.pos, dir, false);
-    if (input.environment == ENVIRONMENT_HDRI) {
-        m += f32(RESTIR_ENV_CANDIDATES) * get_environment_density(dir);
-    } else if (input.environment == ENVIRONMENT_SKY) {
-        m += f32(RESTIR_ENV_CANDIDATES / 2u) * get_sun_density(dir);
-        m += f32(RESTIR_ENV_CANDIDATES - RESTIR_ENV_CANDIDATES / 2u) * get_hemisphere_psa_density(dot(s.normal, dir));
-    } else {
-        m += f32(RESTIR_ENV_CANDIDATES) * get_hemisphere_psa_density(dot(s.normal, dir));
-    }
-    m += get_frostbite_brdf_density(s, dir);
-    return m / RESTIR_M_INIT;
-}
-
-struct Reservoir {
-    dir: vec3f,
-    w_sum: f32,
-    M: f32,
-}
-
-fn reservoir_update(r: ptr<function, Reservoir>, dir: vec3f, w: f32, rand: f32) {
-    (*r).w_sum += w;
-    if (w > 0.0 && rand * (*r).w_sum <= w) {
-        (*r).dir = dir;
-    }
-}
-
-fn restir_candidate(r: ptr<function, Reservoir>, s: ShadingData, lum_albedo: f32, total_light_importance: f32, dir: vec3f, rand: f32) {
-    if (dot(dir, dir) < 0.5) {
-        return; // degenerate sample (e.g. no lamps); still counted in M_INIT
-    }
-    let q = restir_source_pdf(s, total_light_importance, dir);
-    if (q <= 0.0) {
-        return;
-    }
-    reservoir_update(r, dir, restir_target(s, lum_albedo, dir) / q, rand);
-}
-
-// Paired-neighbor delta for the current pixel from one pairing texture,
-// with the per-frame random flip/offset transform applied. Flips of the
-// lookup coordinate require flipping the delta back (keeps A<->B mutual).
-fn pairing_delta(delta_raw: vec2i, flip: vec2u) -> vec2i {
-    return vec2i(
-        select(delta_raw.x, -delta_raw.x, flip.x == 1u),
-        select(delta_raw.y, -delta_raw.y, flip.y == 1u),
-    );
-}
-
-fn pairing_coord(pixel: vec2u, tex_dims: vec2u, transform: vec4u) -> vec2u {
-    var p = vec2u(pixel.x % tex_dims.x, pixel.y % tex_dims.y);
-    if (transform.z == 1u) {
-        p.x = tex_dims.x - 1u - p.x;
-    }
-    if (transform.w == 1u) {
-        p.y = tex_dims.y - 1u - p.y;
-    }
-    return vec2u((p.x + transform.x) % tex_dims.x, (p.y + transform.y) % tex_dims.y);
-}
-
-// Target function evaluated at a spatial neighbor's surface, reconstructed
-// from the reservoir position, G-buffer normal/material, and the previous
-// camera position (their view direction). Needed for pairwise-balance MIS.
-fn restir_target_at(pos: vec3f, normal: vec3f, mat_index: u32, dir: vec3f) -> f32 {
-    let lambert = dot(normal, dir);
-    if (lambert <= 0.0) {
-        return 0.0;
-    }
-    let mat = materials[mat_index];
-    var ns: ShadingData;
-    ns.pos = pos;
-    ns.normal = normal;
-    ns.out_dir = normalize(input.prev_camera_pos - pos);
-    ns.lambert_out = max(dot(normal, ns.out_dir), 1e-4);
-    ns.base_color = mat.base_color;
-    ns.diffuse_albedo = mat.diffuse_albedo;
-    ns.fresnel_0 = mat.fresnel_0;
-    ns.roughness = mat.roughness;
-    let brdf = frostbite_brdf(ns, dir);
-    return (luminance(mat.base_color) * brdf.x + brdf.y) * lambert * luminance(direct_radiance_rgb(pos, dir));
-}
-
-// One spatial neighbor's previous-frame state for the pairwise-MIS merge
-struct SpatialNeighbor {
-    dir: vec3f,
-    w: f32,   // unbiased contribution weight W (may be 0: dead reservoir)
-    m: f32,   // confidence, capped (neighbors are hints)
-    pos: vec3f,
-    normal: vec3f,
-    mat_index: u32,
-    valid: bool,
-}
-
-fn load_spatial_neighbor(neighbor: vec2i, dims: vec2i) -> SpatialNeighbor {
-    var out: SpatialNeighbor;
-    out.valid = false;
-    if (any(neighbor < vec2i(0)) || any(neighbor >= dims)) {
-        return out;
-    }
-    let a = textureLoad(reservoir_prev_a, neighbor, 0);
-    let b = textureLoad(reservoir_prev_b, neighbor, 0);
-    let g = textureLoad(gbuffer_prev, neighbor, 0);
-    let m = min(b.w, 20.0);
-    if (m <= 0.0 || g.w >= 900.0 || !(a.w >= 0.0 && a.w < 1e12)) {
-        return out;
-    }
-    out.dir = a.xyz;
-    out.w = a.w;
-    out.m = m;
-    out.pos = b.xyz;
-    out.normal = g.xyz;
-    out.mat_index = u32(g.w);
-    out.valid = out.mat_index < MAX_MATERIALS;
-    return out;
-}
 
 // ============================================================================
 // Path tracing
@@ -759,6 +928,37 @@ fn environment_rgb(direction: vec3f) -> vec3f {
         return textureSampleLevel(environment_texture, illuminant_sampler, vec2f(u, v), 0.0).rgb * input.dome_integral;
     }
     return skyRadianceRGB(direction, true);
+}
+
+// Spectral upsampling of RGB radiance via the 33^3 Fourier-sRGB LUT:
+// returns the per-wavelength radiance a(phase_i) * maxcomp for the frame's
+// 4 sampled wavelengths. The LUT is indexed by sRGB-ENCODED chroma and
+// stores sRGB-encoded Fourier sRGB (same convention as material textures).
+fn srgb_encode3(v: vec3f) -> vec3f {
+    let lo = v * 12.92;
+    let hi = 1.055 * pow(max(v, vec3f(1e-6)), vec3f(1.0 / 2.4)) - 0.055;
+    return select(hi, lo, v <= vec3f(0.0031308));
+}
+
+fn srgb_decode3(v: vec3f) -> vec3f {
+    let lo = v / 12.92;
+    let hi = pow((v + 0.055) / 1.055, vec3f(2.4));
+    return select(hi, lo, v <= vec3f(0.04045));
+}
+
+fn spectral_env_weights(rgb: vec3f, rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>) -> vec4f {
+    let m = max(max(rgb.r, rgb.g), max(rgb.b, 1e-6));
+    let enc = srgb_encode3(clamp(rgb / m, vec3f(0.0), vec3f(1.0)));
+    // 33^3 grid: map [0,1] onto texel centers
+    let uvw = enc * (32.0 / 33.0) + (0.5 / 33.0);
+    let fsrgb = srgb_decode3(textureSampleLevel(fourier_lut_3d, illuminant_sampler, uvw, 0.0).rgb);
+    let lagranges = prep_reflectance_real_lagrange_biased_3(fourier_srgb_to_fourier(fsrgb));
+    return m * vec4f(
+        eval_reflectance_real_lagrange_3(rgb_and_phases[0].w, lagranges),
+        eval_reflectance_real_lagrange_3(rgb_and_phases[1].w, lagranges),
+        eval_reflectance_real_lagrange_3(rgb_and_phases[2].w, lagranges),
+        eval_reflectance_real_lagrange_3(rgb_and_phases[3].w, lagranges),
+    );
 }
 
 // ============================================================================
@@ -870,21 +1070,15 @@ fn sample_environment(randoms: vec2f, out_pdf: ptr<function, f32>) -> vec3f {
 // Spectral path tracing with NEE and MIS (Peters' method): jittered-
 // stratified wavelength samples from the illuminant LUT, one throughput
 // weight per wavelength.
-fn clear_reservoir(pixel: vec2u) {
-    textureStore(reservoir_out_a, pixel, vec4f(0.0));
-    textureStore(reservoir_out_b, pixel, vec4f(0.0));
+fn clear_gbuffer(pixel: vec2u) {
     textureStore(gbuffer_out, pixel, vec4f(0.0, 0.0, 0.0, 999.0));
 }
 
 fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>) -> vec3f {
     var ray = ray_in;
-    let use_restir = input.restir == 1u;
     // MIS weight applied when a BRDF-sampled ray reaches the environment
     // (competes with sample_environment() NEE from the previous vertex)
     var env_weight = 1.0;
-    // With ReSTIR, emission seen from the primary hit (k == 2 arrivals) is
-    // entirely the reservoir's job — this zeroes it to avoid double counting
-    var direct_scale = 1.0;
 
     var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
     var throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
@@ -904,10 +1098,10 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
         // Direct view / BRDF-sampled hit of a light: MIS-weighted emission
         if (light_hit.index >= 0 && light_hit.t < hit.distance) {
             for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                radiance += (nee_throughput[i] * direct_scale * input.emission_integral) * rgb_and_phases[i].rgb;
+                radiance += (nee_throughput[i] * input.emission_integral) * rgb_and_phases[i].rgb;
             }
             if (k == 1u) {
-                clear_reservoir(pixel);
+                clear_gbuffer(pixel);
             }
             break;
         }
@@ -915,7 +1109,7 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
         // HDRI are RGB-only and approximated with the mean throughput.
         if (hit.object_index < 0) {
             if (k == 1u) {
-                clear_reservoir(pixel);
+                clear_gbuffer(pixel);
             }
             // Primary-ray miss with the white backdrop: display-only white
             // (scaled so it tonemaps to white); the path ends, so the
@@ -926,7 +1120,7 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
             }
             if (input.environment == ENVIRONMENT_STUDIO) {
                 for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                    radiance += (throughput[i] * direct_scale * input.dome_integral) * rgb_and_phases[i].rgb;
+                    radiance += (throughput[i] * input.dome_integral) * rgb_and_phases[i].rgb;
                 }
             } else if (input.environment == ENVIRONMENT_SKY) {
                 // Sky radiance inside the sun cone (disk + circumsolar halo)
@@ -936,11 +1130,17 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
                 if (dot(ray.direction, skyState.sunDirection) >= SUN_CONE_COS) {
                     env *= env_weight;
                 }
-                let mean = (throughput[0] + throughput[1] + throughput[2] + throughput[3]) * 0.25;
-                radiance += (mean * direct_scale) * env;
+                let env_w = spectral_env_weights(env, rgb_and_phases);
+                for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                    radiance += (throughput[i] * env_w[i]) * rgb_and_phases[i].rgb;
+                }
             } else {
-                let mean = (throughput[0] + throughput[1] + throughput[2] + throughput[3]) * 0.25;
-                radiance += (mean * env_weight * direct_scale) * environment_rgb(ray.direction);
+                // Spectrally upsampled through the Fourier LUT so env chroma
+                // multiplies surface chroma per wavelength
+                let env_w = spectral_env_weights(environment_rgb(ray.direction), rgb_and_phases);
+                for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                    radiance += (throughput[i] * env_weight * env_w[i]) * rgb_and_phases[i].rgb;
+                }
             }
             break;
         }
@@ -978,211 +1178,21 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
 
         if (k == input.max_bounces) {
             if (k == 1u) {
-                clear_reservoir(pixel);
+                clear_gbuffer(pixel);
             }
             break;
         }
 
-        // === ReSTIR DI at the primary hit ===
-        if (use_restir && k == 1u) {
-            let lum_albedo = luminance(s.base_color);
-            var tli = 0.0;
-            for (var i = 0u; i < input.light_count; i++) {
-                tli += get_spherical_light_importance(lights[i].xyz, lights[i].w, s.pos, s.normal);
-            }
-            var r: Reservoir;
-            r.dir = vec3f(0.0);
-            r.w_sum = 0.0;
-            r.M = RESTIR_M_INIT;
-            // Initial candidates (no rays: target is unshadowed)
-            for (var c = 0u; c < RESTIR_LAMP_CANDIDATES; c++) {
-                var unused: f32;
-                let dir = sample_lights(&unused, s.pos, s.normal, get_random_numbers(seed));
-                restir_candidate(&r, s, lum_albedo, tli, dir, get_random_numbers(seed).x);
-            }
-            let shading_space = get_shading_space(s.normal);
-            for (var c = 0u; c < RESTIR_ENV_CANDIDATES; c++) {
-                var dir: vec3f;
-                if (input.environment == ENVIRONMENT_HDRI) {
-                    var env_pdf_unused: f32;
-                    dir = sample_environment(get_random_numbers(seed), &env_pdf_unused);
-                } else if (input.environment == ENVIRONMENT_SKY && c < RESTIR_ENV_CANDIDATES / 2u) {
-                    dir = sample_sun(get_random_numbers(seed));
-                } else {
-                    dir = shading_space * sample_hemisphere_psa(get_random_numbers(seed));
-                }
-                restir_candidate(&r, s, lum_albedo, tli, dir, get_random_numbers(seed).x);
-            }
-            restir_candidate(&r, s, lum_albedo, tli, sample_frostbite_brdf(s, get_random_numbers(seed)), get_random_numbers(seed).x);
-
-            // Temporal reuse with motion-vector reprojection: find where
-            // this surface point was last frame (object motion + previous
-            // camera), and validate the stored reservoir belonged to it —
-            // ReSTIR's own invalidation, independent of PT accumulation.
-            if (input.reservoir_valid == 1u) {
-                let dims = vec2i(textureDimensions(reservoir_prev_a));
-                let pos_prev = (obj.motion * vec4f(s.pos, 1.0)).xyz;
-                let cam_prev = (input.prev_view * vec4f(pos_prev, 1.0)).xyz;
-                if (cam_prev.z < 0.0) {
-                    let aspect = f32(dims.x) / f32(dims.y);
-                    let uv = vec2f(
-                        (cam_prev.x / (-cam_prev.z)) / (aspect * input.fov_scale),
-                        (cam_prev.y / (-cam_prev.z)) / input.fov_scale,
-                    ) * 0.5 + 0.5;
-                    let prev_pixel = vec2i(uv * vec2f(dims));
-                    if (all(prev_pixel >= vec2i(0)) && all(prev_pixel < dims)) {
-                        let prev_a = textureLoad(reservoir_prev_a, prev_pixel, 0);
-                        let prev_b = textureLoad(reservoir_prev_b, prev_pixel, 0);
-                        let prev_m = min(prev_b.w, RESTIR_CONFIDENCE_CAP);
-                        let pos_eps = 0.01 * hit.distance + 1e-3;
-                        if (prev_m > 0.0 && prev_a.w > 0.0 && prev_a.w < 1e12 &&
-                            distance(prev_b.xyz, pos_prev) < pos_eps) {
-                            let f_prev = restir_target(s, lum_albedo, prev_a.xyz);
-                            reservoir_update(&r, prev_a.xyz, f_prev * prev_a.w * prev_m, get_random_numbers(seed).x);
-                            r.M += prev_m;
-                        }
-                    }
-                }
-            }
-
-            // Paired spatial reuse — SHADING ONLY (persisting neighbor mass
-            // creates mutual A<->B feedback that inflates energy). Merged
-            // with pairwise-balance MIS: every sample is weighted by
-            // confidence x its own surface's target over the sum across all
-            // participating surfaces, so the weights partition unity and
-            // the naive-M bias disappears. Target evals are ray-free.
-            var neighbors: array<SpatialNeighbor, 3>;
-            if (input.reservoir_valid == 1u) {
-                let dims_i = vec2i(textureDimensions(reservoir_prev_a));
-                {
-                    let t = input.pairing[0];
-                    let td = textureDimensions(pairing_0);
-                    let d = pairing_delta(textureLoad(pairing_0, pairing_coord(pixel, td, t), 0).xy, t.zw);
-                    neighbors[0] = load_spatial_neighbor(vec2i(pixel) + d, dims_i);
-                }
-                {
-                    let t = input.pairing[1];
-                    let td = textureDimensions(pairing_1);
-                    let d = pairing_delta(textureLoad(pairing_1, pairing_coord(pixel, td, t), 0).xy, t.zw);
-                    neighbors[1] = load_spatial_neighbor(vec2i(pixel) + d, dims_i);
-                }
-                {
-                    let t = input.pairing[2];
-                    let td = textureDimensions(pairing_2);
-                    let d = pairing_delta(textureLoad(pairing_2, pairing_coord(pixel, td, t), 0).xy, t.zw);
-                    neighbors[2] = load_spatial_neighbor(vec2i(pixel) + d, dims_i);
-                }
-            }
-
-            var merged: Reservoir;
-            merged.dir = vec3f(0.0);
-            merged.w_sum = 0.0;
-            merged.M = 0.0;
-            let c_c = r.M;
-            // Canonical (temporal-chain) sample
-            let p_c_yc = restir_target(s, lum_albedo, r.dir);
-            if (p_c_yc > 0.0 && r.w_sum > 0.0) {
-                let w_canonical = r.w_sum / (r.M * p_c_yc);
-                var denom = c_c * p_c_yc;
-                for (var l = 0u; l < 3u; l++) {
-                    if (neighbors[l].valid) {
-                        denom += neighbors[l].m * restir_target_at(neighbors[l].pos, neighbors[l].normal, neighbors[l].mat_index, r.dir);
-                    }
-                }
-                if (denom > 0.0) {
-                    let mis = c_c * p_c_yc / denom;
-                    reservoir_update(&merged, r.dir, mis * p_c_yc * w_canonical, get_random_numbers(seed).x);
-                }
-            }
-            // Neighbor samples
-            for (var i = 0u; i < 3u; i++) {
-                if (!neighbors[i].valid || neighbors[i].w <= 0.0) {
-                    continue;
-                }
-                let y = neighbors[i].dir;
-                let p_c_y = restir_target(s, lum_albedo, y);
-                if (p_c_y <= 0.0) {
-                    continue;
-                }
-                var denom = c_c * p_c_y;
-                var p_own = 0.0;
-                for (var l = 0u; l < 3u; l++) {
-                    if (neighbors[l].valid) {
-                        let p_l = restir_target_at(neighbors[l].pos, neighbors[l].normal, neighbors[l].mat_index, y);
-                        denom += neighbors[l].m * p_l;
-                        if (l == i) {
-                            p_own = p_l;
-                        }
-                    }
-                }
-                if (denom > 0.0 && p_own > 0.0) {
-                    let mis = neighbors[i].m * p_own / denom;
-                    reservoir_update(&merged, y, mis * p_c_y * neighbors[i].w, get_random_numbers(seed).x);
-                }
-            }
-
-            // Contribution weight (MIS weights partition unity: no 1/M)
-            let f_shade = restir_target(s, lum_albedo, merged.dir);
-            var big_w = 0.0;
-            if (f_shade > 0.0) {
-                big_w = merged.w_sum / f_shade;
-            }
-
-            // Shade the winner with one shadow ray
-            if (big_w > 0.0) {
-                let shade_ray = Ray(s.pos, merged.dir);
-                let shade_light = intersect_lights(shade_ray);
-                var shade_iterations = 0u;
-                let occluder = intersect_scene(shade_ray, &shade_iterations);
-                *iterations += shade_iterations;
-                let lambert = dot(s.normal, merged.dir);
-                let brdf = frostbite_brdf(s, merged.dir);
-                if (shade_light.index >= 0) {
-                    if (occluder.distance > shade_light.t) {
-                        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                            radiance += (throughput[i] * (reflectance[i] * brdf.x + brdf.y) * lambert * big_w * input.emission_integral) * rgb_and_phases[i].rgb;
-                        }
-                    }
-                } else if (occluder.object_index < 0) {
-                    if (input.environment == ENVIRONMENT_STUDIO) {
-                        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                            radiance += (throughput[i] * (reflectance[i] * brdf.x + brdf.y) * lambert * big_w * input.dome_integral) * rgb_and_phases[i].rgb;
-                        }
-                    } else {
-                        var mean_weight = 0.0;
-                        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                            mean_weight += throughput[i] * (reflectance[i] * brdf.x + brdf.y);
-                        }
-                        mean_weight *= 0.25;
-                        radiance += (mean_weight * lambert * big_w) * environment_rgb(merged.dir);
-                    }
-                }
-            }
-
-            // Persist the TEMPORAL-only reservoir. No visibility feedback:
-            // zeroing occluded winners preferentially keeps visible samples
-            // whose weights were normalized against the UNSHADOWED target —
-            // a selection effect that inflates energy wherever visibility
-            // varies (measured +19% on the ground). Visibility applied at
-            // shading keeps the estimator's energy correct; the low
-            // confidence cap + spatial shading smoothing handle the
-            // penumbra variance that feedback originally addressed.
-            let f_store = restir_target(s, lum_albedo, r.dir);
-            var w_store = 0.0;
-            if (f_store > 0.0) {
-                w_store = r.w_sum / (r.M * f_store);
-            }
-            textureStore(reservoir_out_a, pixel, vec4f(r.dir, w_store));
-            textureStore(reservoir_out_b, pixel, vec4f(s.pos, r.M));
+        // Primary-hit G-buffer (normal + material) for denoise passes
+        if (k == 1u) {
             textureStore(gbuffer_out, pixel, vec4f(s.normal, f32(obj.material_index)));
         }
 
         // Next event estimation: sample a direction towards a light
-        // (vertex 1 direct lighting is handled by ReSTIR when enabled)
         var total_light_importance: f32;
         let light_dir = sample_lights(&total_light_importance, s.pos, s.normal, get_random_numbers(seed));
         let lambert_in_0 = dot(s.normal, light_dir);
-        if (lambert_in_0 > 0.0 && !(use_restir && k == 1u)) {
+        if (lambert_in_0 > 0.0) {
             // Check visibility: the sampled ray must reach a light before any
             // scene surface
             let nee_ray = Ray(s.pos, light_dir);
@@ -1207,7 +1217,7 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
         // Sun NEE (sky): sample the solar cone, MIS-weighted against BRDF
         // sampling. Samples blocked by lamps or scene geometry contribute
         // nothing, keeping lamp MIS independent.
-        if (input.environment == ENVIRONMENT_SKY && !(use_restir && k == 1u)) {
+        if (input.environment == ENVIRONMENT_SKY) {
             let sun_dir = sample_sun(get_random_numbers(seed));
             let lambert_sun = dot(s.normal, sun_dir);
             if (lambert_sun > 0.0) {
@@ -1220,12 +1230,11 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
                     let brdf_density_sun = get_frostbite_brdf_density(s, sun_dir);
                     let brdf_sun = frostbite_brdf(s, sun_dir);
                     let sun_scale = lambert_sun / (get_sun_density(sun_dir) + brdf_density_sun);
-                    var mean_weight = 0.0;
+                    let sun_w = spectral_env_weights(skyRadianceRGB(sun_dir, true), rgb_and_phases);
                     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                        mean_weight += throughput[i] * (reflectance[i] * brdf_sun.x + brdf_sun.y);
+                        let thr = throughput[i] * (reflectance[i] * brdf_sun.x + brdf_sun.y);
+                        radiance += (thr * sun_scale) * sun_w[i] * rgb_and_phases[i].rgb;
                     }
-                    mean_weight *= 1.0 / f32(WAVELENGTH_SAMPLE_COUNT);
-                    radiance += (mean_weight * sun_scale) * skyRadianceRGB(sun_dir, true);
                 }
             }
         }
@@ -1234,7 +1243,7 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
         // MIS-weighted against BRDF sampling (balance heuristic). Lamp NEE
         // never produces env contributions and env samples blocked by lamps
         // are discarded, so lamp and env MIS stay independent.
-        if (input.environment == ENVIRONMENT_HDRI && !(use_restir && k == 1u)) {
+        if (input.environment == ENVIRONMENT_HDRI) {
             var env_pdf: f32;
             let env_dir = sample_environment(get_random_numbers(seed), &env_pdf);
             let lambert_env = dot(s.normal, env_dir);
@@ -1248,14 +1257,12 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
                     let brdf_density_env = get_frostbite_brdf_density(s, env_dir);
                     let brdf_env = frostbite_brdf(s, env_dir);
                     let env_scale = lambert_env / (env_pdf + brdf_density_env);
-                    // RGB environment: apply with the mean spectral weight
-                    // (same approximation as the miss path)
-                    var mean_weight = 0.0;
+                    // Spectrally upsampled RGB environment (Fourier LUT)
+                    let nee_env_w = spectral_env_weights(environment_rgb(env_dir), rgb_and_phases);
                     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                        mean_weight += throughput[i] * (reflectance[i] * brdf_env.x + brdf_env.y);
+                        let thr = throughput[i] * (reflectance[i] * brdf_env.x + brdf_env.y);
+                        radiance += (thr * env_scale) * nee_env_w[i] * rgb_and_phases[i].rgb;
                     }
-                    mean_weight *= 1.0 / f32(WAVELENGTH_SAMPLE_COUNT);
-                    radiance += (mean_weight * env_scale) * environment_rgb(env_dir);
                 }
             }
         }
@@ -1277,8 +1284,6 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
         } else if (input.environment == ENVIRONMENT_SKY) {
             env_weight = brdf_density_1 / (brdf_density_1 + get_sun_density(ray.direction));
         }
-        // ReSTIR owns everything the primary hit sees directly
-        direct_scale = select(1.0, 0.0, use_restir && k == 1u);
         for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
             let brdf_lambert_1_spectral = reflectance[i] * brdf_lambert_1.x + brdf_lambert_1.y;
             nee_throughput[i] = throughput[i] * brdf_lambert_1_spectral * mis_factor;
@@ -1305,6 +1310,481 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
     return radiance * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT));
 }
 
+// ============================================================================
+// ReSTIR PT initial sampling (plan P0): the same path tree as path_trace,
+// but every contribution becomes a RIS candidate instead of being summed.
+// One representative path per pixel survives, with unbiased contribution
+// weight W = sum(luminance(F_i)) / luminance(F_Y); shading with F*W has the
+// same expected value as the full sum (candidates cover disjoint strata of
+// the path space, so MIS weights between candidates are 1).
+//
+// Reconnection-vertex bookkeeping targets the reconnection shift at x2
+// (GRIS §7.4 baseline; footprint criteria arrive in P3): the stored suffix
+// is the incident radiance at x2 (excluding x2's BSDF) plus its direction,
+// or the environment direction itself for paths whose x2 is the env vertex.
+// ============================================================================
+fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>) {
+    var ray = ray_in;
+    var env_weight = 1.0;
+
+    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
+    var throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    var nee_throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    let wavelength_rand = get_random_numbers(seed).x;
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        let u = wavelength_rand * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
+        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
+        throughput[i] = 1.0;
+        nee_throughput[i] = 1.0;
+    }
+    let spectral_norm = 1.0 / f32(WAVELENGTH_SAMPLE_COUNT);
+
+    // Streaming RIS state
+    var w_sum = 0.0;
+    var sel_f = vec3f(0.0);
+    var sel_flags = 0u;
+    var sel_rc_pos = vec3f(0.0);
+    var sel_rc_normal = vec3f(0.0, 0.0, 1.0);
+    var sel_rc_wi = vec3f(0.0);
+    var sel_rc_radiance = vec3f(0.0);
+    var sel_rc_pdf = 0.0;
+
+    // Reconnection-vertex (x2) tracking. Positions/normals are stored in
+    // the owning object's INDEX space so rigid motion never stales them;
+    // suffix directions are world for d == 3 (they point at the env) and
+    // index space for deeper suffixes.
+    var x2_pos = vec3f(0.0);        // index space
+    var x2_normal = vec3f(0.0, 0.0, 1.0); // index space
+    var x2_meta = 0u;               // material/object bits for path_flags
+    var have_x2 = false;
+    var x2_brdf_dir = vec3f(0.0);       // world
+    var x2_brdf_dir_idx = vec3f(0.0);   // index space
+    var x2_brdf_pdf = 0.0;
+    var thr2: array<f32, WAVELENGTH_SAMPLE_COUNT>; // throughput after x2's BSDF (suffix divider)
+    var have_thr2 = false;
+    var sel_init_seed = input.rng_frame;
+
+    for (var k = 1u; k <= input.max_bounces; k++) {
+        let light_hit = intersect_lights(ray);
+        let hit = intersect_scene(ray, iterations);
+        // BSDF-sampled hit of a lamp: MIS-weighted emission
+        if (light_hit.index >= 0 && light_hit.t < hit.distance) {
+            var c = vec3f(0.0);
+            var inc = vec3f(0.0);
+            for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                let ci = nee_throughput[i] * input.emission_integral;
+                c += ci * rgb_and_phases[i].rgb;
+                if (have_thr2) {
+                    inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                }
+            }
+            c *= spectral_norm;
+            inc *= spectral_norm;
+            let pl = luminance(c);
+            if (pl > 0.0) {
+                w_sum += pl;
+                if (get_random_numbers(seed).x * w_sum < pl) {
+                    sel_f = c;
+                    sel_flags = k | x2_meta; // d = k (x_k on the lamp)
+                    sel_rc_pos = x2_pos;
+                    sel_rc_normal = x2_normal;
+                    sel_rc_wi = x2_brdf_dir_idx;
+                    sel_rc_radiance = inc;
+                    sel_rc_pdf = x2_brdf_pdf;
+                }
+            }
+            if (k == 1u) {
+                clear_gbuffer(pixel);
+            }
+            break;
+        }
+        // Miss: environment (or the display-only white backdrop at k == 1)
+        if (hit.object_index < 0) {
+            if (k == 1u) {
+                clear_gbuffer(pixel);
+            }
+            if (k == 1u && input.white_background == 1u) {
+                // Matches the reference exactly: its backdrop constant also
+                // passes through the final 1/WAVELENGTH_SAMPLE_COUNT division
+                let c = vec3f(6.0 / input.exposure) * spectral_norm;
+                w_sum = luminance(c);
+                sel_f = c;
+                sel_flags = 1u;
+                break;
+            }
+            var c = vec3f(0.0);
+            var inc = vec3f(0.0);
+            var env_rgb = vec3f(0.0);
+            if (input.environment == ENVIRONMENT_STUDIO) {
+                for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                    let ci = throughput[i] * input.dome_integral;
+                    c += ci * rgb_and_phases[i].rgb;
+                    if (have_thr2) {
+                        inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                    }
+                }
+                env_rgb = vec3f(input.dome_integral);
+            } else if (input.environment == ENVIRONMENT_SKY) {
+                env_rgb = skyRadianceRGB(ray.direction, true); // raw
+                var env = env_rgb;
+                if (dot(ray.direction, skyState.sunDirection) >= SUN_CONE_COS) {
+                    env *= env_weight;
+                }
+                let env_w = spectral_env_weights(env, rgb_and_phases);
+                for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                    let ci = throughput[i] * env_w[i];
+                    c += ci * rgb_and_phases[i].rgb;
+                    if (have_thr2) {
+                        inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                    }
+                }
+            } else {
+                env_rgb = environment_rgb(ray.direction); // raw: shift re-derives MIS
+                let env_w = spectral_env_weights(environment_rgb(ray.direction), rgb_and_phases);
+                for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                    let ci = throughput[i] * env_weight * env_w[i];
+                    c += ci * rgb_and_phases[i].rgb;
+                    if (have_thr2) {
+                        inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                    }
+                }
+            }
+            c *= spectral_norm;
+            inc *= spectral_norm;
+            let pl = luminance(c);
+            if (pl > 0.0) {
+                w_sum += pl;
+                if (get_random_numbers(seed).x * w_sum < pl) {
+                    sel_f = c;
+                    sel_flags = k; // d = k (x_k on the environment)
+                    if (k == 2u) {
+                        // x2 IS the env vertex: reconnect by direction copy
+                        sel_flags |= PATH_FLAG_RC_ENV;
+                        sel_rc_pos = ray.direction;
+                        sel_rc_normal = -ray.direction;
+                        sel_rc_wi = ray.direction;
+                        sel_rc_radiance = env_rgb; // raw; MIS re-derived at shift
+                        sel_rc_pdf = x2_brdf_pdf;
+                    } else if (k == 3u) {
+                        // Suffix escaped right after rc: store the raw env and
+                        // the WORLD direction so the shift re-derives its MIS
+                        sel_flags |= x2_meta;
+                        sel_rc_pos = x2_pos;
+                        sel_rc_normal = x2_normal;
+                        sel_rc_wi = ray.direction;
+                        sel_rc_radiance = env_rgb;
+                        sel_rc_pdf = x2_brdf_pdf;
+                    } else {
+                        sel_flags |= x2_meta;
+                        sel_rc_pos = x2_pos;
+                        sel_rc_normal = x2_normal;
+                        sel_rc_wi = x2_brdf_dir_idx;
+                        sel_rc_radiance = inc;
+                        sel_rc_pdf = x2_brdf_pdf;
+                    }
+                }
+            }
+            break;
+        }
+
+        // Shading data at the hit point
+        let obj = objects[hit.object_index];
+        let mat = materials[obj.material_index];
+        var s: ShadingData;
+        s.pos = ray.origin + ray.direction * hit.distance;
+        s.normal = hit.normal;
+        if (!(dot(s.normal, s.normal) > 0.5)) {
+            s.normal = -ray.direction;
+        }
+        if (dot(s.normal, ray.direction) > 0.0) {
+            s.normal = -s.normal;
+        }
+        s.out_dir = -ray.direction;
+        s.lambert_out = dot(s.normal, s.out_dir);
+        s.base_color = mat.base_color;
+        s.diffuse_albedo = mat.diffuse_albedo;
+        s.fresnel_0 = mat.fresnel_0;
+        s.roughness = mat.roughness;
+        s.pos += s.normal * RAY_OFFSET;
+
+        if (k == 2u) {
+            x2_pos = (obj.transform * vec4f(s.pos, 1.0)).xyz;
+            x2_normal = normalize((obj.transform * vec4f(s.normal, 0.0)).xyz);
+            x2_meta = ((obj.material_index & 3u) << 6u) | ((u32(hit.object_index) & 3u) << 8u);
+            have_x2 = true;
+        }
+
+        var reflectance: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+        let fourier = fourier_srgb_to_fourier(s.base_color);
+        let lagranges = prep_reflectance_real_lagrange_biased_3(fourier);
+        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+            reflectance[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, lagranges);
+        }
+
+        if (k == input.max_bounces) {
+            if (k == 1u) {
+                clear_gbuffer(pixel);
+            }
+            break;
+        }
+
+        if (k == 1u) {
+            textureStore(gbuffer_out, pixel, vec4f(s.normal, f32(obj.material_index)));
+        }
+
+        // Lamp NEE
+        var total_light_importance: f32;
+        let light_dir = sample_lights(&total_light_importance, s.pos, s.normal, get_random_numbers(seed));
+        let lambert_in_0 = dot(s.normal, light_dir);
+        if (lambert_in_0 > 0.0) {
+            let nee_ray = Ray(s.pos, light_dir);
+            let nee_light = intersect_lights(nee_ray);
+            if (nee_light.index >= 0) {
+                var nee_iterations = 0u;
+                let occluder = intersect_scene(nee_ray, &nee_iterations);
+                *iterations += nee_iterations;
+                if (occluder.distance > nee_light.t) {
+                    let light_density_0 = get_lights_density(total_light_importance, s.pos, light_dir, true);
+                    let brdf_density_0 = get_frostbite_brdf_density(s, light_dir);
+                    let spectrum_scale = lambert_in_0 / (light_density_0 + brdf_density_0);
+                    let brdf = frostbite_brdf(s, light_dir);
+                    var c = vec3f(0.0);
+                    var inc = vec3f(0.0);
+                    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                        let ci = throughput[i] * (reflectance[i] * brdf.x + brdf.y) * input.emission_integral * spectrum_scale;
+                        c += ci * rgb_and_phases[i].rgb;
+                        if (have_thr2) {
+                            inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                        }
+                    }
+                    c *= spectral_norm;
+                    inc *= spectral_norm;
+                    let pl = luminance(c);
+                    if (pl > 0.0) {
+                        w_sum += pl;
+                        if (get_random_numbers(seed).x * w_sum < pl) {
+                            sel_f = c;
+                            sel_flags = (k + 1u) | PATH_FLAG_NEE | x2_meta; // d = k+1
+                            if (k == 2u) {
+                                sel_rc_pos = x2_pos;
+                                sel_rc_normal = x2_normal;
+                                sel_rc_wi = light_dir;
+                                sel_rc_radiance = vec3f(input.emission_integral);
+                                sel_rc_pdf = light_density_0;
+                            } else {
+                                sel_rc_pos = x2_pos;
+                                sel_rc_normal = x2_normal;
+                                sel_rc_wi = x2_brdf_dir_idx;
+                                sel_rc_radiance = inc;
+                                sel_rc_pdf = x2_brdf_pdf;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sun NEE (sky)
+        if (input.environment == ENVIRONMENT_SKY) {
+            let sun_dir = sample_sun(get_random_numbers(seed));
+            let lambert_sun = dot(s.normal, sun_dir);
+            if (lambert_sun > 0.0) {
+                let sun_ray = Ray(s.pos, sun_dir);
+                let sun_light = intersect_lights(sun_ray);
+                var sun_iterations = 0u;
+                let sun_occluder = intersect_scene(sun_ray, &sun_iterations);
+                *iterations += sun_iterations;
+                if (sun_light.index < 0 && sun_occluder.object_index < 0) {
+                    let brdf_density_sun = get_frostbite_brdf_density(s, sun_dir);
+                    let brdf_sun = frostbite_brdf(s, sun_dir);
+                    let sun_scale = lambert_sun / (get_sun_density(sun_dir) + brdf_density_sun);
+                    let sun_rgb = skyRadianceRGB(sun_dir, true);
+                    let sun_w = spectral_env_weights(sun_rgb, rgb_and_phases);
+                    var c = vec3f(0.0);
+                    var inc = vec3f(0.0);
+                    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                        let ci = throughput[i] * (reflectance[i] * brdf_sun.x + brdf_sun.y) * sun_scale * sun_w[i];
+                        c += ci * rgb_and_phases[i].rgb;
+                        if (have_thr2) {
+                            inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                        }
+                    }
+                    c *= spectral_norm;
+                    inc *= spectral_norm;
+                    let pl = luminance(c);
+                    if (pl > 0.0) {
+                        w_sum += pl;
+                        if (get_random_numbers(seed).x * w_sum < pl) {
+                            sel_f = c;
+                            sel_flags = (k + 1u) | PATH_FLAG_NEE;
+                            if (k == 1u) {
+                                // d = 2: the sun IS x2 — env reconnection
+                                sel_flags |= PATH_FLAG_RC_ENV;
+                                sel_rc_pos = sun_dir;
+                                sel_rc_normal = -sun_dir;
+                                sel_rc_wi = sun_dir;
+                                sel_rc_radiance = sun_rgb;
+                                sel_rc_pdf = get_sun_density(sun_dir);
+                            } else if (k == 2u) {
+                                sel_flags |= x2_meta;
+                                sel_rc_pos = x2_pos;
+                                sel_rc_normal = x2_normal;
+                                sel_rc_wi = sun_dir;
+                                sel_rc_radiance = sun_rgb;
+                                sel_rc_pdf = get_sun_density(sun_dir);
+                            } else {
+                                sel_flags |= x2_meta;
+                                sel_rc_pos = x2_pos;
+                                sel_rc_normal = x2_normal;
+                                sel_rc_wi = x2_brdf_dir_idx;
+                                sel_rc_radiance = inc;
+                                sel_rc_pdf = x2_brdf_pdf;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Environment NEE (HDRI)
+        if (input.environment == ENVIRONMENT_HDRI) {
+            var env_pdf: f32;
+            let env_dir = sample_environment(get_random_numbers(seed), &env_pdf);
+            let lambert_env = dot(s.normal, env_dir);
+            if (lambert_env > 0.0 && env_pdf > 0.0) {
+                let env_ray = Ray(s.pos, env_dir);
+                let env_light = intersect_lights(env_ray);
+                var env_iterations = 0u;
+                let env_occluder = intersect_scene(env_ray, &env_iterations);
+                *iterations += env_iterations;
+                if (env_light.index < 0 && env_occluder.object_index < 0) {
+                    let brdf_density_env = get_frostbite_brdf_density(s, env_dir);
+                    let brdf_env = frostbite_brdf(s, env_dir);
+                    let env_scale = lambert_env / (env_pdf + brdf_density_env);
+                    let env_rgb = environment_rgb(env_dir);
+                    let nee_env_w = spectral_env_weights(env_rgb, rgb_and_phases);
+                    var c = vec3f(0.0);
+                    var inc = vec3f(0.0);
+                    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                        let ci = throughput[i] * (reflectance[i] * brdf_env.x + brdf_env.y) * env_scale * nee_env_w[i];
+                        c += ci * rgb_and_phases[i].rgb;
+                        if (have_thr2) {
+                            inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                        }
+                    }
+                    c *= spectral_norm;
+                    inc *= spectral_norm;
+                    let pl = luminance(c);
+                    if (pl > 0.0) {
+                        w_sum += pl;
+                        if (get_random_numbers(seed).x * w_sum < pl) {
+                            sel_f = c;
+                            sel_flags = (k + 1u) | PATH_FLAG_NEE;
+                            if (k == 1u) {
+                                sel_flags |= PATH_FLAG_RC_ENV;
+                                sel_rc_pos = env_dir;
+                                sel_rc_normal = -env_dir;
+                                sel_rc_wi = env_dir;
+                                sel_rc_radiance = env_rgb;
+                                sel_rc_pdf = env_pdf;
+                            } else if (k == 2u) {
+                                sel_flags |= x2_meta;
+                                sel_rc_pos = x2_pos;
+                                sel_rc_normal = x2_normal;
+                                sel_rc_wi = env_dir;
+                                sel_rc_radiance = env_rgb;
+                                sel_rc_pdf = env_pdf;
+                            } else {
+                                sel_flags |= x2_meta;
+                                sel_rc_pos = x2_pos;
+                                sel_rc_normal = x2_normal;
+                                sel_rc_wi = x2_brdf_dir_idx;
+                                sel_rc_radiance = inc;
+                                sel_rc_pdf = x2_brdf_pdf;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sample the BRDF to continue the path
+        ray = Ray(s.pos, sample_frostbite_brdf(s, get_random_numbers(seed)));
+        let lambert_in_1 = dot(s.normal, ray.direction);
+        if (lambert_in_1 <= 0.0) {
+            break;
+        }
+        let light_density_1 = get_lights_density(total_light_importance, s.pos, ray.direction, false);
+        let brdf_density_1 = get_frostbite_brdf_density(s, ray.direction);
+        let brdf_lambert_1 = frostbite_brdf(s, ray.direction) * lambert_in_1;
+        let mis_factor = 1.0 / (light_density_1 + brdf_density_1);
+        let rcp_brdf_density_1 = 1.0 / brdf_density_1;
+        env_weight = 1.0;
+        if (input.environment == ENVIRONMENT_HDRI) {
+            env_weight = brdf_density_1 / (brdf_density_1 + get_environment_density(ray.direction));
+        } else if (input.environment == ENVIRONMENT_SKY) {
+            env_weight = brdf_density_1 / (brdf_density_1 + get_sun_density(ray.direction));
+        }
+        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+            let brdf_lambert_1_spectral = reflectance[i] * brdf_lambert_1.x + brdf_lambert_1.y;
+            nee_throughput[i] = throughput[i] * brdf_lambert_1_spectral * mis_factor;
+            throughput[i] *= brdf_lambert_1_spectral * rcp_brdf_density_1;
+        }
+
+        if (k == 2u) {
+            x2_brdf_dir = ray.direction;
+            x2_brdf_dir_idx = normalize((obj.transform * vec4f(ray.direction, 0.0)).xyz);
+            x2_brdf_pdf = brdf_density_1;
+        }
+
+        // Russian roulette (kept in the sampling PDF; decoupled from replay
+        // in P3 per supplemental §6)
+        if (k >= 2u) {
+            let max_throughput = max(max(throughput[0], throughput[1]), max(throughput[2], throughput[3]));
+            let survival = clamp(max_throughput, 0.05, 1.0);
+            if (get_random_numbers(seed).x >= survival) {
+                break;
+            }
+            let rcp_survival = 1.0 / survival;
+            for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                throughput[i] *= rcp_survival;
+                nee_throughput[i] *= rcp_survival;
+            }
+        }
+
+        if (k == 2u) {
+            for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                thr2[i] = throughput[i];
+            }
+            have_thr2 = true;
+        }
+    }
+
+    // Write the reservoir (empty when w_sum == 0). Temporal reuse runs in
+    // its own pass (temporalMain) to keep this kernel's register footprint
+    // sane — fusing the shifts here stalled the GPU into watchdog territory.
+
+    var r: Reservoir;
+    r.f = sel_f;
+    r.w = 0.0;
+    let pl_sel = luminance(sel_f);
+    if (pl_sel > 0.0) {
+        r.w = w_sum / pl_sel;
+    }
+    r.rc_pos = sel_rc_pos;
+    r.m = 1.0;
+    r.rc_normal_oct = oct_encode(sel_rc_normal);
+    r.rc_wi_oct = oct_encode(sel_rc_wi);
+    r.init_seed = sel_init_seed;
+    r.path_flags = sel_flags;
+    r.rc_radiance = sel_rc_radiance;
+    r.rc_pdf = sel_rc_pdf;
+    reservoirs[reservoir_index(pixel, dims, 2u)] = r;
+    // Mirror into the frame-final region: shade + next frame's temporal
+    // read it directly while the spatial pass is disabled (see P2 note)
+    reservoirs[reservoir_index(pixel, dims, input.rng_frame & 1u)] = r;
+}
+
 // toneMapping implements ACES
 fn toneMapping(color: vec3f) -> vec3f {
     let exposed = color * input.exposure;
@@ -1316,33 +1796,24 @@ fn toneMapping(color: vec3f) -> vec3f {
     return (exposed * (a * exposed + b)) / (exposed * (c * exposed + d) + e);
 }
 
-@compute @workgroup_size(8, 8)
-fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
-    let dims = textureDimensions(output_texture);
-    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
-
-    var seed = vec2u(global_id.xy) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
-    // Sub-pixel jitter for anti-aliasing via accumulation
-    let jitter = get_random_numbers(&seed) - 0.5;
-    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5 + jitter, vec2f(dims));
-
-    var iterations = 0u;
-    var radiance = path_trace(ray, global_id.xy, &seed, &iterations);
+// Sanitize, clamp, accumulate, tonemap, present — shared by the Reference
+// megakernel and the ReSTIR shading pass so both feed the same accumulator.
+fn write_output(pixel: vec2u, dims: vec2u, radiance_in: vec3f) {
+    var radiance = radiance_in;
     // Reject non-finite samples — a single NaN/inf poisons the running sum
     // for the rest of the accumulation (permanent bright pixels) — and cap
-    // the heavy tail. 100 keeps caustic-path fireflies (lamp -> glossy model
-    // -> ground) below saturation within ~100 accumulated samples; direct
-    // light is NEE/ReSTIR-sampled and stays well under this, so the clipped
-    // energy is glossy-caustic tail only (biased, revisit for Reference).
+    // the heavy tail. 100 keeps caustic-path fireflies below saturation
+    // within ~100 accumulated samples; direct light is NEE-sampled and
+    // stays well under this, so the clipped energy is the glossy-caustic
+    // tail only (biased, revisit for Reference).
     if (!(radiance.x + radiance.y + radiance.z < 1e20)) {
         radiance = vec3f(0.0);
     }
     radiance = clamp(radiance, vec3f(0.0), vec3f(100.0));
 
     // Progressive accumulation: running sum, presented as sum / count.
-    // frame_index == 0 restarts (no clear pass needed). The accumulation is
-    // always the pure path trace — the ground truth being converged toward.
-    let pixel_index = global_id.y * dims.x + global_id.x;
+    // frame_index == 0 restarts (no clear pass needed).
+    let pixel_index = pixel.y * dims.x + pixel.x;
     var sum = vec4f(radiance, 1.0);
     if (input.frame_index > 0u) {
         let prev = accumulation[pixel_index];
@@ -1369,7 +1840,318 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
             select(0.0, 1.0, l > 1e3),
         );
     }
-    textureStore(output_texture, global_id.xy, vec4f(color, 1.0));
+    textureStore(output_texture, pixel, vec4f(color, 1.0));
+}
+
+// Reference: the frozen single-kernel path tracer (ground truth)
+@compute @workgroup_size(8, 8)
+fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
+    let dims = textureDimensions(output_texture);
+    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+
+    var seed = vec2u(global_id.xy) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+    // Sub-pixel jitter for anti-aliasing via accumulation
+    let jitter = get_random_numbers(&seed) - 0.5;
+    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5 + jitter, vec2f(dims));
+
+    var iterations = 0u;
+    let radiance = path_trace(ray, global_id.xy, &seed, &iterations);
+    write_output(global_id.xy, dims, radiance);
+}
+
+// ReSTIR PT pass 1: initial sampling (1spp path tree -> RIS -> reservoir)
+@compute @workgroup_size(8, 8)
+fn initialMain(@builtin(global_invocation_id) global_id: vec3u) {
+    let dims = textureDimensions(output_texture);
+    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+
+    var seed = vec2u(global_id.xy) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+    let jitter = get_random_numbers(&seed) - 0.5;
+    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5 + jitter, vec2f(dims));
+
+    var iterations = 0u;
+    initial_sample(ray, global_id.xy, dims, &seed, &iterations);
+}
+
+// ReSTIR PT pass 2: temporal reuse (plan P1). Re-derives the primary hit
+// (deterministic: same seed stream as initialMain), reprojects it through
+// the object motion + previous view, validates against the previous
+// G-buffer, then GRIS-merges the canonical reservoir with the temporal one
+// using reconnection shifts both ways and generalized Talbot MIS with
+// confidence weights (GRIS Eq. 36), cap 20. Runs as its own pass to keep
+// register pressure bounded.
+@compute @workgroup_size(8, 8)
+fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
+    let dims = textureDimensions(output_texture);
+    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+    let pixel = global_id.xy;
+
+    // Same RNG derivation as initialMain: jitter, then wavelengths
+    var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+    let jitter = get_random_numbers(&seed) - 0.5;
+    let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
+    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
+    let wavelength_rand = get_random_numbers(&seed).x;
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        let u = wavelength_rand * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
+        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
+    }
+    // Decorrelate the merge decision from initialMain's stream
+    seed ^= vec2u(0x9e3779b9u, 0x85ebca6bu);
+
+    var iterations = 0u;
+    let hit = intersect_scene(ray, &iterations);
+    if (hit.object_index < 0) {
+        return; // miss pixels keep the canonical (d = 1) sample
+    }
+    let light_hit = intersect_lights(ray);
+    if (light_hit.index >= 0 && light_hit.t < hit.distance) {
+        return;
+    }
+
+    let obj = objects[hit.object_index];
+    let mat = materials[obj.material_index];
+    var s: ShadingData;
+    s.pos = ray.origin + ray.direction * hit.distance;
+    s.normal = hit.normal;
+    if (!(dot(s.normal, s.normal) > 0.5)) {
+        s.normal = -ray.direction;
+    }
+    if (dot(s.normal, ray.direction) > 0.0) {
+        s.normal = -s.normal;
+    }
+    s.out_dir = -ray.direction;
+    s.lambert_out = dot(s.normal, s.out_dir);
+    s.base_color = mat.base_color;
+    s.diffuse_albedo = mat.diffuse_albedo;
+    s.fresnel_0 = mat.fresnel_0;
+    s.roughness = mat.roughness;
+    s.pos += s.normal * RAY_OFFSET;
+
+    var reflectance: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    let lagranges = prep_reflectance_real_lagrange_biased_3(fourier_srgb_to_fourier(s.base_color));
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        reflectance[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, lagranges);
+    }
+
+    // Reproject through object motion + previous camera
+    let pos_prev = (obj.motion * vec4f(s.pos, 1.0)).xyz;
+    let cam_prev = (input.prev_view * vec4f(pos_prev, 1.0)).xyz;
+    if (cam_prev.z >= 0.0) {
+        return;
+    }
+    let aspect = f32(dims.x) / f32(dims.y);
+    let uv = vec2f(
+        (cam_prev.x / (-cam_prev.z)) / (aspect * input.fov_scale),
+        (cam_prev.y / (-cam_prev.z)) / input.fov_scale,
+    ) * 0.5 + 0.5;
+    let prev_pixel = vec2i(uv * vec2f(dims));
+    if (any(prev_pixel < vec2i(0)) || any(prev_pixel >= vec2i(dims))) {
+        return;
+    }
+    let n_prev = normalize((obj.motion * vec4f(s.normal, 0.0)).xyz);
+    let g = textureLoad(gbuffer_prev, prev_pixel, 0);
+    if (g.w >= 900.0 || u32(g.w) != obj.material_index || dot(g.xyz, n_prev) <= 0.9) {
+        return;
+    }
+    let r_t = reservoirs[reservoir_index(vec2u(prev_pixel), dims, 1u - (input.rng_frame & 1u))];
+    let m_t = min(r_t.m, TEMPORAL_CONFIDENCE_CAP);
+    if (!(m_t > 0.0) || !(r_t.w > 0.0) || (r_t.path_flags & 15u) < 2u) {
+        return;
+    }
+
+    let cur_index = reservoir_index(pixel, dims, 2u);
+    var r_c = reservoirs[cur_index];
+    let p_c = luminance(r_c.f);
+
+    // Forward shift: temporal sample into this pixel's domain
+    let prev_sd = make_shading_data(pos_prev, n_prev,
+        normalize(input.prev_camera_pos - pos_prev), mat);
+    let fwd = shift_reconnect(r_t, s, reflectance, rgb_and_phases, prev_sd, false, &iterations);
+    let p_fwd = luminance(fwd.f);
+    if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
+        // Shift failed: keep the canonical but still age confidence
+        r_c.m = 1.0 + m_t;
+        reservoirs[cur_index] = r_c;
+        reservoirs[reservoir_index(pixel, dims, input.rng_frame & 1u)] = r_c;
+        return;
+    }
+
+    // Reverse shift of the canonical for Talbot MIS
+    var p_rev = 0.0;
+    if (p_c > 0.0 && (r_c.path_flags & 15u) >= 2u) {
+        let rev = shift_reconnect(r_c, prev_sd, reflectance, rgb_and_phases, s, true, &iterations);
+        p_rev = luminance(rev.f) * rev.jacobian;
+    }
+
+    // Generalized Talbot MIS with confidence weights; temporal densities
+    // are converted into this domain by the shift Jacobian
+    let p_t_prev = luminance(r_t.f) / fwd.jacobian;
+    let m_temp = (m_t * p_t_prev) / max(p_fwd + m_t * p_t_prev, 1e-12);
+    let m_can = p_c / max(p_c + m_t * p_rev, 1e-12);
+    let w_t = m_temp * p_fwd * r_t.w * fwd.jacobian;
+    let w_c = m_can * p_c * r_c.w;
+    let w_total = w_c + w_t;
+
+    var out = r_c;
+    if (get_random_numbers(&seed).x * w_total < w_t) {
+        out = r_t;
+        out.f = fwd.f;
+    }
+    out.w = 0.0;
+    let pl = luminance(out.f);
+    if (pl > 0.0 && w_total > 0.0) {
+        out.w = w_total / pl;
+    }
+    out.m = 1.0 + m_t;
+    reservoirs[cur_index] = out;
+    reservoirs[reservoir_index(pixel, dims, input.rng_frame & 1u)] = out;
+}
+
+// ReSTIR PT pass 3: spatial reuse (plan P2). Reads every pixel's
+// post-temporal reservoir from the scratch region and merges 3 Gaussian
+// neighbors (sigma = 16, the paper's R = 30 disk equivalent) into the
+// frame-final region via chained 2-candidate GRIS merges with
+// confidence-weighted Talbot MIS. Each neighbor's primary hit is re-traced
+// deterministically (same jitter stream), which doubles as validation.
+@compute @workgroup_size(8, 8)
+fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
+    let dims = textureDimensions(output_texture);
+    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+    let pixel = global_id.xy;
+
+    var out = reservoirs[reservoir_index(pixel, dims, 2u)];
+    let out_index = reservoir_index(pixel, dims, input.rng_frame & 1u);
+
+    // Same primary derivation as initialMain
+    var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+    let jitter = get_random_numbers(&seed) - 0.5;
+    let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
+    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
+    let wavelength_rand = get_random_numbers(&seed).x;
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        let u = wavelength_rand * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
+        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
+    }
+    seed ^= vec2u(0xc2b2ae35u, 0x27d4eb2fu); // decorrelate from other passes
+
+    var iterations = 0u;
+    let hit = intersect_scene(ray, &iterations);
+    if (hit.object_index < 0) {
+        reservoirs[out_index] = out;
+        return;
+    }
+    let obj = objects[hit.object_index];
+    let mat = materials[obj.material_index];
+    var s: ShadingData;
+    s.pos = ray.origin + ray.direction * hit.distance;
+    s.normal = hit.normal;
+    if (!(dot(s.normal, s.normal) > 0.5)) { s.normal = -ray.direction; }
+    if (dot(s.normal, ray.direction) > 0.0) { s.normal = -s.normal; }
+    s.out_dir = -ray.direction;
+    s.lambert_out = dot(s.normal, s.out_dir);
+    s.base_color = mat.base_color;
+    s.diffuse_albedo = mat.diffuse_albedo;
+    s.fresnel_0 = mat.fresnel_0;
+    s.roughness = mat.roughness;
+    s.pos += s.normal * RAY_OFFSET;
+    var reflectance: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    let lagranges = prep_reflectance_real_lagrange_biased_3(fourier_srgb_to_fourier(s.base_color));
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        reflectance[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, lagranges);
+    }
+
+    for (var n = 0u; n < 3u; n++) {
+        // Gaussian neighbor offset (Box-Muller, sigma = 16)
+        let u = get_random_numbers(&seed);
+        let rad = 16.0 * sqrt(max(-2.0 * log(max(u.x, 1e-6)), 0.0));
+        let ang = 2.0 * PI * u.y;
+        let np = vec2i(pixel) + vec2i(rad * vec2f(cos(ang), sin(ang)));
+        if (any(np < vec2i(0)) || any(np >= vec2i(dims)) || all(np == vec2i(pixel))) {
+            continue;
+        }
+        let r_n = reservoirs[reservoir_index(vec2u(np), dims, 2u)];
+        let m_n = min(r_n.m, TEMPORAL_CONFIDENCE_CAP);
+        if (!(m_n > 0.0) || !(r_n.w > 0.0) || (r_n.path_flags & 15u) < 2u) {
+            out.m += m_n; // count the neighbor even when unusable
+            continue;
+        }
+        // Re-trace the neighbor's primary hit (their jitter stream)
+        var nseed = vec2u(vec2u(np)) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+        let njitter = get_random_numbers(&nseed) - 0.5;
+        let nray = generate_camera_ray(vec2f(vec2u(np)) + 0.5 + njitter, vec2f(dims));
+        var nit = 0u;
+        let nhit = intersect_scene(nray, &nit);
+        iterations += nit;
+        if (nhit.object_index != hit.object_index) {
+            out.m += m_n;
+            continue;
+        }
+        let nobj = objects[nhit.object_index];
+        var ns: ShadingData;
+        ns.pos = nray.origin + nray.direction * nhit.distance;
+        ns.normal = nhit.normal;
+        if (!(dot(ns.normal, ns.normal) > 0.5)) { ns.normal = -nray.direction; }
+        if (dot(ns.normal, nray.direction) > 0.0) { ns.normal = -ns.normal; }
+        ns.out_dir = -nray.direction;
+        ns.lambert_out = dot(ns.normal, ns.out_dir);
+        ns.base_color = s.base_color;
+        ns.diffuse_albedo = s.diffuse_albedo;
+        ns.fresnel_0 = s.fresnel_0;
+        ns.roughness = s.roughness;
+        ns.pos += ns.normal * RAY_OFFSET;
+        if (dot(ns.normal, s.normal) <= 0.9) {
+            out.m += m_n;
+            continue;
+        }
+
+        // Forward shift: neighbor path into this pixel
+        let fwd = shift_reconnect(r_n, s, reflectance, rgb_and_phases, ns, false, &iterations);
+        let p_fwd = luminance(fwd.f);
+        if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
+            out.m += m_n;
+            continue;
+        }
+        // Reverse shift of the running canonical into the neighbor's domain
+        let p_c = luminance(out.f);
+        var p_rev = 0.0;
+        if (p_c > 0.0 && (out.path_flags & 15u) >= 2u && out.w > 0.0) {
+            let rev = shift_reconnect(out, ns, reflectance, rgb_and_phases, s, false, &iterations);
+            p_rev = luminance(rev.f) * rev.jacobian;
+        }
+        // 2-candidate confidence-weighted Talbot MIS (chained GRIS)
+        let m_c = out.m;
+        let p_n_own = luminance(r_n.f) / fwd.jacobian;
+        let m_nw = (m_n * p_n_own) / max(m_c * p_fwd + m_n * p_n_own, 1e-12);
+        let m_cw = (m_c * p_c) / max(m_c * p_c + m_n * p_rev, 1e-12);
+        let w_n = m_nw * p_fwd * r_n.w * fwd.jacobian;
+        let w_c = m_cw * p_c * out.w;
+        let w_total = w_c + w_n;
+        if (get_random_numbers(&seed).x * w_total < w_n) {
+            let keep_m = out.m;
+            out = r_n;
+            out.m = keep_m;
+            out.f = fwd.f;
+        }
+        out.w = 0.0;
+        let pl = luminance(out.f);
+        if (pl > 0.0 && w_total > 0.0) {
+            out.w = w_total / pl;
+        }
+        out.m += m_n;
+    }
+
+    reservoirs[out_index] = out;
+}
+
+// ReSTIR PT final pass: shade from the reservoir, F(Y) * W_Y
+@compute @workgroup_size(8, 8)
+fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
+    let dims = textureDimensions(output_texture);
+    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+
+    let r = reservoirs[reservoir_index(global_id.xy, dims, input.rng_frame & 1u)];
+    write_output(global_id.xy, dims, r.f * r.w);
 }
 
 // ============================================================================

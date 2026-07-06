@@ -19,7 +19,6 @@ import { ILLUMINANTS, buildIlluminantLut, packFloat16 } from './lib/illuminants'
 import type { IlluminantLut } from './lib/illuminants';
 import { parseFourierLut, srgbToFourierSrgb } from './lib/fourier_lut';
 import { parseEnv, buildEnvCdfs } from './lib/env';
-import { buildPairingTexture } from './lib/pairing';
 import type { Vec3 } from './lib/spectra';
 
 const MODEL_BASE = './models/';
@@ -70,13 +69,12 @@ let renderWidth = width;
 let renderHeight = height;
 let raytracedTexture: GPUTexture;
 let accumulationBuffer: GPUBuffer;
-// ReSTIR reservoirs: two (A, B) texture pairs, ping-ponged between frames
-let reservoirTextures: GPUTexture[] = [];
-let reservoirsFresh = true;
+// Primary-hit G-buffer ping-pong (denoiser temporal input)
+let gbufferTextures: GPUTexture[] = [];
 let displayBindGroup: GPUBindGroup;
 let perFrameBindGroup: GPUBindGroup;
 let dataBindGroup: GPUBindGroup;
-// Two pass bind groups with the reservoir ping-pong swapped
+// Two pass bind groups with the G-buffer ping-pong swapped
 let passBindGroups: GPUBindGroup[] = [];
 
 // Set canvas to fullscreen size and recreate GPU resources
@@ -120,6 +118,11 @@ if (adapter.limits.maxStorageBuffersPerShaderStage > 8) {
   requiredLimits.maxStorageBuffersPerShaderStage =
     Math.min(16, adapter.limits.maxStorageBuffersPerShaderStage);
 }
+// The path reservoirs are 128 B/pixel (64 B x 2 halves): at 100% render
+// scale on a large window that exceeds the DEFAULT limits (128 MB binding,
+// 256 MB buffer) — request what the adapter actually offers.
+requiredLimits.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize;
+requiredLimits.maxBufferSize = adapter.limits.maxBufferSize;
 
 const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
 device.addEventListener('uncapturederror', event => {
@@ -184,14 +187,27 @@ let lowersBuffer: GPUBuffer;
 let leavesBuffer: GPUBuffer;
 let dataBuffer: GPUBuffer;
 let currentModelConfig: ModelConfig = models[0];
+// ReSTIR PT path reservoirs: one buffer, two ping-pong halves (64 B/pixel
+// each), the written half selected by rng_frame parity
+let reservoirBuffer: GPUBuffer;
 
 // Create size-dependent GPU resources
 function createGPUResources() {
   if (raytracedTexture) { raytracedTexture.destroy(); }
   if (accumulationBuffer) { accumulationBuffer.destroy(); }
 
-  renderWidth = Math.max(1, Math.floor(width * controls.renderScale));
-  renderHeight = Math.max(1, Math.floor(height * controls.renderScale));
+  // Number() guards against option values arriving as strings
+  let scale = Number(controls.renderScale) || 0.5;
+  // Clamp so the reservoir buffer (128 B/pixel) fits the device's storage
+  // binding limit rather than failing createBuffer and killing the frame
+  const maxPixels = Math.floor(device.limits.maxStorageBufferBindingSize / 192);
+  if (width * scale * height * scale > maxPixels) {
+    const fit = Math.sqrt(maxPixels / (width * height));
+    console.warn(`Render scale ${scale} exceeds reservoir budget; clamping to ${fit.toFixed(2)}`);
+    scale = fit;
+  }
+  renderWidth = Math.max(1, Math.floor(width * scale));
+  renderHeight = Math.max(1, Math.floor(height * scale));
 
   raytracedTexture = device.createTexture({
     size: [renderWidth, renderHeight],
@@ -233,9 +249,7 @@ function createGPUResources() {
       { binding: 7, resource: environmentTexture.createView() },
       { binding: 8, resource: envCdfConditionalTexture.createView() },
       { binding: 9, resource: envCdfMarginalTexture.createView() },
-      { binding: 10, resource: pairingTextures[0].createView() },
-      { binding: 11, resource: pairingTextures[1].createView() },
-      { binding: 12, resource: pairingTextures[2].createView() },
+      { binding: 10, resource: fourierLutTexture.createView() },
     ]
   });
 
@@ -255,29 +269,35 @@ function createGPUResources() {
     });
   }
 
-  // ReSTIR reservoir + G-buffer ping-pong: [A0, B0, G0, A1, B1, G1]
-  reservoirTextures.forEach(t => t.destroy());
-  reservoirTextures = [0, 1, 2, 3, 4, 5].map(i => device.createTexture({
-    label: `Reservoir ${i}`,
+  // G-buffer ping-pong (normal + material index per primary hit)
+  gbufferTextures.forEach(t => t.destroy());
+  gbufferTextures = [0, 1].map(i => device.createTexture({
+    label: `G-buffer ${i}`,
     size: [renderWidth, renderHeight],
     format: 'rgba32float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   }));
-  reservoirsFresh = true;
 
-  // Bind group 2: pass (two variants with the reservoir ping-pong swapped)
+  // ReSTIR PT reservoirs: 64 B/pixel x 2 ping-pong halves in one buffer
+  // (stays within the 10 storage-buffer adapter limit)
+  reservoirBuffer?.destroy();
+  reservoirBuffer = device.createBuffer({
+    label: 'Path reservoirs',
+    // 3 regions: final ping-pong x2 + post-temporal scratch for spatial
+    size: renderWidth * renderHeight * 64 * 3,
+    usage: GPUBufferUsage.STORAGE,
+  });
+
+  // Bind group 2: pass (two variants with the G-buffer ping-pong swapped)
   passBindGroups = [0, 1].map(parity => device.createBindGroup({
     label: `Pass bind group ${parity}`,
     layout: passBindGroupLayout,
     entries: [
       { binding: 0, resource: raytracedTexture.createView() },
       { binding: 1, resource: { buffer: accumulationBuffer } },
-      { binding: 2, resource: reservoirTextures[parity * 3].createView() },
-      { binding: 3, resource: reservoirTextures[parity * 3 + 1].createView() },
-      { binding: 4, resource: reservoirTextures[(1 - parity) * 3].createView() },
-      { binding: 5, resource: reservoirTextures[(1 - parity) * 3 + 1].createView() },
-      { binding: 6, resource: reservoirTextures[parity * 3 + 2].createView() },
-      { binding: 7, resource: reservoirTextures[(1 - parity) * 3 + 2].createView() },
+      { binding: 2, resource: gbufferTextures[parity].createView() },
+      { binding: 3, resource: gbufferTextures[1 - parity].createView() },
+      { binding: 4, resource: { buffer: reservoirBuffer } },
     ]
   }));
 }
@@ -389,6 +409,7 @@ async function loadModel(config: ModelConfig) {
   currentModelConfig = config;
   resetAccumulation("model-load");
 
+
   // Recreate data bind group with new buffers
   dataBindGroup = device.createBindGroup({
     label: 'Data bind group',
@@ -445,8 +466,8 @@ controls.resetCamera = () => {
 };
 
 
-// Input uniform, must match struct Input in compute.wgsl (256 bytes)
-const inputValues = new ArrayBuffer(256);
+// Input uniform, must match struct Input in compute.wgsl (208 bytes)
+const inputValues = new ArrayBuffer(208);
 const inputViews = {
   camera_matrix: new Float32Array(inputValues, 0, 16),
   fov_scale: new Float32Array(inputValues, 64, 1),
@@ -462,11 +483,8 @@ const inputViews = {
   light_count: new Uint32Array(inputValues, 104, 1),
   white_background: new Uint32Array(inputValues, 108, 1),
   rng_frame: new Uint32Array(inputValues, 112, 1),
-  reservoir_valid: new Uint32Array(inputValues, 116, 1),
-  restir: new Uint32Array(inputValues, 120, 1),
   prev_view: new Float32Array(inputValues, 128, 16),
-  pairing: new Uint32Array(inputValues, 192, 12),
-  prev_camera_pos: new Float32Array(inputValues, 240, 3),
+  prev_camera_pos: new Float32Array(inputValues, 192, 3),
 };
 const inputBuffer = device.createBuffer({
   label: 'Input Uniforms',
@@ -535,6 +553,40 @@ const illuminantTexture = device.createTexture({
   format: 'rgba16float',
   usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
 });
+// The same LUT as a 3D texture: lets the shader spectrally upsample
+// arbitrary RGB radiance (environment light). rgba8unorm, 33^3, rows
+// padded to 256 bytes for writeTexture.
+const fourierLutTexture = device.createTexture({
+  label: 'Fourier LUT 3D',
+  size: [fourierLut.n, fourierLut.n, fourierLut.n],
+  format: 'rgba8unorm',
+  dimension: '3d',
+  usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+});
+{
+  const n = fourierLut.n;
+  const rowBytes = 256 * Math.ceil((n * 4) / 256);
+  const padded = new Uint8Array(rowBytes * n * n);
+  for (let b = 0; b < n; b++) {
+    for (let g = 0; g < n; g++) {
+      for (let r = 0; r < n; r++) {
+        const si = ((b * n + g) * n + r) * 3;
+        const di = (b * n + g) * rowBytes + r * 4;
+        padded[di] = fourierLut.data[si];
+        padded[di + 1] = fourierLut.data[si + 1];
+        padded[di + 2] = fourierLut.data[si + 2];
+        padded[di + 3] = 255;
+      }
+    }
+  }
+  device.queue.writeTexture(
+    { texture: fourierLutTexture },
+    padded,
+    { bytesPerRow: rowBytes, rowsPerImage: n },
+    [n, n, n],
+  );
+}
+
 const illuminantSampler = device.createSampler({
   addressModeU: 'clamp-to-edge',
   magFilter: 'linear',
@@ -580,22 +632,6 @@ device.queue.writeTexture(
   { bytesPerRow: envMap.height * 4 },
   [envMap.height, 1],
 );
-
-// --- Pairing textures for ReSTIR spatial reuse (rg8sint deltas) ---
-// Coprime-ish sizes avoid tiling-alignment correlation (paper's choice);
-// sigma 16 matches the classic 30px uniform-disk reuse radius.
-const PAIRING_SIZES = [254, 230, 210];
-const pairingTextures = PAIRING_SIZES.map((size, i) => {
-  const data = buildPairingTexture(size, 16.0);
-  const texture = device.createTexture({
-    label: `Pairing ${i}`,
-    size: [size, size],
-    format: 'rg8sint',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-  });
-  device.queue.writeTexture({ texture }, data, { bytesPerRow: size * 2 }, [size, size]);
-  return texture;
-});
 
 const illuminantLutCache = new Map<string, IlluminantLut>();
 function setIlluminant(name: string) {
@@ -763,6 +799,39 @@ function resetAccumulation(cause = 'unknown') {
 }
 // Debug introspection for headless testing
 (window as any).__dbg = () => ({ accumFrameIndex, shouldDispatch, lastResetCause });
+// Headless-test hook: set a GUI control by property name (bypasses DOM)
+(window as any).__set = (prop: string, value: unknown) => {
+  (controls as any)[prop] = value;
+  gui.controllersRecursive().forEach(c => c.updateDisplay());
+  resetAccumulation('test-set');
+  return `${prop}=${value}`;
+};
+// Headless-test hook: GPU readback of the presented (tonemapped) texture at
+// render resolution — measurement without daemon screenshots or UI overlay
+(window as any).__readPixels = async () => {
+  const w = renderWidth, h = renderHeight;
+  const bytesPerRow = Math.ceil((w * 4) / 256) * 256;
+  const buf = device.createBuffer({
+    size: bytesPerRow * h,
+    usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+  });
+  const enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: raytracedTexture }, { buffer: buf, bytesPerRow }, [w, h]);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const data = new Uint8Array(buf.getMappedRange());
+  const out = new Uint8Array(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    out.set(data.subarray(y * bytesPerRow, y * bytesPerRow + w * 4), y * w * 4);
+  }
+  buf.unmap();
+  buf.destroy();
+  let s = '';
+  for (let i = 0; i < out.length; i += 0x8000) {
+    s += String.fromCharCode(...out.subarray(i, i + 0x8000));
+  }
+  return JSON.stringify({ w, h, b64: btoa(s) });
+};
 
 function updateInput(deltaTime: number) {
   // Update time delta
@@ -794,27 +863,18 @@ function updateInput(deltaTime: number) {
   shouldDispatch = accumFrameIndex < MAX_ACCUM_FRAMES;
   inputViews.frame_index[0] = accumFrameIndex;
   if (shouldDispatch) { accumFrameIndex++; }
-  // Monotonic RNG frame + reservoir state: reservoirs survive accumulation
-  // resets (that's ReSTIR's point) but not texture recreation
+  // Monotonic RNG frame: samples stay fresh across accumulation resets
   inputViews.rng_frame[0] = rngFrame;
-  inputViews.reservoir_valid[0] = reservoirsFresh ? 0 : 1;
-  inputViews.restir[0] = controls.restir ? 1 : 0;
   // ReSTIR reprojection state: last frame's view matrix + object motion
   inputViews.prev_view.set(prevViewMatrix);
   inputViews.prev_camera_pos.set(prevCameraPos);
   mat4.inverse(camera.matrix, prevViewMatrix);
+  prevCameraPos.set(camera.position.subarray(0, 3));
   prevCameraPos.set([camera.matrix[12], camera.matrix[13], camera.matrix[14]]);
   updateObjectMotion();
-  // Fresh random transform per pairing texture each frame (offset + flips)
-  PAIRING_SIZES.forEach((size, i) => {
-    inputViews.pairing.set([
-      (Math.random() * size) | 0, (Math.random() * size) | 0,
-      Math.random() < 0.5 ? 1 : 0, Math.random() < 0.5 ? 1 : 0,
-    ], i * 4);
-  });
+
   if (shouldDispatch) {
     rngFrame++;
-    reservoirsFresh = false;
   }
   const ENV_INDEX = { 'Studio': 0, 'Sky': 1, 'Studio HDRI': 2 } as const;
   inputViews.environment[0] = ENV_INDEX[controls.environment];
@@ -866,9 +926,7 @@ const perFrameBindGroupLayout = device.createBindGroupLayout({
     { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '2d' } },
     { binding: 8, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
     { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'sint', viewDimension: '2d' } },
-    { binding: 11, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'sint', viewDimension: '2d' } },
-    { binding: 12, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'sint', viewDimension: '2d' } },
+    { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'float', viewDimension: '3d' } },
   ]
 });
 
@@ -895,20 +953,11 @@ const passBindGroupLayout = device.createBindGroupLayout({
     },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 3, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
     {
-      binding: 4, visibility: GPUShaderStage.COMPUTE,
+      binding: 3, visibility: GPUShaderStage.COMPUTE,
       storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
     },
-    {
-      binding: 5, visibility: GPUShaderStage.COMPUTE,
-      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
-    },
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    {
-      binding: 7, visibility: GPUShaderStage.COMPUTE,
-      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
-    },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
   ]
 });
 
@@ -927,7 +976,30 @@ const computePipeline = await device.createComputePipelineAsync({
   throw error;
 });
 
+// ReSTIR PT passes (docs/restir-pt-plan.md): initial sampling -> shade
+const initialPipeline = await device.createComputePipelineAsync({
+  label: 'ReSTIR Initial Sampling',
+  layout: computePipelineLayout,
+  compute: { module: computeShaderModule, entryPoint: 'initialMain' },
+});
+const spatialPipeline = await device.createComputePipelineAsync({
+  label: 'ReSTIR Spatial Reuse',
+  layout: computePipelineLayout,
+  compute: { module: computeShaderModule, entryPoint: 'spatialMain' },
+});
+const temporalPipeline = await device.createComputePipelineAsync({
+  label: 'ReSTIR Temporal Reuse',
+  layout: computePipelineLayout,
+  compute: { module: computeShaderModule, entryPoint: 'temporalMain' },
+});
+const shadePipeline = await device.createComputePipelineAsync({
+  label: 'ReSTIR Shade',
+  layout: computePipelineLayout,
+  compute: { module: computeShaderModule, entryPoint: 'shadeMain' },
+});
+
 console.log('Pipeline created.');
+
 
 const computePassDescriptor: GPUComputePassDescriptor = {
   label: "Compute pass",
@@ -962,9 +1034,6 @@ gui.onChange((event) => {
   } else if (event.property === 'renderScale') {
     createGPUResources();
     updatePixelRadius();
-  } else if (event.property === 'restir') {
-    // Stale reservoirs must not survive a toggle
-    reservoirsFresh = true;
   }
 });
 
@@ -1001,13 +1070,29 @@ function requestFrame() {
 
   // Skip path tracing entirely once the image has converged
   if (shouldDispatch) {
+    const wgX = Math.ceil(renderWidth / 8);
+    const wgY = Math.ceil(renderHeight / 8);
     const computePass = encoder.beginComputePass(computePassDescriptor);
-    computePass.setPipeline(computePipeline);
     computePass.setBindGroup(0, perFrameBindGroup);
     computePass.setBindGroup(1, dataBindGroup);
     // rngFrame was already advanced for this frame in updateInput
     computePass.setBindGroup(2, passBindGroups[(rngFrame - 1) & 1]);
-    computePass.dispatchWorkgroups(Math.ceil(renderWidth / 8), Math.ceil(renderHeight / 8), 1);
+    if (controls.lightingMode === 'ReSTIR') {
+      computePass.setPipeline(initialPipeline);
+      computePass.dispatchWorkgroups(wgX, wgY, 1);
+      computePass.setPipeline(temporalPipeline);
+      computePass.dispatchWorkgroups(wgX, wgY, 1);
+      // Spatial reuse DISABLED pending the d==3 shift bias fix (P2 note
+      // in docs/restir-pt-plan.md): +1.3%/merge compounds through temporal
+      // feedback into a +27% runaway. Re-enable once the shift is exact.
+      // computePass.setPipeline(spatialPipeline);
+      // computePass.dispatchWorkgroups(wgX, wgY, 1);
+      computePass.setPipeline(shadePipeline);
+      computePass.dispatchWorkgroups(wgX, wgY, 1);
+    } else {
+      computePass.setPipeline(computePipeline);
+      computePass.dispatchWorkgroups(wgX, wgY, 1);
+    }
     computePass.end();
   }
 
