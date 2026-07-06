@@ -67,11 +67,6 @@ struct DenoiseParams {
 @group(0) @binding(11) var atrous_dst: texture_storage_2d<rgba32float, write>;
 // Final 8-bit output (resolve pass)
 @group(0) @binding(12) var resolve_out: texture_storage_2d<rgba8unorm, write>;
-// Progressive accumulation (rgb sum, sample count) from the shade pass —
-// the resolve blends toward its mean as the static-scene sample count
-// grows, so the denoised view CONVERGES to the reference instead of
-// plateauing at the EMA/a-trous steady state
-@group(0) @binding(13) var<storage, read> accumulation: array<vec4f>;
 // Per-material linear-RGB diffuse albedo (authored colours). SVGF albedo
 // demodulation: filter irradiance = radiance / albedo (smooth, denoisable)
 // and remodulate at resolve, so the a-trous blurs the LIGHTING without
@@ -126,9 +121,9 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
     let pixel = gid.xy;
 
     let g = textureLoad(gbuf, pixel, 0);
-    // Albedo-demodulate: the denoiser works on irradiance, not radiance
-    let alb = demod_albedo(g.w);
-    let c_in = textureLoad(illum, pixel, 0).rgb / alb;
+    // illum is already albedo-demodulated irradiance (shade-side, cast-
+    // cancelling), so the denoiser filters it directly; resolve remodulates
+    let c_in = textureLoad(illum, pixel, 0).rgb;
     let l_in = dn_luminance(c_in);
 
     var color = c_in;
@@ -206,11 +201,13 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 let h = h_sum / w_sum;
                 let m = m_sum / w_sum;
                 hist_len = min(h.a + 1.0, 64.0);
-                // Converge like an average early, EMA later. 0.1 (vs
-                // SVGF's 0.2): our per-frame input carries a global
-                // wavelength-set color cast that needs longer averaging;
-                // lighting is static between edits so the extra lag is fine
-                let alpha = max(0.1, 1.0 / hist_len);
+                // Converge like an average early, EMA later. Floor lowered
+                // 0.1 -> 0.05 now that the illum is shade-side albedo-
+                // demodulated (cast-free): the residual per-frame variance
+                // is smaller, so longer temporal averaging is cheap and it
+                // replaces the removed accumulation-blend crutch's stability
+                // (~20-frame EMA). Motion/disocclusion still resets history.
+                let alpha = max(0.05, 1.0 / hist_len);
                 color = mix(h.rgb, c_in, alpha);
                 mu = mix(m, mu, alpha);
             }
@@ -234,7 +231,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
                     continue;
                 }
-                csum += textureLoad(illum, vec2u(q), 0).rgb / alb;
+                csum += textureLoad(illum, vec2u(q), 0).rgb;
                 ccnt += 1.0;
             }
         }
@@ -265,7 +262,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c || dot(gq.xyz, g.xyz) <= 0.75) {
                     continue;
                 }
-                let lq = dn_luminance(textureLoad(illum, vec2u(q), 0).rgb / alb);
+                let lq = dn_luminance(textureLoad(illum, vec2u(q), 0).rgb);
                 s1 += lq;
                 s2 += lq * lq;
                 cnt += 1.0;
@@ -385,18 +382,12 @@ fn resolveMain(@builtin(global_invocation_id) gid: vec3u) {
     let dims = textureDimensions(atrous_src);
     if gid.x >= dims.x || gid.y >= dims.y { return; }
     var color = textureLoad(atrous_src, vec2i(gid.xy), 0).rgb;
-    // Remodulate the filtered irradiance by the material albedo
+    // Remodulate the filtered irradiance by the cast-free material albedo.
+    // No accumulation-blend crutch: with a cast-free irradiance input the
+    // temporal EMA converges to the true mean and the variance-guided
+    // a-trous removes the residual, so the image settles on its own with
+    // low lag (SVGF as designed).
     color = color * demod_albedo(textureLoad(gbuf, vec2i(gid.xy), 0).w);
-    // Converge to the reference: blend toward the progressive accumulation
-    // mean as the static-scene sample count grows (motion resets the
-    // accumulation, so interaction stays on the pure denoised path). The
-    // denoiser alone plateaus at its EMA steady state — without this the
-    // image never settles past "filtered noise" no matter how long it sits.
-    let acc = accumulation[gid.y * dims.x + gid.x];
-    if (acc.a > 0.0) {
-        let t = acc.a / (acc.a + 24.0);
-        color = mix(color, acc.rgb / acc.a, t);
-    }
     color = dn_tonemap(color);
     color = pow(color, vec3f(1.0 / 2.2));
     textureStore(resolve_out, gid.xy, vec4f(color, 1.0));

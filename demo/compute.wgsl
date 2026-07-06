@@ -1196,7 +1196,8 @@ fn clear_gbuffer(pixel: vec2u) {
     textureStore(gbuffer_out, pixel, vec4f(0.0, 0.0, 0.0, -1.0));
 }
 
-fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>) -> vec3f {
+fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>, primary_albedo: ptr<function, vec3f>) -> vec3f {
+    *primary_albedo = vec3f(1.0); // env/miss default (no demod)
     var ray = ray_in;
     // MIS weight applied when a BRDF-sampled ray reaches the environment
     // (competes with sample_environment() NEE from the previous vertex)
@@ -1309,6 +1310,7 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
         // depth, matching initialMain so the denoiser can run on Reference
         // PT too (world_pos reconstruction needs the packed/exact depth)
         if (k == 1u) {
+            *primary_albedo = project_spectral(vec4f(reflectance[0], reflectance[1], reflectance[2], reflectance[3]), rgb_and_phases);
             textureStore(gbuffer_out, pixel,
                 vec4f(s.normal, f32(obj.material_index) + clamp(hit.distance * (1.0 / 16384.0), 0.0, 0.9999)));
             textureStore(gdepth_out, pixel, vec4f(hit.distance, 0.0, 0.0, 0.0));
@@ -1958,10 +1960,10 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5 + jitter, vec2f(dims));
 
     var iterations = 0u;
-    let radiance = path_trace(ray, global_id.xy, &seed, &iterations);
-    // Raw 1spp radiance for the denoiser (when Denoise is on in Reference
-    // mode) — lets SVGF be inspected on plain PT without reservoirs
-    textureStore(illum_out, global_id.xy, vec4f(radiance, 1.0));
+    var primary_albedo = vec3f(1.0);
+    let radiance = path_trace(ray, global_id.xy, &seed, &iterations, &primary_albedo);
+    // Albedo-demodulated 1spp irradiance for the denoiser (Reference mode)
+    textureStore(illum_out, global_id.xy, vec4f(radiance / max(primary_albedo, vec3f(0.02)), 1.0));
     write_output(global_id.xy, dims, radiance);
 }
 
@@ -2521,7 +2523,15 @@ fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
     var radiance = vec3f(0.0);
     if (wsum > 0.0) { radiance = accum / wsum; }
     radiance = clamp(radiance, vec3f(0.0), vec3f(100.0));
-    textureStore(illum_out, pixel, vec4f(radiance, 1.0));
+    // SHADE-SIDE albedo demodulation for the denoiser: divide by the
+    // primary surface's PER-PIXEL reflectance projection. This cancels the
+    // material colour AND the per-pixel hero-wavelength cast at once (both
+    // radiance and albedo_pp carry the same basis), handing the denoiser a
+    // cast-free irradiance signal. resolveMain remodulates by the cast-free
+    // material albedo. write_output keeps RAW radiance (accumulation +
+    // no-denoise path). Miss pixels wrote illum = bg above (albedo 1).
+    let albedo_pp = project_spectral(vec4f(dst_refl[0], dst_refl[1], dst_refl[2], dst_refl[3]), rgb_and_phases);
+    textureStore(illum_out, pixel, vec4f(radiance / max(albedo_pp, vec3f(0.02)), 1.0));
     write_output(pixel, dims, radiance);
 }
 

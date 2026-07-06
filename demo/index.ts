@@ -1355,7 +1355,6 @@ function createDenoiseBindGroups() {
       { binding: 8, resource: histTextures[1 - P].createView() },
       { binding: 9, resource: momentsTextures[1 - P].createView() },
       { binding: 11, resource: atrousTextures[0].createView() },
-      { binding: 14, resource: { buffer: materialAlbedoBuffer } },
     ]
   }));
   denoiseAtrousGroups = [0, 1].map(P =>
@@ -1380,7 +1379,6 @@ function createDenoiseBindGroups() {
       { binding: 4, resource: gbufferTextures[1 - P].createView() },
       { binding: 10, resource: atrousTextures[ATROUS_ITERATIONS % 2].createView() },
       { binding: 12, resource: raytracedTexture.createView() },
-      { binding: 13, resource: { buffer: accumulationBuffer } },
       { binding: 14, resource: { buffer: materialAlbedoBuffer } },
     ]
   }));
