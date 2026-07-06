@@ -135,6 +135,11 @@ const MAX_LIGHTS: u32 = 8u;
 @group(2) @binding(7) var gdepth_cur: texture_2d<f32>;
 // Written by initial sampling alongside the G-buffer
 @group(2) @binding(8) var gdepth_out: texture_storage_2d<r32float, write>;
+// Shade-pass upsampling inputs: the LOW-RES (GI) G-buffer + depth, used to
+// reconstruct the reservoir cell's primary hit (the reconnection-shift
+// source) when a full-res pixel resamples the low-res reservoir grid
+@group(2) @binding(9) var gi_gbuffer: texture_2d<f32>;
+@group(2) @binding(10) var gi_gdepth: texture_2d<f32>;
 
 // ============================================================================
 // ReSTIR PT reservoirs (docs/restir-pt-plan.md, layout after ReSTIR PT
@@ -342,6 +347,7 @@ fn shift_reconnect(
     dst_u: f32,
     src_s: ShadingData,
     use_prev: bool,
+    min_cos: f32,
     iterations: ptr<function, u32>,
 ) -> ShiftResult {
     // RATIO composition: F_shift = F_src * (dst factors)/(src factors) for
@@ -436,15 +442,14 @@ fn shift_reconnect(
     // tiny cosine whose relative error explodes — a one-sided (Jensen)
     // energy inflation measured at silhouettes and the far ground. The
     // footprint criteria (P3) subsume this with a principled bound.
-    const MIN_COS = 0.05;
-    if (lambert_dst <= MIN_COS || lambert_src <= MIN_COS || dst_d2 < 1e-6 || src_d2 < 1e-6) {
+    if (lambert_dst <= min_cos || lambert_src <= min_cos || dst_d2 < 1e-6 || src_d2 < 1e-6) {
         return out;
     }
 
     // Geometric Jacobian (GRIS Eq. 52): cosines at the rc vertex
     let cos_dst = abs(dot(rc_n, dir));
     let cos_src = abs(dot(rc_n, src_dir));
-    if (cos_src <= MIN_COS || cos_dst <= MIN_COS) {
+    if (cos_src <= min_cos || cos_dst <= min_cos) {
         return out;
     }
     var jacobian = (cos_dst / dst_d2) * (src_d2 / cos_src);
@@ -1937,10 +1942,39 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     write_output(global_id.xy, dims, radiance);
 }
 
+// ReSTIR PT pass 0: full-res primary visibility. Traces ONLY the primary
+// ray and writes the full-res G-buffer + exact depth. The reservoir passes
+// run at a lower GI resolution; shade reconstructs THIS primary and shifts
+// the low-res reservoir onto it (sharp silhouettes + full-res shadows).
+@compute @workgroup_size(8, 8)
+fn primaryMain(@builtin(global_invocation_id) global_id: vec3u) {
+    let dims = textureDimensions(gbuffer_out);
+    if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+    let pixel = global_id.xy;
+    var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+    let jitter = get_random_numbers(&seed) - 0.5;
+    let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
+    var it = 0u;
+    let hit = intersect_scene(ray, &it);
+    let lh = intersect_lights(ray);
+    if (hit.object_index < 0 || (lh.index >= 0 && lh.t < hit.distance)) {
+        textureStore(gbuffer_out, pixel, vec4f(0.0, 0.0, 0.0, -1.0));
+        textureStore(gdepth_out, pixel, vec4f(0.0));
+        return;
+    }
+    let obj = objects[hit.object_index];
+    var n = hit.normal;
+    if (!(dot(n, n) > 0.5)) { n = -ray.direction; }
+    if (dot(n, ray.direction) > 0.0) { n = -n; }
+    textureStore(gbuffer_out, pixel,
+        vec4f(n, f32(obj.material_index) + clamp(hit.distance * (1.0 / 16384.0), 0.0, 0.9999)));
+    textureStore(gdepth_out, pixel, vec4f(hit.distance, 0.0, 0.0, 0.0));
+}
+
 // ReSTIR PT pass 1: initial sampling (1spp path tree -> RIS -> reservoir)
 @compute @workgroup_size(8, 8)
 fn initialMain(@builtin(global_invocation_id) global_id: vec3u) {
-    let dims = textureDimensions(output_texture);
+    let dims = textureDimensions(gbuffer_out);
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
 
     var seed = vec2u(global_id.xy) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
@@ -2068,7 +2102,7 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
     let prev_sd = make_shading_data(pos_prev, n_prev,
         normalize(input.prev_camera_pos - pos_prev), mat);
     let fwd = shift_reconnect(r_t, s, reflectance, rgb_and_phases,
-        wavelength_u, prev_sd, false, &iterations);
+        wavelength_u, prev_sd, false, 0.05, &iterations);
     let p_fwd = luminance(project_spectral(fwd.f, rgb_and_phases));
 
     // Canonical Talbot weight needs the reverse shift: the canonical
@@ -2082,7 +2116,7 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
     var m_can = 1.0;
     if (p_c > 0.0 && r_c.w > 0.0) {
         let rev = shift_reconnect(r_c, prev_sd, refl_t, phases_t,
-            r_t.wavelength_u, s, true, &iterations);
+            r_t.wavelength_u, s, true, 0.05, &iterations);
         let p_rev = luminance(project_spectral(rev.f, phases_t));
         if (p_rev > 0.0 && rev.jacobian > 0.0) {
             // GRIS Eq. 36: canonical density vs the temporal technique's
@@ -2288,7 +2322,7 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
                 refl_nb[i] = eval_reflectance_real_lagrange_3(phases_n[i].w, lagranges);
             }
             let rev = shift_reconnect(r_canon, ns, refl_nb, phases_n,
-                r_n.wavelength_u, s, false, &iterations);
+                r_n.wavelength_u, s, false, 0.05, &iterations);
             let p_rev = luminance(project_spectral(rev.f, phases_n)) * rev.jacobian;
             if (p_rev > 0.0) {
                 canonical_weight -= p_rev * m_n / (p_rev * m_n + m_c * p_c / k_norm);
@@ -2301,7 +2335,7 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
         // Forward shift: neighbor path into THIS pixel's per-pixel basis
         // (the wavelength shift rebases the suffix radiance)
         let fwd = shift_reconnect(r_n, s, reflectance, rgb_and_phases,
-            wavelength_u, ns, false, &iterations);
+            wavelength_u, ns, false, 0.05, &iterations);
         let p_fwd = luminance(project_spectral(fwd.f, rgb_and_phases));
         if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
             continue;
@@ -2344,25 +2378,103 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
     reservoirs[out_index] = out;
 }
 
-// ReSTIR PT final pass: shade from the reservoir, F(Y) * W_Y
+// ReSTIR PT final pass: FULL-RES shade + GI-grid upsample. Reconstructs
+// this pixel's full-res primary (from the full-res G-buffer written by
+// primaryMain), finds the covering low-res reservoir cell, reconstructs
+// THAT cell's primary as the shift source, and reconnection-shifts the
+// reservoir onto the full-res primary. The shift re-casts visibility from
+// the full-res hit, so shadows stay sharp at 1:1 even though the light
+// samples live on the low-res grid. Single-cell resample: the shifted
+// integrand F * W * J is an unbiased estimate of this pixel's radiance
+// (GRIS, |R| = 1, no canonical); a geometrically-invalid nearest cell
+// falls through to its 2x2 neighbours, a shift failure yields 0 (denoiser
+// + accumulation fill the residual).
 @compute @workgroup_size(8, 8)
 fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
-    let dims = textureDimensions(output_texture);
+    let dims = textureDimensions(gbuffer_cur); // full-res dst G-buffer
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
+    let pixel = global_id.xy;
 
-    let r = reservoirs[reservoir_index(global_id.xy, dims, input.rng_frame & 1u)];
-    let rgb_and_phases = wavelengths_at(r.wavelength_u);
-    var radiance = project_spectral(r.f, rgb_and_phases) * r.w;
-    if (!(radiance.x + radiance.y + radiance.z < 1e20)) {
-        radiance = vec3f(0.0);
+    // Reconstruct the full-res primary ray (same jitter as primaryMain),
+    // then this pixel's own per-pixel wavelength basis
+    var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+    let jitter = get_random_numbers(&seed) - 0.5;
+    let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
+    let wavelength_u = get_random_numbers(&seed).x;
+    let rgb_and_phases = wavelengths_at(wavelength_u);
+
+    let g = textureLoad(gbuffer_cur, vec2i(pixel), 0);
+    if (g.w < 0.0) {
+        // Primary miss: full-res, view-dependent backdrop/env (sharp)
+        var c_l: vec4f;
+        if (input.white_background == 1u) {
+            c_l = vec4f(6.0 / input.exposure * 0.25);
+        } else {
+            c_l = env_radiance_spectral(ray.direction, rgb_and_phases);
+        }
+        let bg = project_spectral(c_l, rgb_and_phases);
+        textureStore(illum_out, pixel, vec4f(bg, 1.0));
+        write_output(pixel, dims, bg);
+        return;
     }
+
+    // Full-res primary hit (shift destination)
+    let mat_idx = u32(g.w) & 3u;
+    let mat = materials[mat_idx];
+    let depth = textureLoad(gdepth_cur, vec2i(pixel), 0).r;
+    var dst_s: ShadingData;
+    dst_s.pos = ray.origin + ray.direction * depth;
+    dst_s.normal = g.xyz;
+    dst_s.out_dir = -ray.direction;
+    dst_s.lambert_out = dot(dst_s.normal, dst_s.out_dir);
+    dst_s.base_color = mat.base_color;
+    dst_s.diffuse_albedo = mat.diffuse_albedo;
+    dst_s.fresnel_0 = mat.fresnel_0;
+    dst_s.roughness = mat.roughness;
+    dst_s.pos += dst_s.normal * RAY_OFFSET;
+    var dst_refl: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    let lagr = prep_reflectance_real_lagrange_biased_3(fourier_srgb_to_fourier(dst_s.base_color));
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        dst_refl[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, lagr);
+    }
+
+    // Covering low-res cell (nearest-first over the 2x2 footprint). Cell
+    // selection depends only on GEOMETRY (material match + occupancy), never
+    // on the shift outcome, so shift failure -> 0 stays value-independent.
+    let gi_dims = textureDimensions(gi_gbuffer);
+    let base = vec2i(vec2f(pixel) * (vec2f(gi_dims) / vec2f(dims)));
+    var radiance = vec3f(0.0);
+    var it = 0u;
+    for (var t = 0; t < 4; t++) {
+        let cell = clamp(base + vec2i(t & 1, (t >> 1) & 1), vec2i(0), vec2i(gi_dims) - 1);
+        let g_gi = textureLoad(gi_gbuffer, cell, 0);
+        if (g_gi.w < 0.0 || (u32(g_gi.w) & 3u) != mat_idx) { continue; }
+        let r = reservoirs[reservoir_index(vec2u(cell), gi_dims, input.rng_frame & 1u)];
+        if (!(r.w > 0.0) || (r.path_flags & 15u) < 2u) { continue; }
+        // Reconstruct the cell's primary (its own jitter stream) as the src
+        var gseed = vec2u(vec2u(cell)) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
+        let gjit = get_random_numbers(&gseed) - 0.5;
+        let gray = generate_camera_ray(vec2f(vec2u(cell)) + 0.5 + gjit, vec2f(gi_dims));
+        var src_s: ShadingData;
+        src_s.pos = gray.origin + gray.direction * textureLoad(gi_gdepth, cell, 0).r;
+        src_s.normal = g_gi.xyz;
+        src_s.out_dir = -gray.direction;
+        src_s.lambert_out = dot(src_s.normal, src_s.out_dir);
+        src_s.base_color = mat.base_color;
+        src_s.diffuse_albedo = mat.diffuse_albedo;
+        src_s.fresnel_0 = mat.fresnel_0;
+        src_s.roughness = mat.roughness;
+        src_s.pos += src_s.normal * RAY_OFFSET;
+        let fwd = shift_reconnect(r, dst_s, dst_refl, rgb_and_phases, wavelength_u, src_s, false, 0.005, &it);
+        if (fwd.jacobian > 0.0) {
+            radiance = project_spectral(fwd.f, rgb_and_phases) * r.w * fwd.jacobian;
+        }
+        break; // first geometrically-valid cell decides (value-independent)
+    }
+    if (!(radiance.x + radiance.y + radiance.z < 1e20)) { radiance = vec3f(0.0); }
     radiance = clamp(radiance, vec3f(0.0), vec3f(100.0));
-    // Denoiser input: normalize by this sample's flat-spectrum white so the
-    // per-basis CMF color cast cancels (ratio estimator; the white-balanced
-    // LUT makes E[white] = (1,1,1), so no un-correction is needed). The
-    // accumulation path keeps the raw estimator (exact mean).
-    textureStore(illum_out, global_id.xy, vec4f(radiance, 1.0));
-    write_output(global_id.xy, dims, radiance);
+    textureStore(illum_out, pixel, vec4f(radiance, 1.0));
+    write_output(pixel, dims, radiance);
 }
 
 // ============================================================================

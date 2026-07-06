@@ -88,6 +88,15 @@ let passBindGroups: GPUBindGroup[] = [];
 // Reuse-pass variants (current G-buffer + exact depth as sampled inputs)
 let reuseBindGroups: GPUBindGroup[] = [];
 let gdepthTexture: GPUTexture;
+// Low-res GI reservoir grid: reservoir passes run at giWidth x giHeight
+// (<= render res); primary/G-buffer/shade/denoise stay at full render res
+// and shade reconnection-shifts the low-res reservoir onto each full-res
+// primary (sharp silhouettes + full-res visibility from low-res GI).
+let giWidth = 1, giHeight = 1;
+let giGbufferTextures: GPUTexture[] = [];
+let giGdepthTexture: GPUTexture;
+let initialBindGroups: GPUBindGroup[] = [];
+let shadeBindGroups: GPUBindGroup[] = [];
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
@@ -155,11 +164,19 @@ document.body.appendChild(stats.dom);
 // NB: Look for 'timestampQueryManager' in this file to locate parts of this
 // snippets that are related to timestamps. Most of the logic is in
 // TimestampQueryManager.ts.
+let lastGpuMs = 0;
 const timestampQueryManager = new TimestampQueryManager(device, (elapsedNs) => {
   // Convert from nanoseconds to milliseconds:
   const elapsedMs = Number(elapsedNs) * 1e-6;
+  lastGpuMs = elapsedMs;
   gpuPanel.update(elapsedMs, 16); // 16ms = 60fps target
 });
+// Headless-test hook: EMA of measured GPU frame time (ms), for FPS A/Bs
+let gpuMsEma = 0;
+(window as any).__gpuMs = () => {
+  gpuMsEma = gpuMsEma === 0 ? lastGpuMs : gpuMsEma * 0.8 + lastGpuMs * 0.2;
+  return JSON.stringify({ last: +lastGpuMs.toFixed(2), ema: +gpuMsEma.toFixed(2) });
+};
 
 const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
 context.configure({
@@ -221,6 +238,10 @@ function createGPUResources() {
   }
   renderWidth = Math.max(1, Math.floor(width * scale));
   renderHeight = Math.max(1, Math.floor(height * scale));
+  // Low-res GI grid resolution (reservoir passes run here)
+  const giScale = Number(controls.giScale) || 1.0;
+  giWidth = Math.max(1, Math.round(renderWidth * giScale));
+  giHeight = Math.max(1, Math.round(renderHeight * giScale));
 
   raytracedTexture = device.createTexture({
     size: [renderWidth, renderHeight],
@@ -292,15 +313,31 @@ function createGPUResources() {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   }));
 
-  // ReSTIR PT reservoirs: 64 B/pixel x 2 ping-pong halves in one buffer
-  // (stays within the 10 storage-buffer adapter limit)
+  // ReSTIR PT reservoirs at GI resolution (one buffer, 3 regions: final
+  // ping-pong x2 + post-temporal scratch). GI-sized -> the reservoir memory
+  // and all reuse-pass work scale with giScale^2.
   reservoirBuffer?.destroy();
   reservoirBuffer = device.createBuffer({
     label: 'Path reservoirs',
-    // 80 B spectral reservoirs, 3 regions: final ping-pong x2 + scratch
-    size: renderWidth * renderHeight * 80 * 3,
+    size: giWidth * giHeight * 80 * 3,
     // COPY_SRC: __readReservoir debug readback
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  // Low-res GI G-buffer (ping-pong) + exact depth, written by initialMain,
+  // read by temporal/spatial reuse and by shade (the shift source)
+  giGbufferTextures.forEach(t => t?.destroy());
+  giGbufferTextures = [0, 1].map(i => device.createTexture({
+    label: `GI G-buffer ${i}`,
+    size: [giWidth, giHeight],
+    format: 'rgba32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+  }));
+  giGdepthTexture?.destroy();
+  giGdepthTexture = device.createTexture({
+    label: 'GI primary depth',
+    size: [giWidth, giHeight],
+    format: 'r32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   });
 
   const denoiseTex = (label: string) => device.createTexture({
@@ -327,7 +364,9 @@ function createGPUResources() {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   });
 
-  // Bind group 2: pass (two variants with the G-buffer ping-pong swapped)
+  // Bind group 2 variants (parity = ping-pong; gbuffer_out = [1 - parity]).
+  // passBindGroups: full-res — Reference megakernel + primaryMain (writes
+  // full-res G-buffer 3 + depth 8; other bindings present but unused).
   passBindGroups = [0, 1].map(parity => device.createBindGroup({
     label: `Pass bind group ${parity}`,
     layout: passBindGroupLayout,
@@ -341,14 +380,45 @@ function createGPUResources() {
       { binding: 8, resource: gdepthTexture.createView() },
     ]
   }));
+  // initialMain: writes the GI-res G-buffer (3) + depth (8) + reservoirs (4)
+  initialBindGroups = [0, 1].map(parity => device.createBindGroup({
+    label: `Initial bind group ${parity}`,
+    layout: passBindGroupLayout,
+    entries: [
+      { binding: 0, resource: raytracedTexture.createView() },
+      { binding: 1, resource: { buffer: accumulationBuffer } },
+      { binding: 2, resource: giGbufferTextures[parity].createView() },
+      { binding: 3, resource: giGbufferTextures[1 - parity].createView() },
+      { binding: 4, resource: { buffer: reservoirBuffer } },
+      { binding: 5, resource: illumTexture.createView() },
+      { binding: 8, resource: giGdepthTexture.createView() },
+    ]
+  }));
+  // temporal/spatial reuse: GI-res G-buffer (cur = [1-parity]) + depth
   reuseBindGroups = [0, 1].map(parity => device.createBindGroup({
     label: `Reuse bind group ${parity}`,
     layout: reusePassBindGroupLayout,
     entries: [
-      { binding: 2, resource: gbufferTextures[parity].createView() },
+      { binding: 2, resource: giGbufferTextures[parity].createView() },
       { binding: 4, resource: { buffer: reservoirBuffer } },
+      { binding: 6, resource: giGbufferTextures[1 - parity].createView() },
+      { binding: 7, resource: giGdepthTexture.createView() },
+    ]
+  }));
+  // shade: full-res dst G-buffer/depth (6/7) + GI-res src G-buffer/depth
+  // (9/10) + reservoirs (4), writing full-res output/illum/accumulation
+  shadeBindGroups = [0, 1].map(parity => device.createBindGroup({
+    label: `Shade bind group ${parity}`,
+    layout: shadeBindGroupLayout,
+    entries: [
+      { binding: 0, resource: raytracedTexture.createView() },
+      { binding: 1, resource: { buffer: accumulationBuffer } },
+      { binding: 4, resource: { buffer: reservoirBuffer } },
+      { binding: 5, resource: illumTexture.createView() },
       { binding: 6, resource: gbufferTextures[1 - parity].createView() },
       { binding: 7, resource: gdepthTexture.createView() },
+      { binding: 9, resource: giGbufferTextures[1 - parity].createView() },
+      { binding: 10, resource: giGdepthTexture.createView() },
     ]
   }));
 }
@@ -893,8 +963,9 @@ function resetAccumulation(cause = 'unknown') {
 };
 // Headless-test hook: read one pixel's reservoir struct (80 B) from a
 // region (0/1 = final ping-pong, 2 = post-temporal scratch) for bias audits
+(window as any).__giDims = () => JSON.stringify({ giWidth, giHeight, renderWidth, renderHeight });
 (window as any).__readReservoir = async (x: number, y: number, region: number) => {
-  const idx = (region * renderWidth * renderHeight + y * renderWidth + x) * 80;
+  const idx = (region * giWidth * giHeight + y * giWidth + x) * 80;
   const buf = device.createBuffer({ size: 80, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const enc = device.createCommandEncoder();
   enc.copyBufferToBuffer(reservoirBuffer, idx, buf, 0, 80);
@@ -1091,6 +1162,23 @@ const reusePassBindGroupLayout = device.createBindGroupLayout({
   ]
 });
 
+// Shade layout: full-res dst G-buffer/depth (6/7) + low-res GI src
+// G-buffer/depth (9/10) + reservoirs (4) + output/accum/illum, all bound
+// together so the full-res shade can reconnection-shift the GI reservoir
+const shadeBindGroupLayout = device.createBindGroupLayout({
+  label: 'Shade Bind Group Layout',
+  entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+  ]
+});
+
 const computePipelineLayout = device.createPipelineLayout({
   label: 'Compute Pipeline Layout',
   bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, passBindGroupLayout],
@@ -1098,6 +1186,10 @@ const computePipelineLayout = device.createPipelineLayout({
 const reusePipelineLayout = device.createPipelineLayout({
   label: 'Reuse Pipeline Layout',
   bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, reusePassBindGroupLayout],
+});
+const shadePipelineLayout = device.createPipelineLayout({
+  label: 'Shade Pipeline Layout',
+  bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, shadeBindGroupLayout],
 });
 
 const computePipeline = await device.createComputePipelineAsync({
@@ -1110,7 +1202,12 @@ const computePipeline = await device.createComputePipelineAsync({
   throw error;
 });
 
-// ReSTIR PT passes (docs/restir-pt-plan.md): initial sampling -> shade
+// ReSTIR PT passes (docs/restir-pt-plan.md): primary -> initial -> reuse -> shade
+const primaryPipeline = await device.createComputePipelineAsync({
+  label: 'ReSTIR Primary Visibility',
+  layout: computePipelineLayout,
+  compute: { module: computeShaderModule, entryPoint: 'primaryMain' },
+});
 const initialPipeline = await device.createComputePipelineAsync({
   label: 'ReSTIR Initial Sampling',
   layout: computePipelineLayout,
@@ -1128,7 +1225,7 @@ const temporalPipeline = await device.createComputePipelineAsync({
 });
 const shadePipeline = await device.createComputePipelineAsync({
   label: 'ReSTIR Shade',
-  layout: computePipelineLayout,
+  layout: shadePipelineLayout,
   compute: { module: computeShaderModule, entryPoint: 'shadeMain' },
 });
 
@@ -1239,7 +1336,7 @@ gui.onChange((event) => {
     // Sensible exposure defaults per environment (sky radiances are huge)
     controls.exposure = controls.environment === 'Sky' ? 0.05 : 1.0;
     gui.controllersRecursive().forEach(c => c.updateDisplay());
-  } else if (event.property === 'renderScale') {
+  } else if (event.property === 'renderScale' || event.property === 'giScale') {
     createGPUResources();
     updatePixelRadius();
   }
@@ -1284,23 +1381,30 @@ function requestFrame() {
     computePass.setBindGroup(0, perFrameBindGroup);
     computePass.setBindGroup(1, dataBindGroup);
     // rngFrame was already advanced for this frame in updateInput
-    computePass.setBindGroup(2, passBindGroups[(rngFrame - 1) & 1]);
+    const p = (rngFrame - 1) & 1;
+    const giWgX = Math.ceil(giWidth / 8);
+    const giWgY = Math.ceil(giHeight / 8);
+    computePass.setBindGroup(2, passBindGroups[p]);
     if (controls.lightingMode === 'ReSTIR') {
-      computePass.setPipeline(initialPipeline);
+      // Full-res primary visibility -> full-res G-buffer + depth
+      computePass.setPipeline(primaryPipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
-      // Reuse passes reconstruct the primary hit from the G-buffer written
-      // by initialMain (sampled binding variant of group 2)
-      computePass.setBindGroup(2, reuseBindGroups[(rngFrame - 1) & 1]);
+      // GI-res reservoir passes (initial + reuse) run on the low-res grid
+      computePass.setBindGroup(2, initialBindGroups[p]);
+      computePass.setPipeline(initialPipeline);
+      computePass.dispatchWorkgroups(giWgX, giWgY, 1);
+      computePass.setBindGroup(2, reuseBindGroups[p]);
       // Debug bisection toggles (headless __set('temporalReuse'|'spatialReuse', false))
       if ((controls as any).temporalReuse !== false) {
         computePass.setPipeline(temporalPipeline);
-        computePass.dispatchWorkgroups(wgX, wgY, 1);
+        computePass.dispatchWorkgroups(giWgX, giWgY, 1);
       }
       if ((controls as any).spatialReuse !== false) {
         computePass.setPipeline(spatialPipeline);
-        computePass.dispatchWorkgroups(wgX, wgY, 1);
+        computePass.dispatchWorkgroups(giWgX, giWgY, 1);
       }
-      computePass.setBindGroup(2, passBindGroups[(rngFrame - 1) & 1]);
+      // Full-res shade: reconnection-shift the GI reservoir onto each primary
+      computePass.setBindGroup(2, shadeBindGroups[p]);
       computePass.setPipeline(shadePipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
       if (controls.denoise) {

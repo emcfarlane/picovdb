@@ -24,6 +24,7 @@ export interface Controls {
 	exposure: number;
 	maxBounces: number;
 	renderScale: number;
+	giScale: number;
 }
 
 export interface GUIControllers {
@@ -56,8 +57,9 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		lightIntensity: 15.0,
 		domeIntensity: 0.5,
 		exposure: 1.0,
-		maxBounces: 4,
+		maxBounces: 3,
 		renderScale: 0.5,
+		giScale: 0.5,
 		// Temporal + paired-spatial ReSTIR DI: measured at parity with the
 		// path tracer's 3-technique NEE on this scene while spending 1/3 of
 		// its direct shadow rays; pulls ahead as lights multiply
@@ -82,6 +84,7 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 	lighting.add(controls, 'exposure', 0.01, 4, 0.01).name('Exposure');
 	lighting.add(controls, 'maxBounces', 1, 8, 1).name('Max Bounces');
 	lighting.add(controls, 'renderScale', { '25%': 0.25, '50%': 0.5, '100%': 1 }).name('Render Scale');
+	lighting.add(controls, 'giScale', { '25%': 0.25, '50%': 0.5, '100%': 1 }).name('GI Scale');
 	// ReSTIR DI for direct lighting; off = pure path-traced reference
 
 	return { controls, gui, modelController, pauseController, cameraController, highDPIController, rotationController, debugController, illuminantController };
