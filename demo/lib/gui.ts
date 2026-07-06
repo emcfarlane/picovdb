@@ -50,7 +50,7 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		model: initialModelName ?? models[0].name,
 		environment: 'Studio HDRI',
 		whiteBackdrop: true,
-		lightingMode: 'Reference',
+		lightingMode: 'ReSTIR',
 		denoise: true,
 		illuminant: illuminants[0],
 		lightIntensity: 15.0,

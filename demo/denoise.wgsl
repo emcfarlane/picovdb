@@ -67,6 +67,11 @@ struct DenoiseParams {
 @group(0) @binding(11) var atrous_dst: texture_storage_2d<rgba32float, write>;
 // Final 8-bit output (resolve pass)
 @group(0) @binding(12) var resolve_out: texture_storage_2d<rgba8unorm, write>;
+// Progressive accumulation (rgb sum, sample count) from the shade pass —
+// the resolve blends toward its mean as the static-scene sample count
+// grows, so the denoised view CONVERGES to the reference instead of
+// plateauing at the EMA/a-trous steady state
+@group(0) @binding(13) var<storage, read> accumulation: array<vec4f>;
 
 fn dn_luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.2126, 0.7152, 0.0722));
@@ -80,6 +85,24 @@ fn world_pos(pixel: vec2u, dims: vec2u, depth: f32) -> vec3f {
     let origin = (input.camera_matrix * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
     let dir = normalize((input.camera_matrix * vec4f(dir_cam, 0.0)).xyz);
     return origin + dir * depth;
+}
+
+// True when the 3x3 neighborhood spans more than one material (or touches
+// a miss) — the AA-jittered silhouette band
+fn material_boundary(pixel: vec2u, dims: vec2u, mat_c: u32) -> bool {
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let q = vec2i(pixel) + vec2i(dx, dy);
+            if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
+                continue;
+            }
+            let gq = textureLoad(gbuf, q, 0);
+            if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -99,7 +122,34 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
     var mu = vec2f(l_in, l_in * l_in);
     var hist_len = 1.0;
 
-    if (g.w >= 0.0) {
+    if (g.w < 0.0) {
+        // Primary miss (backdrop/env): accumulate in place — the value is
+        // a smooth env/backdrop color, and without accumulation the whole
+        // background shows each frame's raw wavelength-set cast (hue
+        // flicker). Validated against the previous frame also missing.
+        let gp = textureLoad(gbuf_prev, vec2i(pixel), 0);
+        if (gp.w < 0.0) {
+            let h = textureLoad(hist_prev, vec2i(pixel), 0);
+            let m = textureLoad(moments_prev, vec2i(pixel), 0);
+            hist_len = min(h.a + 1.0, 64.0);
+            let alpha = max(0.1, 1.0 / hist_len);
+            color = mix(h.rgb, c_in, alpha);
+            mu = mix(m.xy, mu, alpha);
+        }
+    } else if (material_boundary(pixel, dims, u32(g.w) & 3u)) {
+        // Material-boundary (silhouette) pixels flip material under the AA
+        // jitter every frame; ANY material-gated history dies immediately
+        // and the pixel never settles (the edge jitter). Their converged
+        // value is the jitter-weighted MIX of both materials, so always
+        // accumulate the identity tap — one consistent estimator. The 0.15
+        // alpha floor keeps motion ghosting on the ~1px rim short-lived.
+        let h = textureLoad(hist_prev, vec2i(pixel), 0);
+        let m = textureLoad(moments_prev, vec2i(pixel), 0);
+        hist_len = min(h.a + 1.0, 64.0);
+        let alpha = max(0.15, 1.0 / hist_len);
+        color = mix(h.rgb, c_in, alpha);
+        mu = mix(m.xy, mu, alpha);
+    } else {
         let mat_idx = u32(g.w) & 3u;
         let depth = (g.w - f32(mat_idx)) * 16384.0;
         let pos = world_pos(pixel, dims, depth);
@@ -151,6 +201,34 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 color = mix(h.rgb, c_in, alpha);
                 mu = mix(m, mu, alpha);
             }
+        }
+    }
+
+    // Fresh/disoccluded pixels (boundary pixels are handled above): fall
+    // back to a material-gated 3x3 mean of the raw input instead of
+    // passing single-sample noise through (the dark edge fringe)
+    if (hist_len < 2.0 && g.w >= 0.0) {
+        let mat_c = u32(g.w) & 3u;
+        var csum = vec3f(0.0);
+        var ccnt = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let q = vec2i(pixel) + vec2i(dx, dy);
+                if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
+                    continue;
+                }
+                let gq = textureLoad(gbuf, q, 0);
+                if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
+                    continue;
+                }
+                csum += textureLoad(illum, vec2u(q), 0).rgb;
+                ccnt += 1.0;
+            }
+        }
+        if (ccnt > 1.0) {
+            color = csum / ccnt;
+            let l = dn_luminance(color);
+            mu = vec2f(l, l * l);
         }
     }
 
@@ -294,6 +372,16 @@ fn resolveMain(@builtin(global_invocation_id) gid: vec3u) {
     let dims = textureDimensions(atrous_src);
     if gid.x >= dims.x || gid.y >= dims.y { return; }
     var color = textureLoad(atrous_src, vec2i(gid.xy), 0).rgb;
+    // Converge to the reference: blend toward the progressive accumulation
+    // mean as the static-scene sample count grows (motion resets the
+    // accumulation, so interaction stays on the pure denoised path). The
+    // denoiser alone plateaus at its EMA steady state — without this the
+    // image never settles past "filtered noise" no matter how long it sits.
+    let acc = accumulation[gid.y * dims.x + gid.x];
+    if (acc.a > 0.0) {
+        let t = acc.a / (acc.a + 64.0);
+        color = mix(color, acc.rgb / acc.a, t);
+    }
     color = dn_tonemap(color);
     color = pow(color, vec3f(1.0 / 2.2));
     textureStore(resolve_out, gid.xy, vec4f(color, 1.0));

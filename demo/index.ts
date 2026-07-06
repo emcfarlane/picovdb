@@ -230,7 +230,8 @@ function createGPUResources() {
   accumulationBuffer = device.createBuffer({
     label: 'Accumulation',
     size: renderWidth * renderHeight * 16,
-    usage: GPUBufferUsage.STORAGE,
+    // COPY_SRC: __readAccum debug readback
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
   resetAccumulation("gpu-resources");
 
@@ -294,14 +295,16 @@ function createGPUResources() {
     label: 'Path reservoirs',
     // 80 B spectral reservoirs, 3 regions: final ping-pong x2 + scratch
     size: renderWidth * renderHeight * 80 * 3,
-    usage: GPUBufferUsage.STORAGE,
+    // COPY_SRC: __readReservoir debug readback
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
 
   const denoiseTex = (label: string) => device.createTexture({
     label,
     size: [renderWidth, renderHeight],
     format: 'rgba32float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    // COPY_SRC: __readHist debug readback
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
   });
   [illumTexture, ...histTextures, ...momentsTextures, ...atrousTextures]
     .forEach(t => t?.destroy());
@@ -507,6 +510,7 @@ const inputViews = {
   light_count: new Uint32Array(inputValues, 104, 1),
   white_background: new Uint32Array(inputValues, 108, 1),
   rng_frame: new Uint32Array(inputValues, 112, 1),
+  restir_debug: new Uint32Array(inputValues, 116, 1),
   prev_view: new Float32Array(inputValues, 128, 16),
   prev_camera_pos: new Float32Array(inputValues, 192, 3),
   wavelength_u: new Float32Array(inputValues, 204, 1),
@@ -826,10 +830,61 @@ function resetAccumulation(cause = 'unknown') {
 (window as any).__dbg = () => ({ accumFrameIndex, shouldDispatch, lastResetCause });
 // Headless-test hook: set a GUI control by property name (bypasses DOM)
 (window as any).__set = (prop: string, value: unknown) => {
-  (controls as any)[prop] = value;
+  // Prefer setValue so the control's onChange side effects fire (e.g.
+  // rotation -> updateObjects), matching real GUI interaction
+  const ctrl = gui.controllersRecursive().find(c => (c as any).property === prop);
+  if (ctrl) {
+    ctrl.setValue(value);
+  } else {
+    (controls as any)[prop] = value;
+  }
   gui.controllersRecursive().forEach(c => c.updateDisplay());
   resetAccumulation('test-set');
   return `${prop}=${value}`;
+};
+// Headless-test hook: denoiser history (rgb, history length) at a pixel
+(window as any).__readHist = async (x: number, y: number) => {
+  const P = (rngFrame - 1) & 1; // last write went to histTextures[1 - P]
+  const tex = histTextures[1 - P];
+  const buf = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: tex, origin: [x, y] }, { buffer: buf, bytesPerRow: 256 }, [1, 1]);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const f = new Float32Array(buf.getMappedRange().slice(0, 16));
+  buf.unmap(); buf.destroy();
+  return JSON.stringify({ rgb: [f[0], f[1], f[2]], hist_len: f[3] });
+};
+// Headless-test hook: linear-space accumulated mean at a pixel (rgb, count)
+(window as any).__readAccum = async (x: number, y: number) => {
+  const idx = (y * renderWidth + x) * 16;
+  const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(accumulationBuffer, idx, buf, 0, 16);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const f = new Float32Array(buf.getMappedRange().slice(0));
+  buf.unmap(); buf.destroy();
+  return JSON.stringify({ mean: [f[0]/f[3], f[1]/f[3], f[2]/f[3]], count: f[3] });
+};
+// Headless-test hook: read one pixel's reservoir struct (80 B) from a
+// region (0/1 = final ping-pong, 2 = post-temporal scratch) for bias audits
+(window as any).__readReservoir = async (x: number, y: number, region: number) => {
+  const idx = (region * renderWidth * renderHeight + y * renderWidth + x) * 80;
+  const buf = device.createBuffer({ size: 80, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(reservoirBuffer, idx, buf, 0, 80);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const f = new Float32Array(buf.getMappedRange().slice(0));
+  const u = new Uint32Array(f.buffer);
+  buf.unmap(); buf.destroy();
+  return JSON.stringify({
+    f: [f[0], f[1], f[2], f[3]], rc_rad: [f[4], f[5], f[6], f[7]],
+    rc_pos: [f[8], f[9], f[10]], w: f[11], m: f[12],
+    path_flags: u[16], d: u[16] & 15, env: !!(u[16] & 16), nee: !!(u[16] & 32),
+    wavelength_u: f[17], rc_wi: [f[14], f[18], f[19]], rngFrame,
+  });
 };
 // Headless-test hook: GPU readback of the presented (tonemapped) texture at
 // render resolution — measurement without daemon screenshots or UI overlay
@@ -890,6 +945,7 @@ function updateInput(deltaTime: number) {
   if (shouldDispatch) { accumFrameIndex++; }
   // Monotonic RNG frame: samples stay fresh across accumulation resets
   inputViews.rng_frame[0] = rngFrame;
+  inputViews.restir_debug[0] = (controls as any).restirDebug ?? 0;
   // ReSTIR reprojection state: last frame's view matrix + object motion
   inputViews.prev_view.set(prevViewMatrix);
   inputViews.prev_camera_pos.set(prevCameraPos);
@@ -1051,7 +1107,11 @@ const atrousParamBuffers = Array.from({ length: ATROUS_ITERATIONS }, (_, i) => {
     label: `Atrous params ${i}`, size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
-  device.queue.writeBuffer(buf, 0, new Uint32Array([i, i === 0 ? 1 : 0, 0, 0]));
+  // write_history stays 0: feeding the FILTERED first a-trous iteration
+  // back as history (SVGF's default) rectifies our wavelength-cast chroma
+  // noise through the luminance-guided weights — long-history pixels
+  // drifted pink. Temporal-integration-only history is convex per channel.
+  device.queue.writeBuffer(buf, 0, new Uint32Array([i, 0, 0, 0]));
   return buf;
 });
 
@@ -1095,6 +1155,7 @@ function createDenoiseBindGroups() {
       { binding: 0, resource: { buffer: inputBuffer } },
       { binding: 10, resource: atrousTextures[ATROUS_ITERATIONS % 2].createView() },
       { binding: 12, resource: raytracedTexture.createView() },
+      { binding: 13, resource: { buffer: accumulationBuffer } },
     ]
   });
 }
@@ -1181,10 +1242,15 @@ function requestFrame() {
     if (controls.lightingMode === 'ReSTIR') {
       computePass.setPipeline(initialPipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
-      computePass.setPipeline(temporalPipeline);
-      computePass.dispatchWorkgroups(wgX, wgY, 1);
-      computePass.setPipeline(spatialPipeline);
-      computePass.dispatchWorkgroups(wgX, wgY, 1);
+      // Debug bisection toggles (headless __set('temporalReuse'|'spatialReuse', false))
+      if ((controls as any).temporalReuse !== false) {
+        computePass.setPipeline(temporalPipeline);
+        computePass.dispatchWorkgroups(wgX, wgY, 1);
+      }
+      if ((controls as any).spatialReuse !== false) {
+        computePass.setPipeline(spatialPipeline);
+        computePass.dispatchWorkgroups(wgX, wgY, 1);
+      }
       computePass.setPipeline(shadePipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
       if (controls.denoise) {
@@ -1231,6 +1297,13 @@ function requestFrame() {
 
 // Pause/resume functionality. Use requestAnimationFrame for optimal frame timing.
 let animationId: number | null = null;
+
+// Headless-test hook: drive frames directly (the rAF loop occasionally
+// wedges machine-wide; this keeps GPU testing possible regardless)
+(window as any).__tick = (n: number) => {
+  for (let i = 0; i < (n || 1); i++) { requestFrame(); }
+  return accumFrameIndex;
+};
 
 function renderLoop() {
   (window as any).__loop = ((window as any).__loop ?? 0) + 1;

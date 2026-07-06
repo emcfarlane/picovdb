@@ -33,7 +33,10 @@ struct Input {
     // Monotonic frame counter for RNG seeding (never resets, unlike
     // frame_index, so samples stay fresh while accumulation restarts)
     rng_frame: u32,
-    _pad0: u32,
+    // Debug bitmask for reuse-bias bisection (0 in normal operation):
+    // bit 0: spatial skips d==2 candidates | bit 1: skips d==3 NEE |
+    // bit 2: skips d==3 escape | bit 3: skips d>=4
+    restir_debug: u32,
     _pad1: u32,
     _pad2: u32,
     // Previous frame's view matrix (world -> camera): temporal reprojection
@@ -42,9 +45,10 @@ struct Input {
     // Previous frame's camera position: source view directions when
     // evaluating the reverse shift for temporal MIS
     prev_camera_pos: vec3f,
-    // Stratified hero-wavelength offset, GLOBAL per frame: every pixel
-    // shares the same 4 lambdas, so same-frame (spatial) reuse never has a
-    // wavelength mismatch (docs/restir-pt-plan.md, spectral reservoirs)
+    // Legacy global hero-wavelength offset. UNUSED: lambdas are per-pixel
+    // again (a frame-global set = coherent per-frame color cast, visible as
+    // hue swings whenever motion resets accumulation); the wavelength shift
+    // rebases reused samples between per-pixel bases instead.
     wavelength_u: f32,
 }
 
@@ -146,8 +150,15 @@ struct Reservoir {
     // Confidence weight (sample count analogue, capped in temporal reuse)
     m: f32,
     rc_normal_oct: u32,
-    // Suffix direction at the rc vertex (toward x_{k+1} / the light)
-    rc_wi_oct: u32,
+    // Suffix direction at the rc vertex (toward x_{k+1} / the light),
+    // FULL f32 precision, x component (y/z below). Oct16 quantization here
+    // was an energy poison: the env pdf is texel-discontinuous, so a
+    // quantized direction re-derives lpdf on the wrong texel while the
+    // stored radiance came from the exact direction — a one-sided
+    // stored-bright/pdf-dim mismatch that inflated shifts by up to
+    // (lpdf+pdf)/pdf at softbox edges (measured +10-35% per spatial merge
+    // in shadows, amplified 4-6x by the temporal chain)
+    rc_wi_x: f32,
     init_seed: u32,
     // bits 0-3: d | bit 4: rc-is-env | bit 5: NEE | 6-7: rc material |
     // 8-9: rc object
@@ -157,12 +168,15 @@ struct Reservoir {
     // it and shading projects with it — the wavelength shift is the
     // identity (J = 1), exact for any spectrum
     wavelength_u: f32,
-    _pad1: u32,
-    _pad2: u32,
+    rc_wi_y: f32,
+    rc_wi_z: f32,
 }
 
 const PATH_FLAG_RC_ENV = 16u;
 const PATH_FLAG_NEE = 32u;
+// The d == 3 suffix vertex is on the environment (its radiance is a pure
+// function of rc_wi, so the wavelength rebase can recompute it exactly)
+const PATH_FLAG_SUFFIX_ENV = 1024u;
 
 @group(2) @binding(4) var<storage, read_write> reservoirs: array<Reservoir>;
 
@@ -266,6 +280,40 @@ struct ShiftResult {
     jacobian: f32, // PSS Jacobian; 0 marks the shift undefined
 }
 
+// Raw per-lambda env radiance for a direction in an arbitrary wavelength
+// basis (recomputable: the environment is static). Mirrors the initial
+// sampler's env_l composition.
+fn env_radiance_spectral(wi: vec3f, rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>) -> vec4f {
+    if (input.environment == ENVIRONMENT_STUDIO) {
+        return vec4f(input.dome_integral);
+    }
+    if (input.environment == ENVIRONMENT_SKY) {
+        return spectral_env_weights(skyRadianceRGB(wi, true), rgb_and_phases);
+    }
+    return spectral_env_weights(environment_rgb(wi), rgb_and_phases);
+}
+
+// Wavelength shift for sampled (non-recomputable) suffix radiance: the 4
+// hero lambdas are stratified bins; a change of the global offset u slides
+// each lambda within its bin, so linear interpolation toward the adjacent
+// bin (pdf ratio 1 — stratified-uniform) maps the stored 4-vector onto the
+// destination basis. End bins clamp (tiny extrapolation bias, d >= 4 only).
+fn rebase_suffix_radiance(rad: vec4f, u_src: f32, u_dst: f32) -> vec4f {
+    let du = u_dst - u_src;
+    if (du >= 0.0) {
+        return vec4f(
+            mix(rad.x, rad.y, du),
+            mix(rad.y, rad.z, du),
+            mix(rad.z, rad.w, du),
+            rad.w);
+    }
+    return vec4f(
+        rad.x,
+        mix(rad.y, rad.x, -du),
+        mix(rad.z, rad.y, -du),
+        mix(rad.w, rad.z, -du));
+}
+
 // Reconnection shift of a reservoir path onto a destination primary hit
 // (GRIS §7.4: reconnect at x2; direction copy for env suffixes — formulas
 // follow ReSTIR_PT Shift.slang::computeShiftedIntegrandReconnection).
@@ -281,6 +329,7 @@ fn shift_reconnect(
     dst_s: ShadingData,
     dst_reflectance: array<f32, WAVELENGTH_SAMPLE_COUNT>,
     rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>,
+    dst_u: f32,
     src_s: ShadingData,
     use_prev: bool,
     iterations: ptr<function, u32>,
@@ -302,7 +351,7 @@ fn shift_reconnect(
 
     if (is_env_rc) {
         // d = 2: x2 IS the environment — direction copy (world direction)
-        let wi = oct_decode(r.rc_wi_oct);
+        let wi = vec3f(r.rc_wi_x, r.rc_wi_y, r.rc_wi_z);
         let lambert_dst = dot(dst_s.normal, wi);
         let lambert_src = dot(src_s.normal, wi);
         if (lambert_dst <= 0.0 || lambert_src <= 0.0) {
@@ -315,11 +364,13 @@ fn shift_reconnect(
             return out;
         }
         let b_dst = frostbite_brdf(dst_s, wi);
-        // Fully per-wavelength composition: the stored suffix radiance is
-        // already the frame's per-lambda vector — no RGB round trip
+        // Wavelength shift: the env vertex's radiance is a pure function of
+        // the direction, so re-evaluate it EXACTLY in the destination basis
+        // (the stored per-lambda vector belongs to the sample's birth basis)
+        let rc_rad = env_radiance_spectral(wi, rgb_and_phases);
         var f_l = vec4f(0.0);
         for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-            f_l[i] = (dst_reflectance[i] * b_dst.x + b_dst.y) * r.rc_radiance[i];
+            f_l[i] = (dst_reflectance[i] * b_dst.x + b_dst.y) * rc_rad[i];
         }
         f_l *= lambert_dst;
         let pdf1_dst = get_frostbite_brdf_density(dst_s, wi);
@@ -350,7 +401,7 @@ fn shift_reconnect(
     let rc_obj = objects[(r.path_flags >> 8u) & 3u];
     var rc_pos = (rc_obj.transform_inverse * vec4f(r.rc_pos, 1.0)).xyz;
     var rc_n = normalize((rc_obj.transform_inverse * vec4f(oct_decode(r.rc_normal_oct), 0.0)).xyz);
-    var rc_wi = oct_decode(r.rc_wi_oct);
+    var rc_wi = vec3f(r.rc_wi_x, r.rc_wi_y, r.rc_wi_z);
     if (d >= 4u) {
         rc_wi = normalize((rc_obj.transform_inverse * vec4f(rc_wi, 0.0)).xyz);
     }
@@ -422,11 +473,20 @@ fn shift_reconnect(
     }
     let b1_dst = frostbite_brdf(dst_s, dir);
     let b2_dst = frostbite_brdf(rc_s, rc_wi);
+    // Wavelength shift of the suffix radiance into the destination basis:
+    // exact recompute when the suffix vertex is on the environment,
+    // stratified-bin interpolation for sampled deep suffixes
+    var rc_rad = r.rc_radiance;
+    if (d == 3u && (r.path_flags & PATH_FLAG_SUFFIX_ENV) != 0u) {
+        rc_rad = env_radiance_spectral(rc_wi, rgb_and_phases);
+    } else {
+        rc_rad = rebase_suffix_radiance(rc_rad, r.wavelength_u, dst_u);
+    }
     var f_l = vec4f(0.0);
     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
         let w1d = dst_reflectance[i] * b1_dst.x + b1_dst.y;
         let w2d = rc_refl[i] * b2_dst.x + b2_dst.y;
-        f_l[i] = w1d * w2d * r.rc_radiance[i];
+        f_l[i] = w1d * w2d * rc_rad[i];
     }
     f_l *= lambert_dst * lambert2_dst / pdf1_dst;
 
@@ -1360,10 +1420,14 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
 
     var throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
     var nee_throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
-    // Keep the draw so the RNG stream stays aligned with the other passes;
-    // the value is unused — lambdas are global per frame (spectral plan)
-    let unused_wavelength_rand = get_random_numbers(seed).x;
-    let rgb_and_phases = wavelengths_at(input.wavelength_u);
+    // PER-PIXEL hero-wavelength offset (like the Reference): a frame-global
+    // set makes the whole frame share one 4-lambda projection, a coherent
+    // per-frame color cast that accumulation hides while static but shows
+    // at FULL strength during motion (sharp hue swings on rotation). The
+    // wavelength shift rebases reused samples between per-pixel bases, so
+    // cross-pixel reuse no longer needs a shared basis.
+    let wavelength_u = get_random_numbers(seed).x;
+    let rgb_and_phases = wavelengths_at(wavelength_u);
     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
         throughput[i] = 1.0;
         nee_throughput[i] = 1.0;
@@ -1483,7 +1547,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                     } else if (k == 3u) {
                         // Suffix escaped right after rc: raw env + WORLD dir
                         // so the shift re-derives its MIS
-                        sel_flags |= x2_meta;
+                        sel_flags |= x2_meta | PATH_FLAG_SUFFIX_ENV;
                         sel_rc_pos = x2_pos;
                         sel_rc_normal = x2_normal;
                         sel_rc_wi = ray.direction;
@@ -1632,7 +1696,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                                 sel_rc_wi = sun_dir;
                                 sel_rc_radiance = sun_w;
                             } else if (k == 2u) {
-                                sel_flags |= x2_meta;
+                                sel_flags |= x2_meta | PATH_FLAG_SUFFIX_ENV;
                                 sel_rc_pos = x2_pos;
                                 sel_rc_normal = x2_normal;
                                 sel_rc_wi = sun_dir;
@@ -1687,7 +1751,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                                 sel_rc_wi = env_dir;
                                 sel_rc_radiance = nee_env_w;
                             } else if (k == 2u) {
-                                sel_flags |= x2_meta;
+                                sel_flags |= x2_meta | PATH_FLAG_SUFFIX_ENV;
                                 sel_rc_pos = x2_pos;
                                 sel_rc_normal = x2_normal;
                                 sel_rc_wi = env_dir;
@@ -1732,6 +1796,16 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
             x2_brdf_dir = ray.direction;
             x2_brdf_dir_idx = normalize((obj.transform * vec4f(ray.direction, 0.0)).xyz);
             x2_brdf_pdf = brdf_density_1;
+            // Suffix divider captured BEFORE the k=2 RR division: the RR
+            // compensation belongs to the suffix estimator (rc_radiance =
+            // c_l / thr2 must keep 1/survival so E[rc_radiance] is the true
+            // incident radiance). Capturing after RR made the identity
+            // shift return f * survival — a systematic energy loss on every
+            // reuse of d >= 4 paths.
+            for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                thr2[i] = throughput[i];
+            }
+            have_thr2 = true;
         }
 
         // Russian roulette (kept in the sampling PDF; decoupled from replay
@@ -1749,12 +1823,6 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
             }
         }
 
-        if (k == 2u) {
-            for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                thr2[i] = throughput[i];
-            }
-            have_thr2 = true;
-        }
     }
 
     // Write the reservoir (empty when w_sum == 0). Temporal reuse runs in
@@ -1771,11 +1839,13 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
     r.rc_pos = sel_rc_pos;
     r.m = 1.0;
     r.rc_normal_oct = oct_encode(sel_rc_normal);
-    r.rc_wi_oct = oct_encode(sel_rc_wi);
+    r.rc_wi_x = sel_rc_wi.x;
+    r.rc_wi_y = sel_rc_wi.y;
+    r.rc_wi_z = sel_rc_wi.z;
     r.init_seed = sel_init_seed;
     r.path_flags = sel_flags;
     r.rc_radiance = sel_rc_radiance;
-    r.wavelength_u = input.wavelength_u;
+    r.wavelength_u = wavelength_u;
     reservoirs[reservoir_index(pixel, dims, 2u)] = r;
     // Mirror into the frame-final region: shade + next frame's temporal
     // read it directly while the spatial pass is disabled (see P2 note)
@@ -1883,12 +1953,13 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
     let pixel = global_id.xy;
 
-    // Same RNG derivation as initialMain: jitter, then wavelengths
+    // Same RNG derivation as initialMain: jitter, then the pixel's
+    // per-pixel wavelength offset (must match initialMain's draw exactly)
     var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
     let jitter = get_random_numbers(&seed) - 0.5;
     let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
-    let unused_wavelength_rand = get_random_numbers(&seed).x; // stream alignment
-    let rgb_and_phases = wavelengths_at(input.wavelength_u);
+    let wavelength_u = get_random_numbers(&seed).x;
+    let rgb_and_phases = wavelengths_at(wavelength_u);
     // Decorrelate the merge decision from initialMain's stream
     seed ^= vec2u(0x9e3779b9u, 0x85ebca6bu);
 
@@ -1968,7 +2039,13 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
         return;
     }
     let r_t = reservoirs[reservoir_index(vec2u(best_tap), dims, 1u - (input.rng_frame & 1u))];
-    let m_t = min(r_t.m, TEMPORAL_CONFIDENCE_CAP);
+    // Debug bit 6: hard-shorten the temporal chain (cap 3) to test whether
+    // the shadow inflation compounds with chain length
+    var cap = TEMPORAL_CONFIDENCE_CAP;
+    if ((input.restir_debug & 64u) != 0u) {
+        cap = 3.0;
+    }
+    let m_t = min(r_t.m, cap);
     if (!(m_t > 0.0) || !(r_t.w > 0.0) || (r_t.path_flags & 15u) < 2u) {
         return;
     }
@@ -1977,51 +2054,86 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
     var r_c = reservoirs[cur_index];
     let p_c = luminance(project_spectral(r_c.f, rgb_and_phases));
 
-    // Forward shift: temporal sample into this pixel's domain, evaluated
-    // in the SAMPLE's own lambda basis (its u rides in the reservoir)
+    // Forward shift: temporal sample into this pixel's domain, INCLUDING
+    // the wavelength shift onto the current frame's basis (exact for env
+    // suffixes, stratified-bin interpolation for sampled deep suffixes).
+    // All candidates then live in ONE basis, which makes Talbot MIS's
+    // density ratios well-defined again (per-sample bases had disjoint
+    // wavelength supports — the old +3-5% Talbot failure).
+    let prev_sd = make_shading_data(pos_prev, n_prev,
+        normalize(input.prev_camera_pos - pos_prev), mat);
+    let fwd = shift_reconnect(r_t, s, reflectance, rgb_and_phases,
+        wavelength_u, prev_sd, false, &iterations);
+    let p_fwd = luminance(project_spectral(fwd.f, rgb_and_phases));
+
+    // Canonical Talbot weight needs the reverse shift: the canonical
+    // sample evaluated in the temporal technique's domain (prev geometry,
+    // the temporal sample's wavelength basis)
     let phases_t = wavelengths_at(r_t.wavelength_u);
     var refl_t: array<f32, WAVELENGTH_SAMPLE_COUNT>;
     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
         refl_t[i] = eval_reflectance_real_lagrange_3(phases_t[i].w, lagranges);
     }
-    let prev_sd = make_shading_data(pos_prev, n_prev,
-        normalize(input.prev_camera_pos - pos_prev), mat);
-    let fwd = shift_reconnect(r_t, s, refl_t, phases_t, prev_sd, false, &iterations);
-    let p_fwd = luminance(project_spectral(fwd.f, phases_t));
+    var m_can = 1.0;
+    if (p_c > 0.0 && r_c.w > 0.0) {
+        let rev = shift_reconnect(r_c, prev_sd, refl_t, phases_t,
+            r_t.wavelength_u, s, true, &iterations);
+        let p_rev = luminance(project_spectral(rev.f, phases_t));
+        if (p_rev > 0.0 && rev.jacobian > 0.0) {
+            // GRIS Eq. 36: canonical density vs the temporal technique's
+            // confidence-weighted density at the canonical sample
+            m_can = p_c / (p_c + m_t * p_rev * rev.jacobian);
+        }
+    }
+    let w_c = m_can * p_c * r_c.w;
+
     if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
-        // Shift failed: keep the canonical but still age confidence
+        // Temporal shift undefined: the canonical keeps its Talbot weight
+        // (the temporal technique could still have produced it) and ages
+        r_c.w = 0.0;
+        if (p_c > 0.0) {
+            r_c.w = w_c / p_c;
+        }
         r_c.m = 1.0 + m_t;
-        reservoirs[cur_index] = r_c;
+        if ((input.restir_debug & 32u) == 0u) {
+            reservoirs[cur_index] = r_c;
+        }
         reservoirs[reservoir_index(pixel, dims, input.rng_frame & 1u)] = r_c;
         return;
     }
 
-    // Constant (confidence-proportional) MIS: with the frame-global
-    // wavelength offset the u-dimension's support is DISJOINT across
-    // frames, violating Talbot MIS's overlap assumption (measured +3-5%
-    // inflation). Constant weights partition unity unconditionally (GRIS
-    // Eq. 20) and stay unbiased for any support structure, at some
-    // variance cost — the original ReSTIR temporal weighting.
-    let m_temp = m_t / (1.0 + m_t);
-    let m_can = 1.0 / (1.0 + m_t);
+    // Temporal candidate's Talbot weight: its own confidence-weighted
+    // source density (source p-hat over the forward Jacobian) vs the
+    // canonical's density at the shifted sample
+    let p_src = luminance(project_spectral(r_t.f, phases_t));
+    let dens_t = m_t * p_src / max(fwd.jacobian, 1e-9);
+    let m_temp = dens_t / max(p_fwd + dens_t, 1e-12);
     let w_t = m_temp * p_fwd * r_t.w * fwd.jacobian;
-    let w_c = m_can * p_c * r_c.w;
     let w_total = w_c + w_t;
 
     var out = r_c;
-    var out_phases = rgb_and_phases;
     if (get_random_numbers(&seed).x * w_total < w_t) {
-        out = r_t; // keeps the temporal sample's wavelength_u
-        out.f = fwd.f;
-        out_phases = phases_t;
+        out = r_t;
+        out.f = fwd.f; // rebased to the current basis by the shift
+        // Keep the stored suffix radiance consistent with wavelength_u
+        // (env suffixes get recomputed from the direction at reuse anyway)
+        out.rc_radiance = rebase_suffix_radiance(r_t.rc_radiance,
+            r_t.wavelength_u, wavelength_u);
     }
+    out.wavelength_u = wavelength_u;
     out.w = 0.0;
-    let pl = luminance(project_spectral(out.f, out_phases));
+    let pl = luminance(project_spectral(out.f, rgb_and_phases));
     if (pl > 0.0 && w_total > 0.0) {
         out.w = w_total / pl;
     }
     out.m = 1.0 + m_t;
-    reservoirs[cur_index] = out;
+    // Debug bit 5: leave region 2 holding initialMain's FRESH reservoirs so
+    // spatialMain merges un-aged neighbors (bisects temporal-aged W in the
+    // spatial injection); the temporal result still reaches shading via the
+    // final region, which spatialMain uses as its canonical under this bit
+    if ((input.restir_debug & 32u) == 0u) {
+        reservoirs[cur_index] = out;
+    }
     reservoirs[reservoir_index(pixel, dims, input.rng_frame & 1u)] = out;
 }
 
@@ -2037,18 +2149,23 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
     let pixel = global_id.xy;
 
-    var out = reservoirs[reservoir_index(pixel, dims, 2u)];
-    // The running canonical's own wavelength basis (may be a temporal
-    // survivor with an older u than this frame's)
-    var out_phases = wavelengths_at(out.wavelength_u);
+    // Canonical = post-temporal reservoir. Normally mirrored into region 2;
+    // under debug bit 5 it lives only in the final region (region 2 then
+    // holds initialMain's fresh reservoirs for the neighbor reads)
+    var canon_region = 2u;
+    if ((input.restir_debug & 32u) != 0u) {
+        canon_region = input.rng_frame & 1u;
+    }
+    let r_canon = reservoirs[reservoir_index(pixel, dims, canon_region)];
+    var out = r_canon;
     let out_index = reservoir_index(pixel, dims, input.rng_frame & 1u);
 
     // Same primary derivation as initialMain
     var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
     let jitter = get_random_numbers(&seed) - 0.5;
     let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
-    let unused_wavelength_rand = get_random_numbers(&seed).x; // stream alignment
-    let rgb_and_phases = wavelengths_at(input.wavelength_u);
+    let wavelength_u = get_random_numbers(&seed).x; // matches initialMain's draw
+    let rgb_and_phases = wavelengths_at(wavelength_u);
     seed ^= vec2u(0xc2b2ae35u, 0x27d4eb2fu); // decorrelate from other passes
 
     var iterations = 0u;
@@ -2077,20 +2194,59 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
         reflectance[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, lagranges);
     }
 
-    for (var n = 0u; n < 3u; n++) {
+    // Defensive pairwise MIS (GRIS Eq. 38, the paper's spatial choice):
+    // per-candidate density ratios via one forward + one reverse shift per
+    // neighbor, streamed into a fresh reservoir; the canonical merges last
+    // with its accumulated defensive weight, and the final UCW divides by
+    // (validNeighbors + 1). All reservoirs share the frame's wavelength
+    // basis after the temporal pass's wavelength shift.
+    let p_c = luminance(project_spectral(r_canon.f, rgb_and_phases));
+    let m_c = r_canon.m;
+    var canonical_weight = 1.0;
+    var valid_neighbors = 0.0;
+    var w_sum = 0.0;
+    var m_sum = m_c;
+    var sel = r_canon;
+    var have_sel = false;
+
+    // Debug bit 8: single SELF-merge (np = pixel, exact identity shift —
+    // any deviation from parity is a mechanical merge bug); bit 9: single
+    // fixed-offset neighbor (+8, 0)
+    var neighbor_count = 3u;
+    if ((input.restir_debug & (256u | 512u)) != 0u) {
+        neighbor_count = 1u;
+    }
+    let k_norm = f32(neighbor_count);
+    for (var n = 0u; n < neighbor_count; n++) {
         // Gaussian neighbor offset (Box-Muller, sigma = 16)
         let u = get_random_numbers(&seed);
         let rad = 16.0 * sqrt(max(-2.0 * log(max(u.x, 1e-6)), 0.0));
         let ang = 2.0 * PI * u.y;
-        let np = vec2i(pixel) + vec2i(rad * vec2f(cos(ang), sin(ang)));
-        if (any(np < vec2i(0)) || any(np >= vec2i(dims)) || all(np == vec2i(pixel))) {
+        var np = vec2i(pixel) + vec2i(rad * vec2f(cos(ang), sin(ang)));
+        if ((input.restir_debug & 256u) != 0u) {
+            np = vec2i(pixel);
+        } else if ((input.restir_debug & 512u) != 0u) {
+            np = vec2i(pixel) + vec2i(8, 0);
+        }
+        if (any(np < vec2i(0)) || any(np >= vec2i(dims)) ||
+            (all(np == vec2i(pixel)) && (input.restir_debug & 256u) == 0u)) {
             continue;
         }
         let r_n = reservoirs[reservoir_index(vec2u(np), dims, 2u)];
-        let m_n = min(r_n.m, TEMPORAL_CONFIDENCE_CAP);
-        if (!(m_n > 0.0) || !(r_n.w > 0.0) || (r_n.path_flags & 15u) < 2u) {
-            out.m += m_n; // count the neighbor even when unusable
+        let m_n = min(r_n.m, TEMPORAL_CONFIDENCE_CAP + 1.0);
+        if (!(m_n > 0.0)) {
             continue;
+        }
+        // Bias-bisection gates (restir_debug == 0 in normal operation)
+        if (input.restir_debug != 0u) {
+            let d_n = r_n.path_flags & 15u;
+            let nee_n = (r_n.path_flags & PATH_FLAG_NEE) != 0u;
+            if (((input.restir_debug & 1u) != 0u && d_n == 2u) ||
+                ((input.restir_debug & 2u) != 0u && d_n == 3u && nee_n) ||
+                ((input.restir_debug & 4u) != 0u && d_n == 3u && !nee_n) ||
+                ((input.restir_debug & 8u) != 0u && d_n >= 4u)) {
+                continue;
+            }
         }
         // Re-trace the neighbor's primary hit (their jitter stream)
         var nseed = vec2u(vec2u(np)) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
@@ -2100,10 +2256,8 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
         let nhit = intersect_scene(nray, &nit);
         iterations += nit;
         if (nhit.object_index != hit.object_index) {
-            out.m += m_n;
             continue;
         }
-        let nobj = objects[nhit.object_index];
         var ns: ShadingData;
         ns.pos = nray.origin + nray.direction * nhit.distance;
         ns.normal = nhit.normal;
@@ -2117,49 +2271,75 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
         ns.roughness = s.roughness;
         ns.pos += ns.normal * RAY_OFFSET;
         if (dot(ns.normal, s.normal) <= 0.9) {
-            out.m += m_n;
             continue;
+        }
+        valid_neighbors += 1.0;
+        m_sum += m_n;
+
+        // Defensive canonical share for this pair: the canonical sample's
+        // density in the NEIGHBOR's domain (reverse shift, evaluated in the
+        // neighbor's own per-pixel wavelength basis) vs its own
+        canonical_weight += 1.0;
+        let phases_n = wavelengths_at(r_n.wavelength_u);
+        if (p_c > 0.0 && r_canon.w > 0.0) {
+            var refl_nb: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+            for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                refl_nb[i] = eval_reflectance_real_lagrange_3(phases_n[i].w, lagranges);
+            }
+            let rev = shift_reconnect(r_canon, ns, refl_nb, phases_n,
+                r_n.wavelength_u, s, false, &iterations);
+            let p_rev = luminance(project_spectral(rev.f, phases_n)) * rev.jacobian;
+            if (p_rev > 0.0) {
+                canonical_weight -= p_rev * m_n / (p_rev * m_n + m_c * p_c / k_norm);
+            }
         }
 
-        // Forward shift: neighbor path into this pixel, evaluated in the
-        // SAMPLE's own wavelength basis (temporal survivors in the scratch
-        // carry older u sets — mixing bases blew energy up immediately)
-        let phases_n = wavelengths_at(r_n.wavelength_u);
-        var refl_n: array<f32, WAVELENGTH_SAMPLE_COUNT>;
-        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-            refl_n[i] = eval_reflectance_real_lagrange_3(phases_n[i].w, lagranges);
+        if (!(r_n.w > 0.0) || (r_n.path_flags & 15u) < 2u) {
+            continue; // neighbor carries no usable sample (confidence counted)
         }
-        let fwd = shift_reconnect(r_n, s, refl_n, phases_n, ns, false, &iterations);
-        let p_fwd = luminance(project_spectral(fwd.f, phases_n));
+        // Forward shift: neighbor path into THIS pixel's per-pixel basis
+        // (the wavelength shift rebases the suffix radiance)
+        let fwd = shift_reconnect(r_n, s, reflectance, rgb_and_phases,
+            wavelength_u, ns, false, &iterations);
+        let p_fwd = luminance(project_spectral(fwd.f, rgb_and_phases));
         if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
-            out.m += m_n;
             continue;
         }
-        // Constant (confidence-proportional) MIS — partitions unity for
-        // any support structure, including cross-basis candidate pairs;
-        // also removes the need for a reverse shift entirely
-        let p_c = luminance(project_spectral(out.f, out_phases));
-        let m_c = out.m;
-        let m_nw = m_n / max(m_c + m_n, 1e-6);
-        let m_cw = m_c / max(m_c + m_n, 1e-6);
-        let w_n = m_nw * p_fwd * r_n.w * fwd.jacobian;
-        let w_c = m_cw * p_c * out.w;
-        let w_total = w_c + w_n;
-        if (get_random_numbers(&seed).x * w_total < w_n) {
-            let keep_m = out.m;
-            out = r_n; // carries r_n.wavelength_u
-            out.m = keep_m;
-            out.f = fwd.f;
-            out_phases = phases_n;
+        // Pairwise MIS weight (GRIS Eq. 38): the neighbor technique's
+        // source density is its p-hat in ITS OWN basis
+        let p_src_n = luminance(project_spectral(r_n.f, phases_n));
+        let dens_n = p_src_n / max(fwd.jacobian, 1e-9) * m_n;
+        let nw = dens_n / max(dens_n + p_fwd * m_c / k_norm, 1e-12);
+        let w_n = nw * p_fwd * r_n.w * fwd.jacobian;
+        w_sum += w_n;
+        if (get_random_numbers(&seed).x * w_sum < w_n) {
+            sel = r_n;
+            sel.f = fwd.f; // rebased to this pixel's basis by the shift
+            sel.rc_radiance = rebase_suffix_radiance(r_n.rc_radiance,
+                r_n.wavelength_u, wavelength_u);
+            sel.wavelength_u = wavelength_u;
+            have_sel = true;
         }
-        out.w = 0.0;
-        let pl = luminance(project_spectral(out.f, out_phases));
-        if (pl > 0.0 && w_total > 0.0) {
-            out.w = w_total / pl;
-        }
-        out.m += m_n;
     }
 
+    // Canonical sample merges last with its accumulated defensive weight
+    let w_c = canonical_weight * p_c * r_canon.w;
+    w_sum += w_c;
+    if (w_c > 0.0 && get_random_numbers(&seed).x * w_sum < w_c) {
+        sel = r_canon;
+        have_sel = true;
+    } else if (!have_sel) {
+        sel = r_canon;
+    }
+
+    out = sel;
+    out.m = m_sum;
+    out.w = 0.0;
+    let pl = luminance(project_spectral(out.f, rgb_and_phases));
+    if (pl > 0.0 && w_sum > 0.0) {
+        // Pairwise weights are not pre-divided by (k + 1); normalize here
+        out.w = w_sum / pl / (valid_neighbors + 1.0);
+    }
     reservoirs[out_index] = out;
 }
 
