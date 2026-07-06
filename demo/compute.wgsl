@@ -125,6 +125,16 @@ const MAX_LIGHTS: u32 = 8u;
 @group(2) @binding(3) var gbuffer_out: texture_storage_2d<rgba32float, write>;
 // Raw (pre-accumulation, pre-tonemap) per-frame radiance for the denoiser
 @group(2) @binding(5) var illum_out: texture_storage_2d<rgba32float, write>;
+// Reuse-pass variant bindings (temporal/spatial only): the CURRENT frame's
+// G-buffer + exact primary depth as sampled inputs — reconstructing the
+// primary hit replaces ~5 HDDA traversals/pixel of deterministic re-traces
+// (the gbuffer w-packing's quantized depth is too coarse: its ~4e-3 step
+// exceeds RAY_OFFSET, so the exact distance rides in its own r32float —
+// rg32float storage is not supported in WebGPU compatibility mode)
+@group(2) @binding(6) var gbuffer_cur: texture_2d<f32>;
+@group(2) @binding(7) var gdepth_cur: texture_2d<f32>;
+// Written by initial sampling alongside the G-buffer
+@group(2) @binding(8) var gdepth_out: texture_storage_2d<r32float, write>;
 
 // ============================================================================
 // ReSTIR PT reservoirs (docs/restir-pt-plan.md, layout after ReSTIR PT
@@ -1612,6 +1622,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
             // passed on depth-contour bands only, the banding root cause)
             textureStore(gbuffer_out, pixel,
                 vec4f(s.normal, f32(obj.material_index) + clamp(hit.distance * (1.0 / 16384.0), 0.0, 0.9999)));
+            textureStore(gdepth_out, pixel, vec4f(hit.distance, 0.0, 0.0, 0.0));
         }
 
         // Lamp NEE
@@ -1949,7 +1960,7 @@ fn initialMain(@builtin(global_invocation_id) global_id: vec3u) {
 // register pressure bounded.
 @compute @workgroup_size(8, 8)
 fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
-    let dims = textureDimensions(output_texture);
+    let dims = textureDimensions(gbuffer_cur);
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
     let pixel = global_id.xy;
 
@@ -1964,26 +1975,20 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
     seed ^= vec2u(0x9e3779b9u, 0x85ebca6bu);
 
     var iterations = 0u;
-    let hit = intersect_scene(ray, &iterations);
-    if (hit.object_index < 0) {
+    // Reconstruct this frame's primary hit from the G-buffer (initialMain
+    // already traced it: same jitter stream, exact depth in gdepth_cur)
+    let g = textureLoad(gbuffer_cur, vec2i(pixel), 0);
+    if (g.w < 0.0) {
         return; // miss pixels keep the canonical (d = 1) sample
     }
-    let light_hit = intersect_lights(ray);
-    if (light_hit.index >= 0 && light_hit.t < hit.distance) {
-        return;
-    }
-
-    let obj = objects[hit.object_index];
-    let mat = materials[obj.material_index];
+    let mat_idx = u32(g.w) & 3u;
+    let depth = textureLoad(gdepth_cur, vec2i(pixel), 0).r;
+    // Materials map 1:1 to objects (0 = model, 1 = ground)
+    let obj = objects[min(mat_idx, 1u)];
+    let mat = materials[mat_idx];
     var s: ShadingData;
-    s.pos = ray.origin + ray.direction * hit.distance;
-    s.normal = hit.normal;
-    if (!(dot(s.normal, s.normal) > 0.5)) {
-        s.normal = -ray.direction;
-    }
-    if (dot(s.normal, ray.direction) > 0.0) {
-        s.normal = -s.normal;
-    }
+    s.pos = ray.origin + ray.direction * depth;
+    s.normal = g.xyz; // stored post-faceforward
     s.out_dir = -ray.direction;
     s.lambert_out = dot(s.normal, s.out_dir);
     s.base_color = mat.base_color;
@@ -2025,7 +2030,7 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
                 continue;
             }
             let gp = textureLoad(gbuffer_prev, pp, 0);
-            if (gp.w < 0.0 || (u32(gp.w) & 3u) != obj.material_index) {
+            if (gp.w < 0.0 || (u32(gp.w) & 3u) != mat_idx) {
                 continue;
             }
             let score = dot(gp.xyz, n_prev);
@@ -2145,7 +2150,7 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
 // deterministically (same jitter stream), which doubles as validation.
 @compute @workgroup_size(8, 8)
 fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
-    let dims = textureDimensions(output_texture);
+    let dims = textureDimensions(gbuffer_cur);
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
     let pixel = global_id.xy;
 
@@ -2169,18 +2174,17 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
     seed ^= vec2u(0xc2b2ae35u, 0x27d4eb2fu); // decorrelate from other passes
 
     var iterations = 0u;
-    let hit = intersect_scene(ray, &iterations);
-    if (hit.object_index < 0) {
+    // Reconstruct the primary hit from the G-buffer (see temporalMain)
+    let g = textureLoad(gbuffer_cur, vec2i(pixel), 0);
+    if (g.w < 0.0) {
         reservoirs[out_index] = out;
         return;
     }
-    let obj = objects[hit.object_index];
-    let mat = materials[obj.material_index];
+    let mat_idx = u32(g.w) & 3u;
+    let mat = materials[mat_idx];
     var s: ShadingData;
-    s.pos = ray.origin + ray.direction * hit.distance;
-    s.normal = hit.normal;
-    if (!(dot(s.normal, s.normal) > 0.5)) { s.normal = -ray.direction; }
-    if (dot(s.normal, ray.direction) > 0.0) { s.normal = -s.normal; }
+    s.pos = ray.origin + ray.direction * textureLoad(gdepth_cur, vec2i(pixel), 0).r;
+    s.normal = g.xyz;
     s.out_dir = -ray.direction;
     s.lambert_out = dot(s.normal, s.out_dir);
     s.base_color = mat.base_color;
@@ -2248,21 +2252,18 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
                 continue;
             }
         }
-        // Re-trace the neighbor's primary hit (their jitter stream)
+        // Reconstruct the neighbor's primary hit from the G-buffer
+        // (their jitter stream; no trace needed)
+        let g_n = textureLoad(gbuffer_cur, np, 0);
+        if (g_n.w < 0.0 || (u32(g_n.w) & 3u) != mat_idx) {
+            continue;
+        }
         var nseed = vec2u(vec2u(np)) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
         let njitter = get_random_numbers(&nseed) - 0.5;
         let nray = generate_camera_ray(vec2f(vec2u(np)) + 0.5 + njitter, vec2f(dims));
-        var nit = 0u;
-        let nhit = intersect_scene(nray, &nit);
-        iterations += nit;
-        if (nhit.object_index != hit.object_index) {
-            continue;
-        }
         var ns: ShadingData;
-        ns.pos = nray.origin + nray.direction * nhit.distance;
-        ns.normal = nhit.normal;
-        if (!(dot(ns.normal, ns.normal) > 0.5)) { ns.normal = -nray.direction; }
-        if (dot(ns.normal, nray.direction) > 0.0) { ns.normal = -ns.normal; }
+        ns.pos = nray.origin + nray.direction * textureLoad(gdepth_cur, np, 0).r;
+        ns.normal = g_n.xyz;
         ns.out_dir = -nray.direction;
         ns.lambert_out = dot(ns.normal, ns.out_dir);
         ns.base_color = s.base_color;
