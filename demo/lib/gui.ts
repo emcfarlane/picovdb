@@ -13,11 +13,13 @@ export interface Controls {
 	rotation: number;
 	resetCamera: () => void;
 	debugIterations: boolean;
+	passMode: 'Final' | 'Denoised' | 'Raw' | 'GBuffer Normals' | 'Motion Vectors' | 'Depth' | 'Iterations';
 	model: string;
 	environment: 'Studio' | 'Sky' | 'Studio HDRI';
 	whiteBackdrop: boolean;
 	lightingMode: 'Reference' | 'ReSTIR';
 	denoise: boolean;
+	denoiserMode: 'SVGF' | 'WALR';
 	illuminant: string;
 	lightIntensity: number;
 	domeIntensity: number;
@@ -52,11 +54,13 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		rotation: 0.0,
 		resetCamera: () => { },
 		debugIterations: false,
+		passMode: 'Final',
 		model: initialModelName ?? models[0].name,
 		environment: 'Studio HDRI',
 		whiteBackdrop: true,
-		lightingMode: 'ReSTIR',
+		lightingMode: 'Reference',
 		denoise: true,
+		denoiserMode: 'WALR',
 		illuminant: illuminants[0],
 		lightIntensity: 15.0,
 		domeIntensity: 0.5,
@@ -76,12 +80,10 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 	const cameraController = gui.add(controls, 'resetCamera').name('Reset Camera');
 	const highDPIController = gui.add(controls, 'highDPI').name('High DPI');
 	const rotationController = gui.add(controls, 'rotation', 0, 360, 1).name('Rotation');
-	const debugController = gui.add(controls, 'debugIterations').name('Debug Iterations');
+	const debugController = gui.add(controls, 'passMode', ['Final', 'Denoised', 'Raw', 'GBuffer Normals', 'Motion Vectors', 'Depth', 'Iterations']).name('Pass');
 
 	const lighting = gui.addFolder('Lighting');
-	// ReSTIR = ReSTIR PT (docs/restir-pt-plan.md); Reference = ground truth
-	lighting.add(controls, 'lightingMode', ['Reference', 'ReSTIR']).name('Lighting');
-	// SVGF on the ReSTIR output (temporal + a-trous); off = raw accumulation
+	// Path tracing + ReBLUR-style denoiser (docs/restir-pt-plan.md)
 	lighting.add(controls, 'denoise').name('Denoise');
 	lighting.add(controls, 'environment', ['Studio HDRI', 'Studio', 'Sky']).name('Environment');
 	lighting.add(controls, 'whiteBackdrop').name('White Backdrop');

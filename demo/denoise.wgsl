@@ -370,6 +370,137 @@ fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // ============================================================================
+// Pass 2 (alt): WALR — Weighted A-Trous Linear Regression (src-walr, AMD 2022)
+// Instead of the a-trous weighted AVERAGE, fit a per-pixel weighted linear
+// model of the (demodulated) irradiance against position-offset features
+// [1, dx, dy, dz] over the 5x5 stride window (moving least squares), solved
+// by 4x4 Cholesky. The intercept beta0 IS the denoised centre value. A
+// planar fit preserves the smooth gradients of indirect shadows/highlights
+// that averaging flattens into piecewise-constant patches, so large filters
+// stay usable on a 1-spp signal. Regularisation degrades gracefully to the
+// weighted average when the neighbourhood is degenerate (flat/too few taps).
+// ============================================================================
+@compute @workgroup_size(8, 8)
+fn walrMain(@builtin(global_invocation_id) gid: vec3u) {
+    let dims = textureDimensions(atrous_src);
+    if gid.x >= dims.x || gid.y >= dims.y { return; }
+    let pixel = vec2i(gid.xy);
+
+    let center = textureLoad(atrous_src, pixel, 0);
+    let g = textureLoad(gbuf, pixel, 0);
+    if (g.w < 0.0) {
+        textureStore(atrous_dst, gid.xy, center);
+        if (params.write_history == 1u) {
+            textureStore(hist_out, gid.xy, vec4f(center.rgb, textureLoad(moments_prev, pixel, 0).w));
+        }
+        return;
+    }
+    let mat_c = u32(g.w) & 3u;
+    let depth_c = (g.w - f32(mat_c)) * 16384.0;
+    let n_c = g.xyz;
+    let pos_c = world_pos(gid.xy, dims, depth_c);
+    let step = i32(1u << params.step);
+    // Scale position deltas to ~unit magnitude over the footprint so the
+    // 4x4 normal-equation matrix stays well conditioned
+    let fscale = 1.0 / (0.01 * depth_c * f32(step) + 1e-4);
+    let l_c = dn_luminance(center.rgb);
+    // 3x3-prefiltered variance drives the luminance edge-stop. This is
+    // ESSENTIAL, not optional: on a flat plane the geometric weights
+    // (plane-distance/normal) are identical for lit and shadowed pixels, so
+    // only the luminance weight stops the regression from fitting ACROSS a
+    // hard shadow edge and smearing it (the removed-shadow + ghosting bug).
+    var var_pre = 0.0;
+    {
+        var vwsum = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let q = clamp(pixel + vec2i(dx, dy), vec2i(0), vec2i(dims) - 1);
+                let wg = select(select(1.0, 2.0, (dx == 0) != (dy == 0)), 4.0, dx == 0 && dy == 0);
+                var_pre += wg * textureLoad(atrous_src, q, 0).a;
+                vwsum += wg;
+            }
+        }
+        var_pre /= vwsum;
+    }
+    let sigma_l_den = SIGMA_L * sqrt(max(var_pre, 1e-10));
+
+    // Weighted normal-equation moments: M (4x4 symmetric upper triangle) and
+    // b = X^T W y (one vec3 per feature row)
+    var m00 = 0.0; var m01 = 0.0; var m02 = 0.0; var m03 = 0.0;
+    var m11 = 0.0; var m12 = 0.0; var m13 = 0.0;
+    var m22 = 0.0; var m23 = 0.0; var m33 = 0.0;
+    var b0 = vec3f(0.0); var b1 = vec3f(0.0); var b2 = vec3f(0.0); var b3 = vec3f(0.0);
+    var wsum = 0.0;
+    var sum_v = 0.0;
+    for (var dy = -2; dy <= 2; dy++) {
+        for (var dx = -2; dx <= 2; dx++) {
+            let q = pixel + vec2i(dx, dy) * step;
+            if (any(q < vec2i(0)) || any(q >= vec2i(dims))) { continue; }
+            let gq = textureLoad(gbuf, q, 0);
+            if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) { continue; }
+            let depth_q = (gq.w - f32(u32(gq.w) & 3u)) * 16384.0;
+            let pos_q = world_pos(vec2u(q), dims, depth_q);
+            let sq = textureLoad(atrous_src, q, 0);
+            let y = sq.rgb;
+            // Edge-stopping: plane distance + normal + variance-guided
+            // LUMINANCE (the last preserves hard shadow discontinuities)
+            let plane_d = abs(dot(n_c, pos_q - pos_c));
+            let wz = exp(-plane_d / (SIGMA_Z * (0.01 * depth_c) + 1e-4));
+            let wn = pow(max(dot(n_c, gq.xyz), 0.0), SIGMA_N);
+            let wl = exp(-abs(dn_luminance(y) - l_c) / (sigma_l_den + 1e-8));
+            var kern = KERNEL;
+            let h = kern[abs(dx)] * kern[abs(dy)];
+            let w = h * wz * wn * wl;
+            if (w <= 0.0) { continue; }
+            let d = (pos_q - pos_c) * fscale;
+            sum_v += w * w * sq.a;
+            // accumulate w * x x^T (x = [1, d.x, d.y, d.z]) and w * x y
+            m00 += w;          m01 += w * d.x;      m02 += w * d.y;      m03 += w * d.z;
+            m11 += w * d.x*d.x; m12 += w * d.x*d.y;  m13 += w * d.x*d.z;
+            m22 += w * d.y*d.y; m23 += w * d.y*d.z;
+            m33 += w * d.z*d.z;
+            b0 += w * y; b1 += w * (d.x * y); b2 += w * (d.y * y); b3 += w * (d.z * y);
+            wsum += w;
+        }
+    }
+    var out_c = center.rgb;
+    if (m00 > 1e-8) {
+        // Ridge regularisation on the gradient terms: pulls beta_{1..3} -> 0
+        // (i.e. toward the plain weighted average beta0 = sum(w*y)/sum(w))
+        // when the fit is under-determined. 0.3 keeps a mild bias for
+        // stability while still fitting real gradients.
+        let lambda = 0.3 * m00;
+        m11 += lambda; m22 += lambda; m33 += lambda;
+        // Cholesky M = L L^T (lower), then forward/back substitution.
+        let l00 = sqrt(max(m00, 1e-8));
+        let l10 = m01 / l00; let l20 = m02 / l00; let l30 = m03 / l00;
+        let l11 = sqrt(max(m11 - l10*l10, 1e-8));
+        let l21 = (m12 - l20*l10) / l11; let l31 = (m13 - l30*l10) / l11;
+        let l22 = sqrt(max(m22 - l20*l20 - l21*l21, 1e-8));
+        let l32 = (m23 - l30*l20 - l31*l21) / l22;
+        let l33 = sqrt(max(m33 - l30*l30 - l31*l31 - l32*l32, 1e-8));
+        let z0 = b0 / l00;
+        let z1 = (b1 - l10*z0) / l11;
+        let z2 = (b2 - l20*z0 - l21*z1) / l22;
+        let z3 = (b3 - l30*z0 - l31*z1 - l32*z2) / l33;
+        let beta3 = z3 / l33;
+        let beta2 = (z2 - l32*beta3) / l22;
+        let beta1 = (z1 - l21*beta2 - l31*beta3) / l11;
+        let beta0 = (z0 - l10*beta1 - l20*beta2 - l30*beta3) / l00;
+        // beta0 is the fit at the centre (x = [1,0,0,0]); clamp to the
+        // neighbourhood mean +/- guard to reject extrapolation overshoot
+        let mean = b0 / wsum;
+        out_c = clamp(beta0, mean - abs(mean) - vec3f(0.05), mean + abs(mean) + vec3f(0.05));
+        out_c = max(out_c, vec3f(0.0));
+    }
+    let out_v = select(center.a, sum_v / (wsum * wsum), wsum > 1e-8);
+    textureStore(atrous_dst, gid.xy, vec4f(out_c, out_v));
+    if (params.write_history == 1u) {
+        textureStore(hist_out, gid.xy, vec4f(out_c, textureLoad(moments_prev, pixel, 0).w));
+    }
+}
+
+// ============================================================================
 // Pass 3: resolve — tonemap the filtered radiance to the display target
 // ============================================================================
 fn dn_tonemap(color: vec3f) -> vec3f {

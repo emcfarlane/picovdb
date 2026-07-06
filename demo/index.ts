@@ -79,8 +79,9 @@ let momentsTextures: GPUTexture[] = [];
 let atrousTextures: GPUTexture[] = [];
 let denoiseTemporalGroups: GPUBindGroup[] = [];
 let denoiseAtrousGroups: GPUBindGroup[][] = [];
+let denoiseWalrGroups: GPUBindGroup[][] = [];
 let denoiseResolveGroups: GPUBindGroup[] = [];
-let displayBindGroup: GPUBindGroup;
+let displayBindGroups: GPUBindGroup[] = [];
 let perFrameBindGroup: GPUBindGroup;
 let dataBindGroup: GPUBindGroup;
 // Two pass bind groups with the G-buffer ping-pong swapped
@@ -263,14 +264,19 @@ function createGPUResources() {
   });
   resetAccumulation("gpu-resources");
 
-  displayBindGroup = device.createBindGroup({
-    label: "Display bind group",
+  displayBindGroups = [0, 1].map(P => device.createBindGroup({
+    label: `Display bind group ${P}`,
     layout: displayPipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: raytracedTexture.createView() },
       { binding: 1, resource: displaySampler },
+      { binding: 2, resource: gbufferTextures[1 - P].createView() },
+      { binding: 3, resource: gdepthTexture.createView() },
+      { binding: 4, resource: illumTexture.createView() },
+      { binding: 5, resource: { buffer: inputBuffer } },
+      { binding: 6, resource: { buffer: objectsBuffer } },
     ]
-  });
+  }));
 
   // Bind group 0: per-frame
   perFrameBindGroup = device.createBindGroup({
@@ -1074,7 +1080,8 @@ function updateInput(deltaTime: number) {
   inputViews.time_delta[0] = deltaTime;
 
   // Update debug flag
-  inputViews.debug_iterations[0] = controls.debugIterations ? 1 : 0;
+  // Debug Iterations moved into the Pass dropdown
+  inputViews.debug_iterations[0] = controls.passMode === 'Iterations' ? 1 : 0;
 
   // Drag rotates/pans the model in hand; the camera keeps only zoom (dolly
   // along its fixed view direction), so backdrop and lights stay put.
@@ -1101,7 +1108,9 @@ function updateInput(deltaTime: number) {
   if (shouldDispatch) { accumFrameIndex++; }
   // Monotonic RNG frame: samples stay fresh across accumulation resets
   inputViews.rng_frame[0] = rngFrame;
-  inputViews.restir_debug[0] = (controls as any).restirDebug ?? 0;
+  // pass_mode rides in the (now-free) restir_debug slot; read by blit.wgsl
+  const PASS = { 'Final': 0, 'Denoised': 1, 'Raw': 2, 'GBuffer Normals': 3, 'Motion Vectors': 4, 'Depth': 5, 'Iterations': 6 } as const;
+  inputViews.restir_debug[0] = PASS[controls.passMode as keyof typeof PASS] ?? 0;
   // ReSTIR reprojection state: last frame's view matrix + object motion
   inputViews.prev_view.set(prevViewMatrix);
   inputViews.prev_camera_pos.set(prevCameraPos);
@@ -1319,6 +1328,12 @@ const denoiseAtrousPipeline = await device.createComputePipelineAsync({
   label: 'Denoise A-Trous', layout: 'auto',
   compute: { module: denoiseModule, entryPoint: 'atrousMain' },
 });
+// WALR (weighted a-trous linear regression) spatial filter — same bindings
+// as atrousMain, its own 'auto' layout (WebGPU auto layouts are not shared)
+const denoiseWalrPipeline = await device.createComputePipelineAsync({
+  label: 'Denoise WALR', layout: 'auto',
+  compute: { module: denoiseModule, entryPoint: 'walrMain' },
+});
 const denoiseResolvePipeline = await device.createComputePipelineAsync({
   label: 'Denoise Resolve', layout: 'auto',
   compute: { module: denoiseModule, entryPoint: 'resolveMain' },
@@ -1361,6 +1376,20 @@ function createDenoiseBindGroups() {
     Array.from({ length: ATROUS_ITERATIONS }, (_, i) => device.createBindGroup({
       label: `Denoise atrous ${P}.${i}`,
       layout: denoiseAtrousPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: inputBuffer } },
+        { binding: 2, resource: { buffer: atrousParamBuffers[i] } },
+        { binding: 4, resource: gbufferTextures[1 - P].createView() },
+        { binding: 7, resource: momentsTextures[1 - P].createView() },
+        { binding: 8, resource: histTextures[1 - P].createView() },
+        { binding: 10, resource: atrousTextures[i % 2].createView() },
+        { binding: 11, resource: atrousTextures[(i + 1) % 2].createView() },
+      ]
+    })));
+  denoiseWalrGroups = [0, 1].map(P =>
+    Array.from({ length: ATROUS_ITERATIONS }, (_, i) => device.createBindGroup({
+      label: `Denoise walr ${P}.${i}`,
+      layout: denoiseWalrPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: inputBuffer } },
         { binding: 2, resource: { buffer: atrousParamBuffers[i] } },
@@ -1514,9 +1543,11 @@ function requestFrame() {
       computePass.setPipeline(denoiseTemporalPipeline);
       computePass.setBindGroup(0, denoiseTemporalGroups[P]);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
-      computePass.setPipeline(denoiseAtrousPipeline);
+      const useWalr = (controls as any).denoiserMode === 'WALR';
+      computePass.setPipeline(useWalr ? denoiseWalrPipeline : denoiseAtrousPipeline);
+      const spatialGroups = useWalr ? denoiseWalrGroups : denoiseAtrousGroups;
       for (let i = 0; i < ATROUS_ITERATIONS; i++) {
-        computePass.setBindGroup(0, denoiseAtrousGroups[P][i]);
+        computePass.setBindGroup(0, spatialGroups[P][i]);
         computePass.dispatchWorkgroups(wgX, wgY, 1);
       }
       computePass.setPipeline(denoiseResolvePipeline);
@@ -1531,7 +1562,7 @@ function requestFrame() {
   const displayPass = encoder.beginRenderPass(renderPassDescriptor);
   displayPass.setPipeline(displayPipeline);
   displayPass.setVertexBuffer(0, vertexBuffer);
-  displayPass.setBindGroup(0, displayBindGroup);
+  displayPass.setBindGroup(0, displayBindGroups[(rngFrame - 1) & 1]);
   displayPass.draw(3, 1, 0, 0);
   displayPass.end();
 
