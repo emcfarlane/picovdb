@@ -42,7 +42,10 @@ struct Input {
     // Previous frame's camera position: source view directions when
     // evaluating the reverse shift for temporal MIS
     prev_camera_pos: vec3f,
-    _pad3: f32,
+    // Stratified hero-wavelength offset, GLOBAL per frame: every pixel
+    // shares the same 4 lambdas, so same-frame (spatial) reuse never has a
+    // wavelength mismatch (docs/restir-pt-plan.md, spectral reservoirs)
+    wavelength_u: f32,
 }
 
 // --- Object types ---
@@ -125,28 +128,35 @@ const MAX_LIGHTS: u32 = 8u;
 // ============================================================================
 
 struct Reservoir {
-    // Selected path contribution F (RGB, CMF-projected; the "RGB copy"
-    // spectral simplification per plan) and unbiased contribution weight
-    f: vec3f,
-    w: f32,
-    // Reconnection vertex: world position, or the env direction when the
-    // path reconnects at the environment (rc-is-env flag)
+    // Selected path contribution, PER WAVELENGTH (the frame's 4 hero
+    // lambdas — global per frame, so all reservoirs share the set). CMF
+    // projection happens only at shading; reuse recomposes per-lambda,
+    // eliminating the RGB-round-trip bias class.
+    f: vec4f,
+    // Incident radiance at the rc vertex along rc_wi, per wavelength,
+    // excluding the rc vertex's own BSDF (re-evaluated at reuse)
+    rc_radiance: vec4f,
+    // Reconnection vertex: object-index-space position, or the env
+    // direction when the path reconnects at the environment
     rc_pos: vec3f,
+    // Scalar unbiased contribution weight (per-DoF UCWs are a later step)
+    w: f32,
     // Confidence weight (sample count analogue, capped in temporal reuse)
     m: f32,
     rc_normal_oct: u32,
     // Suffix direction at the rc vertex (toward x_{k+1} / the light)
     rc_wi_oct: u32,
-    // rng_frame that generated the path: with the owning pixel this
-    // reconstructs the full RNG stream for random replay
     init_seed: u32,
-    // bits 0-3: path length d | bit 4: rc-is-env | bit 5: ends by NEE
+    // bits 0-3: d | bit 4: rc-is-env | bit 5: NEE | 6-7: rc material |
+    // 8-9: rc object
     path_flags: u32,
-    // Incident radiance at the rc vertex along rc_wi (RGB), excluding the
-    // rc vertex's own BSDF (re-evaluated at reuse)
-    rc_radiance: vec3f,
-    // Solid-angle pdf of sampling rc_wi at the rc vertex (Jacobian cache)
-    rc_pdf: f32,
+    // Stratified wavelength offset the sample was BORN with: the lambda
+    // set is part of the path sample (a PSS dimension), so reuse carries
+    // it and shading projects with it — the wavelength shift is the
+    // identity (J = 1), exact for any spectrum
+    wavelength_u: f32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 const PATH_FLAG_RC_ENV = 16u;
@@ -162,6 +172,26 @@ fn reservoir_index(pixel: vec2u, dims: vec2u, region: u32) -> u32 {
 
 fn luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.2126, 0.7152, 0.0722));
+}
+
+// CMF-project a per-wavelength contribution vector to RGB
+fn project_spectral(f: vec4f, rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>) -> vec3f {
+    var c = vec3f(0.0);
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        c += f[i] * rgb_and_phases[i].rgb;
+    }
+    return c * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT));
+}
+
+// Hero-wavelength LUT entries (rgb + phase per lambda) for a stratified
+// offset — the frame's global set or a reservoir sample's stored set
+fn wavelengths_at(u0: f32) -> array<vec4f, WAVELENGTH_SAMPLE_COUNT> {
+    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        let u = u0 * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
+        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
+    }
+    return rgb_and_phases;
 }
 
 fn oct_wrap(v: vec2f) -> vec2f {
@@ -230,7 +260,7 @@ fn make_shading_data(pos: vec3f, normal: vec3f, view_dir: vec3f, mat: Material) 
 }
 
 struct ShiftResult {
-    f: vec3f,      // shifted integrand (as-if-sampled at the destination)
+    f: vec4f,      // shifted integrand per wavelength (as-if-sampled at dst)
     jacobian: f32, // PSS Jacobian; 0 marks the shift undefined
 }
 
@@ -259,7 +289,7 @@ fn shift_reconnect(
     // cancels by construction — recomposing F from parts measured a
     // systematic +1.2%/merge energy bias from estimator mismatch.
     var out: ShiftResult;
-    out.f = vec3f(0.0);
+    out.f = vec4f(0.0);
     out.jacobian = 0.0;
     let d = r.path_flags & 15u;
     if (d < 2u || !(r.w > 0.0)) {
@@ -283,15 +313,13 @@ fn shift_reconnect(
             return out;
         }
         let b_dst = frostbite_brdf(dst_s, wi);
-        // Component composition: destination factors x LUT-upsampled
-        // stored suffix radiance (ratio-to-source forms amplify source
-        // reconstruction error one-sidedly — measured energy inflation)
-        let l_w = spectral_env_weights(r.rc_radiance, rgb_and_phases);
-        var w_rgb = vec3f(0.0);
+        // Fully per-wavelength composition: the stored suffix radiance is
+        // already the frame's per-lambda vector — no RGB round trip
+        var f_l = vec4f(0.0);
         for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-            w_rgb += (dst_reflectance[i] * b_dst.x + b_dst.y) * l_w[i] * rgb_and_phases[i].rgb;
+            f_l[i] = (dst_reflectance[i] * b_dst.x + b_dst.y) * r.rc_radiance[i];
         }
-        w_rgb *= (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) * lambert_dst;
+        f_l *= lambert_dst;
         let pdf1_dst = get_frostbite_brdf_density(dst_s, wi);
         let pdf1_src = get_frostbite_brdf_density(src_s, wi);
         if (pdf1_src <= 0.0 || pdf1_dst <= 0.0) {
@@ -302,14 +330,15 @@ fn shift_reconnect(
             if (lpdf <= 0.0) {
                 return out;
             }
-            out.f = (w_rgb / lpdf) * mis_balance(lpdf, pdf1_dst);
+            out.f = (f_l / lpdf) * mis_balance(lpdf, pdf1_dst);
             out.jacobian = 1.0;
         } else {
-            out.f = (w_rgb / pdf1_dst) * env_escape_mis(wi, pdf1_dst);
+            out.f = (f_l / pdf1_dst) * env_escape_mis(wi, pdf1_dst);
             out.jacobian = pdf1_dst / pdf1_src;
         }
-        if (!(out.jacobian > 0.0) || !(dot(out.f, vec3f(1.0)) < 1e20) || !(dot(out.f, vec3f(1.0)) >= 0.0)) {
-            out.f = vec3f(0.0);
+        let s_env = dot(out.f, vec4f(1.0));
+        if (!(out.jacobian > 0.0) || !(s_env < 1e20) || !(s_env >= 0.0)) {
+            out.f = vec4f(0.0);
             out.jacobian = 0.0;
         }
         return out;
@@ -391,14 +420,13 @@ fn shift_reconnect(
     }
     let b1_dst = frostbite_brdf(dst_s, dir);
     let b2_dst = frostbite_brdf(rc_s, rc_wi);
-    let l_w = spectral_env_weights(r.rc_radiance, rgb_and_phases);
-    var f_rgb = vec3f(0.0);
+    var f_l = vec4f(0.0);
     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
         let w1d = dst_reflectance[i] * b1_dst.x + b1_dst.y;
         let w2d = rc_refl[i] * b2_dst.x + b2_dst.y;
-        f_rgb += w1d * w2d * l_w[i] * rgb_and_phases[i].rgb;
+        f_l[i] = w1d * w2d * r.rc_radiance[i];
     }
-    f_rgb *= (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) * lambert_dst * lambert2_dst / pdf1_dst;
+    f_l *= lambert_dst * lambert2_dst / pdf1_dst;
 
     let pdf2_dst = get_frostbite_brdf_density(rc_s, rc_wi);
     let pdf2_src = get_frostbite_brdf_density(rc_src_s, rc_wi);
@@ -408,14 +436,14 @@ fn shift_reconnect(
         if (lpdf <= 0.0) {
             return out;
         }
-        f_rgb *= mis_balance(lpdf, pdf2_dst) / lpdf;
+        f_l *= mis_balance(lpdf, pdf2_dst) / lpdf;
     } else {
         if (pdf2_dst <= 0.0 || pdf2_src <= 0.0) {
             return out;
         }
-        f_rgb /= pdf2_dst;
+        f_l /= pdf2_dst;
         if (!is_nee && d == 3u) {
-            f_rgb *= env_escape_mis(rc_wi, pdf2_dst);
+            f_l *= env_escape_mis(rc_wi, pdf2_dst);
         }
         jacobian *= pdf2_dst / pdf2_src;
     }
@@ -440,11 +468,11 @@ fn shift_reconnect(
     if (max(jacobian, 1.0 / max(jacobian, 1e-9)) > 1.0 + JACOBIAN_REJECT_THRESHOLD) {
         return out;
     }
-    out.f = f_rgb;
+    out.f = f_l;
     out.jacobian = jacobian;
-    let fs = dot(out.f, vec3f(1.0));
+    let fs = dot(out.f, vec4f(1.0));
     if (!(out.jacobian > 0.0 && out.jacobian < 1e12) || !(fs < 1e20) || !(fs >= 0.0)) {
-        out.f = vec3f(0.0);
+        out.f = vec4f(0.0);
         out.jacobian = 0.0;
     }
     return out;
@@ -1327,27 +1355,26 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
     var ray = ray_in;
     var env_weight = 1.0;
 
-    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
     var throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
     var nee_throughput: array<f32, WAVELENGTH_SAMPLE_COUNT>;
-    let wavelength_rand = get_random_numbers(seed).x;
+    // Keep the draw so the RNG stream stays aligned with the other passes;
+    // the value is unused — lambdas are global per frame (spectral plan)
+    let unused_wavelength_rand = get_random_numbers(seed).x;
+    let rgb_and_phases = wavelengths_at(input.wavelength_u);
     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-        let u = wavelength_rand * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
-        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
         throughput[i] = 1.0;
         nee_throughput[i] = 1.0;
     }
     let spectral_norm = 1.0 / f32(WAVELENGTH_SAMPLE_COUNT);
 
-    // Streaming RIS state
+    // Streaming RIS state (contributions tracked per wavelength)
     var w_sum = 0.0;
-    var sel_f = vec3f(0.0);
+    var sel_f = vec4f(0.0);
     var sel_flags = 0u;
     var sel_rc_pos = vec3f(0.0);
     var sel_rc_normal = vec3f(0.0, 0.0, 1.0);
     var sel_rc_wi = vec3f(0.0);
-    var sel_rc_radiance = vec3f(0.0);
-    var sel_rc_pdf = 0.0;
+    var sel_rc_radiance = vec4f(0.0);
 
     // Reconnection-vertex (x2) tracking. Positions/normals are stored in
     // the owning object's INDEX space so rigid motion never stales them;
@@ -1369,28 +1396,24 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
         let hit = intersect_scene(ray, iterations);
         // BSDF-sampled hit of a lamp: MIS-weighted emission
         if (light_hit.index >= 0 && light_hit.t < hit.distance) {
-            var c = vec3f(0.0);
-            var inc = vec3f(0.0);
+            var c_l = vec4f(0.0);
+            var inc_l = vec4f(0.0);
             for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                let ci = nee_throughput[i] * input.emission_integral;
-                c += ci * rgb_and_phases[i].rgb;
+                c_l[i] = nee_throughput[i] * input.emission_integral;
                 if (have_thr2) {
-                    inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                    inc_l[i] = c_l[i] / max(thr2[i], 1e-12);
                 }
             }
-            c *= spectral_norm;
-            inc *= spectral_norm;
-            let pl = luminance(c);
+            let pl = luminance(project_spectral(c_l, rgb_and_phases));
             if (pl > 0.0) {
                 w_sum += pl;
                 if (get_random_numbers(seed).x * w_sum < pl) {
-                    sel_f = c;
+                    sel_f = c_l;
                     sel_flags = k | x2_meta; // d = k (x_k on the lamp)
                     sel_rc_pos = x2_pos;
                     sel_rc_normal = x2_normal;
                     sel_rc_wi = x2_brdf_dir_idx;
-                    sel_rc_radiance = inc;
-                    sel_rc_pdf = x2_brdf_pdf;
+                    sel_rc_radiance = inc_l;
                 }
             }
             if (k == 1u) {
@@ -1404,58 +1427,48 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                 clear_gbuffer(pixel);
             }
             if (k == 1u && input.white_background == 1u) {
-                // Matches the reference exactly: its backdrop constant also
-                // passes through the final 1/WAVELENGTH_SAMPLE_COUNT division
-                let c = vec3f(6.0 / input.exposure) * spectral_norm;
-                w_sum = luminance(c);
-                sel_f = c;
+                // Flat spectrum scaled so E[projection] equals the
+                // reference's display constant (6/exposure * 1/4)
+                let c_l = vec4f(6.0 / input.exposure * 0.25);
+                w_sum = luminance(project_spectral(c_l, rgb_and_phases));
+                sel_f = c_l;
                 sel_flags = 1u;
                 break;
             }
-            var c = vec3f(0.0);
-            var inc = vec3f(0.0);
-            var env_rgb = vec3f(0.0);
+            var c_l = vec4f(0.0);
+            var inc_l = vec4f(0.0);
+            // Raw (MIS-free) per-lambda env radiance for the reservoir
+            var env_l = vec4f(0.0);
             if (input.environment == ENVIRONMENT_STUDIO) {
+                env_l = vec4f(input.dome_integral);
                 for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                    let ci = throughput[i] * input.dome_integral;
-                    c += ci * rgb_and_phases[i].rgb;
-                    if (have_thr2) {
-                        inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
-                    }
+                    c_l[i] = throughput[i] * input.dome_integral;
                 }
-                env_rgb = vec3f(input.dome_integral);
             } else if (input.environment == ENVIRONMENT_SKY) {
-                env_rgb = skyRadianceRGB(ray.direction, true); // raw
-                var env = env_rgb;
+                env_l = spectral_env_weights(skyRadianceRGB(ray.direction, true), rgb_and_phases);
+                var mw = 1.0;
                 if (dot(ray.direction, skyState.sunDirection) >= SUN_CONE_COS) {
-                    env *= env_weight;
+                    mw = env_weight;
                 }
-                let env_w = spectral_env_weights(env, rgb_and_phases);
                 for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                    let ci = throughput[i] * env_w[i];
-                    c += ci * rgb_and_phases[i].rgb;
-                    if (have_thr2) {
-                        inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
-                    }
+                    c_l[i] = throughput[i] * mw * env_l[i];
                 }
             } else {
-                env_rgb = environment_rgb(ray.direction); // raw: shift re-derives MIS
-                let env_w = spectral_env_weights(environment_rgb(ray.direction), rgb_and_phases);
+                env_l = spectral_env_weights(environment_rgb(ray.direction), rgb_and_phases);
                 for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                    let ci = throughput[i] * env_weight * env_w[i];
-                    c += ci * rgb_and_phases[i].rgb;
-                    if (have_thr2) {
-                        inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
-                    }
+                    c_l[i] = throughput[i] * env_weight * env_l[i];
                 }
             }
-            c *= spectral_norm;
-            inc *= spectral_norm;
-            let pl = luminance(c);
+            if (have_thr2) {
+                for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+                    inc_l[i] = c_l[i] / max(thr2[i], 1e-12);
+                }
+            }
+            let pl = luminance(project_spectral(c_l, rgb_and_phases));
             if (pl > 0.0) {
                 w_sum += pl;
                 if (get_random_numbers(seed).x * w_sum < pl) {
-                    sel_f = c;
+                    sel_f = c_l;
                     sel_flags = k; // d = k (x_k on the environment)
                     if (k == 2u) {
                         // x2 IS the env vertex: reconnect by direction copy
@@ -1463,24 +1476,21 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                         sel_rc_pos = ray.direction;
                         sel_rc_normal = -ray.direction;
                         sel_rc_wi = ray.direction;
-                        sel_rc_radiance = env_rgb; // raw; MIS re-derived at shift
-                        sel_rc_pdf = x2_brdf_pdf;
+                        sel_rc_radiance = env_l; // raw; MIS re-derived at shift
                     } else if (k == 3u) {
-                        // Suffix escaped right after rc: store the raw env and
-                        // the WORLD direction so the shift re-derives its MIS
+                        // Suffix escaped right after rc: raw env + WORLD dir
+                        // so the shift re-derives its MIS
                         sel_flags |= x2_meta;
                         sel_rc_pos = x2_pos;
                         sel_rc_normal = x2_normal;
                         sel_rc_wi = ray.direction;
-                        sel_rc_radiance = env_rgb;
-                        sel_rc_pdf = x2_brdf_pdf;
+                        sel_rc_radiance = env_l;
                     } else {
                         sel_flags |= x2_meta;
                         sel_rc_pos = x2_pos;
                         sel_rc_normal = x2_normal;
                         sel_rc_wi = x2_brdf_dir_idx;
-                        sel_rc_radiance = inc;
-                        sel_rc_pdf = x2_brdf_pdf;
+                        sel_rc_radiance = inc_l;
                     }
                 }
             }
@@ -1548,35 +1558,28 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                     let brdf_density_0 = get_frostbite_brdf_density(s, light_dir);
                     let spectrum_scale = lambert_in_0 / (light_density_0 + brdf_density_0);
                     let brdf = frostbite_brdf(s, light_dir);
-                    var c = vec3f(0.0);
-                    var inc = vec3f(0.0);
+                    var c_l = vec4f(0.0);
+                    var inc_l = vec4f(0.0);
                     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                        let ci = throughput[i] * (reflectance[i] * brdf.x + brdf.y) * input.emission_integral * spectrum_scale;
-                        c += ci * rgb_and_phases[i].rgb;
+                        c_l[i] = throughput[i] * (reflectance[i] * brdf.x + brdf.y) * input.emission_integral * spectrum_scale;
                         if (have_thr2) {
-                            inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                            inc_l[i] = c_l[i] / max(thr2[i], 1e-12);
                         }
                     }
-                    c *= spectral_norm;
-                    inc *= spectral_norm;
-                    let pl = luminance(c);
+                    let pl = luminance(project_spectral(c_l, rgb_and_phases));
                     if (pl > 0.0) {
                         w_sum += pl;
                         if (get_random_numbers(seed).x * w_sum < pl) {
-                            sel_f = c;
+                            sel_f = c_l;
                             sel_flags = (k + 1u) | PATH_FLAG_NEE | x2_meta; // d = k+1
+                            sel_rc_pos = x2_pos;
+                            sel_rc_normal = x2_normal;
                             if (k == 2u) {
-                                sel_rc_pos = x2_pos;
-                                sel_rc_normal = x2_normal;
                                 sel_rc_wi = light_dir;
-                                sel_rc_radiance = vec3f(input.emission_integral);
-                                sel_rc_pdf = light_density_0;
+                                sel_rc_radiance = vec4f(input.emission_integral);
                             } else {
-                                sel_rc_pos = x2_pos;
-                                sel_rc_normal = x2_normal;
                                 sel_rc_wi = x2_brdf_dir_idx;
-                                sel_rc_radiance = inc;
-                                sel_rc_pdf = x2_brdf_pdf;
+                                sel_rc_radiance = inc_l;
                             }
                         }
                     }
@@ -1598,24 +1601,20 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                     let brdf_density_sun = get_frostbite_brdf_density(s, sun_dir);
                     let brdf_sun = frostbite_brdf(s, sun_dir);
                     let sun_scale = lambert_sun / (get_sun_density(sun_dir) + brdf_density_sun);
-                    let sun_rgb = skyRadianceRGB(sun_dir, true);
-                    let sun_w = spectral_env_weights(sun_rgb, rgb_and_phases);
-                    var c = vec3f(0.0);
-                    var inc = vec3f(0.0);
+                    let sun_w = spectral_env_weights(skyRadianceRGB(sun_dir, true), rgb_and_phases);
+                    var c_l = vec4f(0.0);
+                    var inc_l = vec4f(0.0);
                     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                        let ci = throughput[i] * (reflectance[i] * brdf_sun.x + brdf_sun.y) * sun_scale * sun_w[i];
-                        c += ci * rgb_and_phases[i].rgb;
+                        c_l[i] = throughput[i] * (reflectance[i] * brdf_sun.x + brdf_sun.y) * sun_scale * sun_w[i];
                         if (have_thr2) {
-                            inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                            inc_l[i] = c_l[i] / max(thr2[i], 1e-12);
                         }
                     }
-                    c *= spectral_norm;
-                    inc *= spectral_norm;
-                    let pl = luminance(c);
+                    let pl = luminance(project_spectral(c_l, rgb_and_phases));
                     if (pl > 0.0) {
                         w_sum += pl;
                         if (get_random_numbers(seed).x * w_sum < pl) {
-                            sel_f = c;
+                            sel_f = c_l;
                             sel_flags = (k + 1u) | PATH_FLAG_NEE;
                             if (k == 1u) {
                                 // d = 2: the sun IS x2 — env reconnection
@@ -1623,22 +1622,19 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                                 sel_rc_pos = sun_dir;
                                 sel_rc_normal = -sun_dir;
                                 sel_rc_wi = sun_dir;
-                                sel_rc_radiance = sun_rgb;
-                                sel_rc_pdf = get_sun_density(sun_dir);
+                                sel_rc_radiance = sun_w;
                             } else if (k == 2u) {
                                 sel_flags |= x2_meta;
                                 sel_rc_pos = x2_pos;
                                 sel_rc_normal = x2_normal;
                                 sel_rc_wi = sun_dir;
-                                sel_rc_radiance = sun_rgb;
-                                sel_rc_pdf = get_sun_density(sun_dir);
+                                sel_rc_radiance = sun_w;
                             } else {
                                 sel_flags |= x2_meta;
                                 sel_rc_pos = x2_pos;
                                 sel_rc_normal = x2_normal;
                                 sel_rc_wi = x2_brdf_dir_idx;
-                                sel_rc_radiance = inc;
-                                sel_rc_pdf = x2_brdf_pdf;
+                                sel_rc_radiance = inc_l;
                             }
                         }
                     }
@@ -1661,46 +1657,39 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
                     let brdf_density_env = get_frostbite_brdf_density(s, env_dir);
                     let brdf_env = frostbite_brdf(s, env_dir);
                     let env_scale = lambert_env / (env_pdf + brdf_density_env);
-                    let env_rgb = environment_rgb(env_dir);
-                    let nee_env_w = spectral_env_weights(env_rgb, rgb_and_phases);
-                    var c = vec3f(0.0);
-                    var inc = vec3f(0.0);
+                    let nee_env_w = spectral_env_weights(environment_rgb(env_dir), rgb_and_phases);
+                    var c_l = vec4f(0.0);
+                    var inc_l = vec4f(0.0);
                     for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-                        let ci = throughput[i] * (reflectance[i] * brdf_env.x + brdf_env.y) * env_scale * nee_env_w[i];
-                        c += ci * rgb_and_phases[i].rgb;
+                        c_l[i] = throughput[i] * (reflectance[i] * brdf_env.x + brdf_env.y) * env_scale * nee_env_w[i];
                         if (have_thr2) {
-                            inc += (ci / max(thr2[i], 1e-12)) * rgb_and_phases[i].rgb;
+                            inc_l[i] = c_l[i] / max(thr2[i], 1e-12);
                         }
                     }
-                    c *= spectral_norm;
-                    inc *= spectral_norm;
-                    let pl = luminance(c);
+                    let pl = luminance(project_spectral(c_l, rgb_and_phases));
                     if (pl > 0.0) {
                         w_sum += pl;
                         if (get_random_numbers(seed).x * w_sum < pl) {
-                            sel_f = c;
+                            sel_f = c_l;
                             sel_flags = (k + 1u) | PATH_FLAG_NEE;
                             if (k == 1u) {
                                 sel_flags |= PATH_FLAG_RC_ENV;
                                 sel_rc_pos = env_dir;
                                 sel_rc_normal = -env_dir;
                                 sel_rc_wi = env_dir;
-                                sel_rc_radiance = env_rgb;
-                                sel_rc_pdf = env_pdf;
+                                sel_rc_radiance = nee_env_w;
                             } else if (k == 2u) {
                                 sel_flags |= x2_meta;
                                 sel_rc_pos = x2_pos;
                                 sel_rc_normal = x2_normal;
                                 sel_rc_wi = env_dir;
-                                sel_rc_radiance = env_rgb;
-                                sel_rc_pdf = env_pdf;
+                                sel_rc_radiance = nee_env_w;
                             } else {
                                 sel_flags |= x2_meta;
                                 sel_rc_pos = x2_pos;
                                 sel_rc_normal = x2_normal;
                                 sel_rc_wi = x2_brdf_dir_idx;
-                                sel_rc_radiance = inc;
-                                sel_rc_pdf = x2_brdf_pdf;
+                                sel_rc_radiance = inc_l;
                             }
                         }
                     }
@@ -1767,7 +1756,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
     var r: Reservoir;
     r.f = sel_f;
     r.w = 0.0;
-    let pl_sel = luminance(sel_f);
+    let pl_sel = luminance(project_spectral(sel_f, rgb_and_phases));
     if (pl_sel > 0.0) {
         r.w = w_sum / pl_sel;
     }
@@ -1778,7 +1767,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
     r.init_seed = sel_init_seed;
     r.path_flags = sel_flags;
     r.rc_radiance = sel_rc_radiance;
-    r.rc_pdf = sel_rc_pdf;
+    r.wavelength_u = input.wavelength_u;
     reservoirs[reservoir_index(pixel, dims, 2u)] = r;
     // Mirror into the frame-final region: shade + next frame's temporal
     // read it directly while the spatial pass is disabled (see P2 note)
@@ -1890,12 +1879,8 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
     var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
     let jitter = get_random_numbers(&seed) - 0.5;
     let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
-    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
-    let wavelength_rand = get_random_numbers(&seed).x;
-    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-        let u = wavelength_rand * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
-        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
-    }
+    let unused_wavelength_rand = get_random_numbers(&seed).x; // stream alignment
+    let rgb_and_phases = wavelengths_at(input.wavelength_u);
     // Decorrelate the merge decision from initialMain's stream
     seed ^= vec2u(0x9e3779b9u, 0x85ebca6bu);
 
@@ -1962,13 +1947,19 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
 
     let cur_index = reservoir_index(pixel, dims, 2u);
     var r_c = reservoirs[cur_index];
-    let p_c = luminance(r_c.f);
+    let p_c = luminance(project_spectral(r_c.f, rgb_and_phases));
 
-    // Forward shift: temporal sample into this pixel's domain
+    // Forward shift: temporal sample into this pixel's domain, evaluated
+    // in the SAMPLE's own lambda basis (its u rides in the reservoir)
+    let phases_t = wavelengths_at(r_t.wavelength_u);
+    var refl_t: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+        refl_t[i] = eval_reflectance_real_lagrange_3(phases_t[i].w, lagranges);
+    }
     let prev_sd = make_shading_data(pos_prev, n_prev,
         normalize(input.prev_camera_pos - pos_prev), mat);
-    let fwd = shift_reconnect(r_t, s, reflectance, rgb_and_phases, prev_sd, false, &iterations);
-    let p_fwd = luminance(fwd.f);
+    let fwd = shift_reconnect(r_t, s, refl_t, phases_t, prev_sd, false, &iterations);
+    let p_fwd = luminance(project_spectral(fwd.f, phases_t));
     if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
         // Shift failed: keep the canonical but still age confidence
         r_c.m = 1.0 + m_t;
@@ -1977,29 +1968,27 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
         return;
     }
 
-    // Reverse shift of the canonical for Talbot MIS
-    var p_rev = 0.0;
-    if (p_c > 0.0 && (r_c.path_flags & 15u) >= 2u) {
-        let rev = shift_reconnect(r_c, prev_sd, reflectance, rgb_and_phases, s, true, &iterations);
-        p_rev = luminance(rev.f) * rev.jacobian;
-    }
-
-    // Generalized Talbot MIS with confidence weights; temporal densities
-    // are converted into this domain by the shift Jacobian
-    let p_t_prev = luminance(r_t.f) / fwd.jacobian;
-    let m_temp = (m_t * p_t_prev) / max(p_fwd + m_t * p_t_prev, 1e-12);
-    let m_can = p_c / max(p_c + m_t * p_rev, 1e-12);
+    // Constant (confidence-proportional) MIS: with the frame-global
+    // wavelength offset the u-dimension's support is DISJOINT across
+    // frames, violating Talbot MIS's overlap assumption (measured +3-5%
+    // inflation). Constant weights partition unity unconditionally (GRIS
+    // Eq. 20) and stay unbiased for any support structure, at some
+    // variance cost — the original ReSTIR temporal weighting.
+    let m_temp = m_t / (1.0 + m_t);
+    let m_can = 1.0 / (1.0 + m_t);
     let w_t = m_temp * p_fwd * r_t.w * fwd.jacobian;
     let w_c = m_can * p_c * r_c.w;
     let w_total = w_c + w_t;
 
     var out = r_c;
+    var out_phases = rgb_and_phases;
     if (get_random_numbers(&seed).x * w_total < w_t) {
-        out = r_t;
+        out = r_t; // keeps the temporal sample's wavelength_u
         out.f = fwd.f;
+        out_phases = phases_t;
     }
     out.w = 0.0;
-    let pl = luminance(out.f);
+    let pl = luminance(project_spectral(out.f, out_phases));
     if (pl > 0.0 && w_total > 0.0) {
         out.w = w_total / pl;
     }
@@ -2027,12 +2016,8 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
     var seed = vec2u(pixel) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
     let jitter = get_random_numbers(&seed) - 0.5;
     let ray = generate_camera_ray(vec2f(pixel) + 0.5 + jitter, vec2f(dims));
-    var rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>;
-    let wavelength_rand = get_random_numbers(&seed).x;
-    for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
-        let u = wavelength_rand * (1.0 / f32(WAVELENGTH_SAMPLE_COUNT)) + f32(i) / f32(WAVELENGTH_SAMPLE_COUNT);
-        rgb_and_phases[i] = textureSampleLevel(illuminant_spectrum, illuminant_sampler, vec2f(u, 0.5), 0.0);
-    }
+    let unused_wavelength_rand = get_random_numbers(&seed).x; // stream alignment
+    let rgb_and_phases = wavelengths_at(input.wavelength_u);
     seed ^= vec2u(0xc2b2ae35u, 0x27d4eb2fu); // decorrelate from other passes
 
     var iterations = 0u;
@@ -2105,23 +2090,24 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
             continue;
         }
 
-        // Forward shift: neighbor path into this pixel
+        // Forward shift: neighbor path into this pixel (same frame =>
+        // identical lambda set: fully spectral reuse, no wavelength shift)
         let fwd = shift_reconnect(r_n, s, reflectance, rgb_and_phases, ns, false, &iterations);
-        let p_fwd = luminance(fwd.f);
+        let p_fwd = luminance(project_spectral(fwd.f, rgb_and_phases));
         if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
             out.m += m_n;
             continue;
         }
         // Reverse shift of the running canonical into the neighbor's domain
-        let p_c = luminance(out.f);
+        let p_c = luminance(project_spectral(out.f, rgb_and_phases));
         var p_rev = 0.0;
         if (p_c > 0.0 && (out.path_flags & 15u) >= 2u && out.w > 0.0) {
             let rev = shift_reconnect(out, ns, reflectance, rgb_and_phases, s, false, &iterations);
-            p_rev = luminance(rev.f) * rev.jacobian;
+            p_rev = luminance(project_spectral(rev.f, rgb_and_phases)) * rev.jacobian;
         }
         // 2-candidate confidence-weighted Talbot MIS (chained GRIS)
         let m_c = out.m;
-        let p_n_own = luminance(r_n.f) / fwd.jacobian;
+        let p_n_own = luminance(project_spectral(r_n.f, rgb_and_phases)) / fwd.jacobian;
         let m_nw = (m_n * p_n_own) / max(m_c * p_fwd + m_n * p_n_own, 1e-12);
         let m_cw = (m_c * p_c) / max(m_c * p_c + m_n * p_rev, 1e-12);
         let w_n = m_nw * p_fwd * r_n.w * fwd.jacobian;
@@ -2134,7 +2120,7 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
             out.f = fwd.f;
         }
         out.w = 0.0;
-        let pl = luminance(out.f);
+        let pl = luminance(project_spectral(out.f, rgb_and_phases));
         if (pl > 0.0 && w_total > 0.0) {
             out.w = w_total / pl;
         }
@@ -2151,7 +2137,8 @@ fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
 
     let r = reservoirs[reservoir_index(global_id.xy, dims, input.rng_frame & 1u)];
-    write_output(global_id.xy, dims, r.f * r.w);
+    let rgb_and_phases = wavelengths_at(r.wavelength_u);
+    write_output(global_id.xy, dims, project_spectral(r.f, rgb_and_phases) * r.w);
 }
 
 // ============================================================================

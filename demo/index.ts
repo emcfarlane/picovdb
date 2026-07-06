@@ -200,7 +200,7 @@ function createGPUResources() {
   let scale = Number(controls.renderScale) || 0.5;
   // Clamp so the reservoir buffer (128 B/pixel) fits the device's storage
   // binding limit rather than failing createBuffer and killing the frame
-  const maxPixels = Math.floor(device.limits.maxStorageBufferBindingSize / 192);
+  const maxPixels = Math.floor(device.limits.maxStorageBufferBindingSize / 240);
   if (width * scale * height * scale > maxPixels) {
     const fit = Math.sqrt(maxPixels / (width * height));
     console.warn(`Render scale ${scale} exceeds reservoir budget; clamping to ${fit.toFixed(2)}`);
@@ -283,8 +283,8 @@ function createGPUResources() {
   reservoirBuffer?.destroy();
   reservoirBuffer = device.createBuffer({
     label: 'Path reservoirs',
-    // 3 regions: final ping-pong x2 + post-temporal scratch for spatial
-    size: renderWidth * renderHeight * 64 * 3,
+    // 80 B spectral reservoirs, 3 regions: final ping-pong x2 + scratch
+    size: renderWidth * renderHeight * 80 * 3,
     usage: GPUBufferUsage.STORAGE,
   });
 
@@ -485,6 +485,7 @@ const inputViews = {
   rng_frame: new Uint32Array(inputValues, 112, 1),
   prev_view: new Float32Array(inputValues, 128, 16),
   prev_camera_pos: new Float32Array(inputValues, 192, 3),
+  wavelength_u: new Float32Array(inputValues, 204, 1),
 };
 const inputBuffer = device.createBuffer({
   label: 'Input Uniforms',
@@ -875,6 +876,9 @@ function updateInput(deltaTime: number) {
 
   if (shouldDispatch) {
     rngFrame++;
+    // Global hero-wavelength offset: one stratified set per frame so all
+    // reservoirs share the same lambdas (spectral reservoirs plan)
+    inputViews.wavelength_u[0] = Math.random();
   }
   const ENV_INDEX = { 'Studio': 0, 'Sky': 1, 'Studio HDRI': 2 } as const;
   inputViews.environment[0] = ENV_INDEX[controls.environment];
@@ -1082,9 +1086,10 @@ function requestFrame() {
       computePass.dispatchWorkgroups(wgX, wgY, 1);
       computePass.setPipeline(temporalPipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
-      // Spatial reuse DISABLED pending the d==3 shift bias fix (P2 note
-      // in docs/restir-pt-plan.md): +1.3%/merge compounds through temporal
-      // feedback into a +27% runaway. Re-enable once the shift is exact.
+      // Spatial reuse DISABLED: candidates in the post-temporal scratch
+      // carry MIXED per-sample wavelength bases; the pass must evaluate
+      // each candidate in its own basis with constant MIS (exactly the
+      // temporal fix) before re-enabling. See docs/restir-pt-plan.md.
       // computePass.setPipeline(spatialPipeline);
       // computePass.dispatchWorkgroups(wgX, wgY, 1);
       computePass.setPipeline(shadePipeline);
