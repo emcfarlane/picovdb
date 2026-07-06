@@ -8,6 +8,7 @@ import { vec3, mat4 } from 'wgpu-matrix';
 import DisplayShader from "./blit.wgsl";
 import ComputeShader from "./compute.wgsl";
 import SpectraShader from "./spectra.wgsl";
+import DenoiseShader from "./denoise.wgsl";
 import PicoVDBShader from "./../picovdb.wgsl";
 import { fetchPicoVDB } from '../picovdb.ts';
 import { createOrbitCamera } from './lib/camera';
@@ -71,6 +72,14 @@ let raytracedTexture: GPUTexture;
 let accumulationBuffer: GPUBuffer;
 // Primary-hit G-buffer ping-pong (denoiser temporal input)
 let gbufferTextures: GPUTexture[] = [];
+// SVGF denoiser textures: raw radiance + history/moments/a-trous ping-pongs
+let illumTexture: GPUTexture;
+let histTextures: GPUTexture[] = [];
+let momentsTextures: GPUTexture[] = [];
+let atrousTextures: GPUTexture[] = [];
+let denoiseTemporalGroups: GPUBindGroup[] = [];
+let denoiseAtrousGroups: GPUBindGroup[][] = [];
+let denoiseResolveGroup: GPUBindGroup;
 let displayBindGroup: GPUBindGroup;
 let perFrameBindGroup: GPUBindGroup;
 let dataBindGroup: GPUBindGroup;
@@ -288,6 +297,20 @@ function createGPUResources() {
     usage: GPUBufferUsage.STORAGE,
   });
 
+  const denoiseTex = (label: string) => device.createTexture({
+    label,
+    size: [renderWidth, renderHeight],
+    format: 'rgba32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+  });
+  [illumTexture, ...histTextures, ...momentsTextures, ...atrousTextures]
+    .forEach(t => t?.destroy());
+  illumTexture = denoiseTex('Denoise illum');
+  histTextures = [denoiseTex('Denoise hist 0'), denoiseTex('Denoise hist 1')];
+  momentsTextures = [denoiseTex('Denoise moments 0'), denoiseTex('Denoise moments 1')];
+  atrousTextures = [denoiseTex('Denoise atrous 0'), denoiseTex('Denoise atrous 1')];
+  createDenoiseBindGroups();
+
   // Bind group 2: pass (two variants with the G-buffer ping-pong swapped)
   passBindGroups = [0, 1].map(parity => device.createBindGroup({
     label: `Pass bind group ${parity}`,
@@ -298,6 +321,7 @@ function createGPUResources() {
       { binding: 2, resource: gbufferTextures[parity].createView() },
       { binding: 3, resource: gbufferTextures[1 - parity].createView() },
       { binding: 4, resource: { buffer: reservoirBuffer } },
+      { binding: 5, resource: illumTexture.createView() },
     ]
   }));
 }
@@ -962,6 +986,10 @@ const passBindGroupLayout = device.createBindGroupLayout({
       storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
     },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    {
+      binding: 5, visibility: GPUShaderStage.COMPUTE,
+      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
+    },
   ]
 });
 
@@ -1001,6 +1029,75 @@ const shadePipeline = await device.createComputePipelineAsync({
   layout: computePipelineLayout,
   compute: { module: computeShaderModule, entryPoint: 'shadeMain' },
 });
+
+// --- SVGF denoiser (demo/denoise.wgsl, auto layouts per entry point) ---
+const denoiseModule = device.createShaderModule({ label: 'Denoise', code: DenoiseShader });
+const denoiseTemporalPipeline = await device.createComputePipelineAsync({
+  label: 'Denoise Temporal', layout: 'auto',
+  compute: { module: denoiseModule, entryPoint: 'temporalAccumMain' },
+});
+const denoiseAtrousPipeline = await device.createComputePipelineAsync({
+  label: 'Denoise A-Trous', layout: 'auto',
+  compute: { module: denoiseModule, entryPoint: 'atrousMain' },
+});
+const denoiseResolvePipeline = await device.createComputePipelineAsync({
+  label: 'Denoise Resolve', layout: 'auto',
+  compute: { module: denoiseModule, entryPoint: 'resolveMain' },
+});
+// One params buffer per a-trous iteration: (step, write_history)
+const ATROUS_ITERATIONS = 5;
+const atrousParamBuffers = Array.from({ length: ATROUS_ITERATIONS }, (_, i) => {
+  const buf = device.createBuffer({
+    label: `Atrous params ${i}`, size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(buf, 0, new Uint32Array([i, i === 0 ? 1 : 0, 0, 0]));
+  return buf;
+});
+
+// P = (rngFrame - 1) & 1: gbuffer/hist/moments cur = [1 - P], prev = [P];
+// a-trous ping-pong: temporal seeds [0], iterations alternate 0->1
+function createDenoiseBindGroups() {
+  denoiseTemporalGroups = [0, 1].map(P => device.createBindGroup({
+    label: `Denoise temporal ${P}`,
+    layout: denoiseTemporalPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: inputBuffer } },
+      { binding: 1, resource: { buffer: objectsBuffer } },
+      { binding: 3, resource: illumTexture.createView() },
+      { binding: 4, resource: gbufferTextures[1 - P].createView() },
+      { binding: 5, resource: gbufferTextures[P].createView() },
+      { binding: 6, resource: histTextures[P].createView() },
+      { binding: 7, resource: momentsTextures[P].createView() },
+      { binding: 8, resource: histTextures[1 - P].createView() },
+      { binding: 9, resource: momentsTextures[1 - P].createView() },
+      { binding: 11, resource: atrousTextures[0].createView() },
+    ]
+  }));
+  denoiseAtrousGroups = [0, 1].map(P =>
+    Array.from({ length: ATROUS_ITERATIONS }, (_, i) => device.createBindGroup({
+      label: `Denoise atrous ${P}.${i}`,
+      layout: denoiseAtrousPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: inputBuffer } },
+        { binding: 2, resource: { buffer: atrousParamBuffers[i] } },
+        { binding: 4, resource: gbufferTextures[1 - P].createView() },
+        { binding: 7, resource: momentsTextures[1 - P].createView() },
+        { binding: 8, resource: histTextures[1 - P].createView() },
+        { binding: 10, resource: atrousTextures[i % 2].createView() },
+        { binding: 11, resource: atrousTextures[(i + 1) % 2].createView() },
+      ]
+    })));
+  denoiseResolveGroup = device.createBindGroup({
+    label: 'Denoise resolve',
+    layout: denoiseResolvePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: inputBuffer } },
+      { binding: 10, resource: atrousTextures[ATROUS_ITERATIONS % 2].createView() },
+      { binding: 12, resource: raytracedTexture.createView() },
+    ]
+  });
+}
 
 console.log('Pipeline created.');
 
@@ -1090,6 +1187,20 @@ function requestFrame() {
       computePass.dispatchWorkgroups(wgX, wgY, 1);
       computePass.setPipeline(shadePipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
+      if (controls.denoise) {
+        const P = (rngFrame - 1) & 1;
+        computePass.setPipeline(denoiseTemporalPipeline);
+        computePass.setBindGroup(0, denoiseTemporalGroups[P]);
+        computePass.dispatchWorkgroups(wgX, wgY, 1);
+        computePass.setPipeline(denoiseAtrousPipeline);
+        for (let i = 0; i < ATROUS_ITERATIONS; i++) {
+          computePass.setBindGroup(0, denoiseAtrousGroups[P][i]);
+          computePass.dispatchWorkgroups(wgX, wgY, 1);
+        }
+        computePass.setPipeline(denoiseResolvePipeline);
+        computePass.setBindGroup(0, denoiseResolveGroup);
+        computePass.dispatchWorkgroups(wgX, wgY, 1);
+      }
     } else {
       computePass.setPipeline(computePipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);

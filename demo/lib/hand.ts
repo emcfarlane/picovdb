@@ -94,7 +94,13 @@ export function createModelHand(): ModelHand {
 			if (currentOffset[0] !== targetOffset[0] || currentOffset[1] !== targetOffset[1] ||
 				currentOffset[2] !== targetOffset[2]) {
 				const offsetDiff = vec3.sub(targetOffset, currentOffset, vec3.create());
-				if (vec3.lenSq(offsetDiff) < 1e-10) {
+				// Snap threshold must exceed the f32 rounding residue at scene
+				// scale (~1.5e-5/component at |offset| ~ 240): at large frame
+				// times the lerp lands within rounding of the target and a
+				// 1e-10 threshold never fires -> dirty forever -> accumulation
+				// resets every frame (dt-dependent; seen with the denoiser on
+				// slow machines). 1e-6 lenSq = 1e-3 world units, sub-pixel.
+				if (vec3.lenSq(offsetDiff) < 1e-6) {
 					vec3.copy(targetOffset, currentOffset);
 				} else {
 					vec3.addScaled(currentOffset, offsetDiff, t, currentOffset);

@@ -116,7 +116,8 @@ export function createOrbitCamera(options?: {
 
 			// Interpolate pivot
 			const pivotDiff = vec3.sub(targetPivot, pivot, temp);
-			if (vec3.lenSq(pivotDiff) > epsilon * epsilon) {
+			// 1e-6 lenSq floor: pivot is f32 — see hand.ts snap-threshold note
+			if (vec3.lenSq(pivotDiff) > Math.max(epsilon * epsilon, 1e-6)) {
 				vec3.addScaled(pivot, pivotDiff, t, pivot);
 				dirty = true;
 			}

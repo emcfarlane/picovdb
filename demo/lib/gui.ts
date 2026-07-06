@@ -17,6 +17,7 @@ export interface Controls {
 	environment: 'Studio' | 'Sky' | 'Studio HDRI';
 	whiteBackdrop: boolean;
 	lightingMode: 'Reference' | 'ReSTIR';
+	denoise: boolean;
 	illuminant: string;
 	lightIntensity: number;
 	domeIntensity: number;
@@ -50,6 +51,7 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		environment: 'Studio HDRI',
 		whiteBackdrop: true,
 		lightingMode: 'Reference',
+		denoise: true,
 		illuminant: illuminants[0],
 		lightIntensity: 15.0,
 		domeIntensity: 0.5,
@@ -71,6 +73,8 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 	const lighting = gui.addFolder('Lighting');
 	// ReSTIR = ReSTIR PT (docs/restir-pt-plan.md); Reference = ground truth
 	lighting.add(controls, 'lightingMode', ['Reference', 'ReSTIR']).name('Lighting');
+	// SVGF on the ReSTIR output (temporal + a-trous); off = raw accumulation
+	lighting.add(controls, 'denoise').name('Denoise');
 	lighting.add(controls, 'environment', ['Studio HDRI', 'Studio', 'Sky']).name('Environment');
 	lighting.add(controls, 'whiteBackdrop').name('White Backdrop');
 	const illuminantController = lighting.add(controls, 'illuminant', illuminants).name('Illuminant');

@@ -115,10 +115,12 @@ const MAX_LIGHTS: u32 = 8u;
 @group(2) @binding(0) var output_texture: texture_storage_2d<rgba8unorm, write>;
 // Progressive accumulation: running radiance sum per pixel (rgb) + count (a)
 @group(2) @binding(1) var<storage, read_write> accumulation: array<vec4f>;
-// Primary-hit G-buffer (normal.xyz, material index; >= 900 marks a miss),
-// ping-ponged across frames for the denoiser's temporal pass
+// Primary-hit G-buffer (normal.xyz, w = material + 4*depth; w < 0 marks a
+// miss), ping-ponged across frames for temporal passes
 @group(2) @binding(2) var gbuffer_prev: texture_2d<f32>;
 @group(2) @binding(3) var gbuffer_out: texture_storage_2d<rgba32float, write>;
+// Raw (pre-accumulation, pre-tonemap) per-frame radiance for the denoiser
+@group(2) @binding(5) var illum_out: texture_storage_2d<rgba32float, write>;
 
 // ============================================================================
 // ReSTIR PT reservoirs (docs/restir-pt-plan.md, layout after ReSTIR PT
@@ -1099,7 +1101,8 @@ fn sample_environment(randoms: vec2f, out_pdf: ptr<function, f32>) -> vec3f {
 // stratified wavelength samples from the illuminant LUT, one throughput
 // weight per wavelength.
 fn clear_gbuffer(pixel: vec2u) {
-    textureStore(gbuffer_out, pixel, vec4f(0.0, 0.0, 0.0, 999.0));
+    // w < 0 marks a primary miss; hits store material + 4 * depth
+    textureStore(gbuffer_out, pixel, vec4f(0.0, 0.0, 0.0, -1.0));
 }
 
 fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>) -> vec3f {
@@ -1539,7 +1542,8 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
         }
 
         if (k == 1u) {
-            textureStore(gbuffer_out, pixel, vec4f(s.normal, f32(obj.material_index)));
+            textureStore(gbuffer_out, pixel,
+                vec4f(s.normal, f32(obj.material_index) + 4.0 * hit.distance));
         }
 
         // Lamp NEE
@@ -1930,16 +1934,36 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
         (cam_prev.x / (-cam_prev.z)) / (aspect * input.fov_scale),
         (cam_prev.y / (-cam_prev.z)) / input.fov_scale,
     ) * 0.5 + 0.5;
-    let prev_pixel = vec2i(uv * vec2f(dims));
-    if (any(prev_pixel < vec2i(0)) || any(prev_pixel >= vec2i(dims))) {
-        return;
-    }
+    // Validated 2x2-footprint reprojection: a single truncating vec2i
+    // beats against the pixel grid under camera zoom (moire rings of
+    // alternating reuse/skip that persist in the reservoirs and leak into
+    // the image). Pick the footprint tap with the best geometric match.
+    let base_f = uv * vec2f(dims) - 0.5;
+    let base = vec2i(floor(base_f));
     let n_prev = normalize((obj.motion * vec4f(s.normal, 0.0)).xyz);
-    let g = textureLoad(gbuffer_prev, prev_pixel, 0);
-    if (g.w >= 900.0 || u32(g.w) != obj.material_index || dot(g.xyz, n_prev) <= 0.9) {
+    var best_tap = vec2i(-1);
+    var best_score = 0.9; // minimum acceptable normal agreement
+    for (var ty = 0; ty < 2; ty++) {
+        for (var tx = 0; tx < 2; tx++) {
+            let pp = base + vec2i(tx, ty);
+            if (any(pp < vec2i(0)) || any(pp >= vec2i(dims))) {
+                continue;
+            }
+            let gp = textureLoad(gbuffer_prev, pp, 0);
+            if (gp.w < 0.0 || (u32(gp.w) & 3u) != obj.material_index) {
+                continue;
+            }
+            let score = dot(gp.xyz, n_prev);
+            if (score > best_score) {
+                best_score = score;
+                best_tap = pp;
+            }
+        }
+    }
+    if (best_tap.x < 0) {
         return;
     }
-    let r_t = reservoirs[reservoir_index(vec2u(prev_pixel), dims, 1u - (input.rng_frame & 1u))];
+    let r_t = reservoirs[reservoir_index(vec2u(best_tap), dims, 1u - (input.rng_frame & 1u))];
     let m_t = min(r_t.m, TEMPORAL_CONFIDENCE_CAP);
     if (!(m_t > 0.0) || !(r_t.w > 0.0) || (r_t.path_flags & 15u) < 2u) {
         return;
@@ -2143,7 +2167,17 @@ fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
 
     let r = reservoirs[reservoir_index(global_id.xy, dims, input.rng_frame & 1u)];
     let rgb_and_phases = wavelengths_at(r.wavelength_u);
-    write_output(global_id.xy, dims, project_spectral(r.f, rgb_and_phases) * r.w);
+    var radiance = project_spectral(r.f, rgb_and_phases) * r.w;
+    if (!(radiance.x + radiance.y + radiance.z < 1e20)) {
+        radiance = vec3f(0.0);
+    }
+    radiance = clamp(radiance, vec3f(0.0), vec3f(100.0));
+    // Denoiser input: normalize by this sample's flat-spectrum white so the
+    // per-basis CMF color cast cancels (ratio estimator; the white-balanced
+    // LUT makes E[white] = (1,1,1), so no un-correction is needed). The
+    // accumulation path keeps the raw estimator (exact mean).
+    textureStore(illum_out, global_id.xy, vec4f(radiance, 1.0));
+    write_output(global_id.xy, dims, radiance);
 }
 
 // ============================================================================
