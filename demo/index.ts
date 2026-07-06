@@ -1086,12 +1086,8 @@ function requestFrame() {
       computePass.dispatchWorkgroups(wgX, wgY, 1);
       computePass.setPipeline(temporalPipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
-      // Spatial reuse DISABLED: candidates in the post-temporal scratch
-      // carry MIXED per-sample wavelength bases; the pass must evaluate
-      // each candidate in its own basis with constant MIS (exactly the
-      // temporal fix) before re-enabling. See docs/restir-pt-plan.md.
-      // computePass.setPipeline(spatialPipeline);
-      // computePass.dispatchWorkgroups(wgX, wgY, 1);
+      computePass.setPipeline(spatialPipeline);
+      computePass.dispatchWorkgroups(wgX, wgY, 1);
       computePass.setPipeline(shadePipeline);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
     } else {

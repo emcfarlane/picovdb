@@ -2010,6 +2010,9 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
     let pixel = global_id.xy;
 
     var out = reservoirs[reservoir_index(pixel, dims, 2u)];
+    // The running canonical's own wavelength basis (may be a temporal
+    // survivor with an older u than this frame's)
+    var out_phases = wavelengths_at(out.wavelength_u);
     let out_index = reservoir_index(pixel, dims, input.rng_frame & 1u);
 
     // Same primary derivation as initialMain
@@ -2090,37 +2093,39 @@ fn spatialMain(@builtin(global_invocation_id) global_id: vec3u) {
             continue;
         }
 
-        // Forward shift: neighbor path into this pixel (same frame =>
-        // identical lambda set: fully spectral reuse, no wavelength shift)
-        let fwd = shift_reconnect(r_n, s, reflectance, rgb_and_phases, ns, false, &iterations);
-        let p_fwd = luminance(project_spectral(fwd.f, rgb_and_phases));
+        // Forward shift: neighbor path into this pixel, evaluated in the
+        // SAMPLE's own wavelength basis (temporal survivors in the scratch
+        // carry older u sets — mixing bases blew energy up immediately)
+        let phases_n = wavelengths_at(r_n.wavelength_u);
+        var refl_n: array<f32, WAVELENGTH_SAMPLE_COUNT>;
+        for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
+            refl_n[i] = eval_reflectance_real_lagrange_3(phases_n[i].w, lagranges);
+        }
+        let fwd = shift_reconnect(r_n, s, refl_n, phases_n, ns, false, &iterations);
+        let p_fwd = luminance(project_spectral(fwd.f, phases_n));
         if (!(p_fwd > 0.0) || !(fwd.jacobian > 0.0)) {
             out.m += m_n;
             continue;
         }
-        // Reverse shift of the running canonical into the neighbor's domain
-        let p_c = luminance(project_spectral(out.f, rgb_and_phases));
-        var p_rev = 0.0;
-        if (p_c > 0.0 && (out.path_flags & 15u) >= 2u && out.w > 0.0) {
-            let rev = shift_reconnect(out, ns, reflectance, rgb_and_phases, s, false, &iterations);
-            p_rev = luminance(project_spectral(rev.f, rgb_and_phases)) * rev.jacobian;
-        }
-        // 2-candidate confidence-weighted Talbot MIS (chained GRIS)
+        // Constant (confidence-proportional) MIS — partitions unity for
+        // any support structure, including cross-basis candidate pairs;
+        // also removes the need for a reverse shift entirely
+        let p_c = luminance(project_spectral(out.f, out_phases));
         let m_c = out.m;
-        let p_n_own = luminance(project_spectral(r_n.f, rgb_and_phases)) / fwd.jacobian;
-        let m_nw = (m_n * p_n_own) / max(m_c * p_fwd + m_n * p_n_own, 1e-12);
-        let m_cw = (m_c * p_c) / max(m_c * p_c + m_n * p_rev, 1e-12);
+        let m_nw = m_n / max(m_c + m_n, 1e-6);
+        let m_cw = m_c / max(m_c + m_n, 1e-6);
         let w_n = m_nw * p_fwd * r_n.w * fwd.jacobian;
         let w_c = m_cw * p_c * out.w;
         let w_total = w_c + w_n;
         if (get_random_numbers(&seed).x * w_total < w_n) {
             let keep_m = out.m;
-            out = r_n;
+            out = r_n; // carries r_n.wavelength_u
             out.m = keep_m;
             out.f = fwd.f;
+            out_phases = phases_n;
         }
         out.w = 0.0;
-        let pl = luminance(project_spectral(out.f, rgb_and_phases));
+        let pl = luminance(project_spectral(out.f, out_phases));
         if (pl > 0.0 && w_total > 0.0) {
             out.w = w_total / pl;
         }
