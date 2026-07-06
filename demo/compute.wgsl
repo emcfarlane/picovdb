@@ -140,6 +140,11 @@ const MAX_LIGHTS: u32 = 8u;
 // source) when a full-res pixel resamples the low-res reservoir grid
 @group(2) @binding(9) var gi_gbuffer: texture_2d<f32>;
 @group(2) @binding(10) var gi_gdepth: texture_2d<f32>;
+// P4 duplication map (Enhanced Sec.5): dupMain writes the fraction of a
+// window sharing each reservoir's birth id; temporal reuse reads the prev
+// map to lower its confidence cap where samples are over-duplicated.
+@group(2) @binding(11) var dup_out: texture_storage_2d<r32float, write>;
+@group(2) @binding(12) var dup_prev: texture_2d<f32>;
 
 // ============================================================================
 // ReSTIR PT reservoirs (docs/restir-pt-plan.md, layout after ReSTIR PT
@@ -248,6 +253,17 @@ fn oct_decode(bits: u32) -> vec3f {
 }
 
 const TEMPORAL_CONFIDENCE_CAP = 20.0;
+// Per-sample birth id (pixel x frame): a reused sample carries its birth id
+// to every pixel it spreads to, so a window's same-id count measures reuse
+// duplication (Enhanced Sec.5). Must be well distributed across pixels.
+fn dup_hash(pixel: vec2u, frame: u32) -> u32 {
+    // Explicit parens: Tint (Chrome) rejects mixing * and ^ without them
+    var h = (pixel.x * 0x9e3779b9u) ^ (pixel.y * 0x85ebca6bu) ^ (frame * 0xc2b2ae35u);
+    h = h ^ (h >> 16u);
+    h = h * 0x7feb352du;
+    h = h ^ (h >> 15u);
+    return h;
+}
 const JACOBIAN_REJECT_THRESHOLD = 0.5;
 
 fn mis_balance(a: f32, b: f32) -> f32 {
@@ -1289,9 +1305,13 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
             break;
         }
 
-        // Primary-hit G-buffer (normal + material) for denoise passes
+        // Primary-hit G-buffer (normal, material + packed depth) + exact
+        // depth, matching initialMain so the denoiser can run on Reference
+        // PT too (world_pos reconstruction needs the packed/exact depth)
         if (k == 1u) {
-            textureStore(gbuffer_out, pixel, vec4f(s.normal, f32(obj.material_index)));
+            textureStore(gbuffer_out, pixel,
+                vec4f(s.normal, f32(obj.material_index) + clamp(hit.distance * (1.0 / 16384.0), 0.0, 0.9999)));
+            textureStore(gdepth_out, pixel, vec4f(hit.distance, 0.0, 0.0, 0.0));
         }
 
         // Next event estimation: sample a direction towards a light
@@ -1471,7 +1491,7 @@ fn initial_sample(ray_in: Ray, pixel: vec2u, dims: vec2u, seed: ptr<function, ve
     var x2_brdf_pdf = 0.0;
     var thr2: array<f32, WAVELENGTH_SAMPLE_COUNT>; // throughput after x2's BSDF (suffix divider)
     var have_thr2 = false;
-    var sel_init_seed = input.rng_frame;
+    var sel_init_seed = dup_hash(pixel, input.rng_frame);
 
     for (var k = 1u; k <= input.max_bounces; k++) {
         let light_hit = intersect_lights(ray);
@@ -1939,6 +1959,9 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
 
     var iterations = 0u;
     let radiance = path_trace(ray, global_id.xy, &seed, &iterations);
+    // Raw 1spp radiance for the denoiser (when Denoise is on in Reference
+    // mode) — lets SVGF be inspected on plain PT without reservoirs
+    textureStore(illum_out, global_id.xy, vec4f(radiance, 1.0));
     write_output(global_id.xy, dims, radiance);
 }
 
@@ -2078,9 +2101,14 @@ fn temporalMain(@builtin(global_invocation_id) global_id: vec3u) {
         return;
     }
     let r_t = reservoirs[reservoir_index(vec2u(best_tap), dims, 1u - (input.rng_frame & 1u))];
-    // Debug bit 6: hard-shorten the temporal chain (cap 3) to test whether
-    // the shadow inflation compounds with chain length
-    var cap = TEMPORAL_CONFIDENCE_CAP;
+    // P4 adaptive confidence cap (Enhanced Sec.5): where this sample has
+    // been over-duplicated by reuse (high D in the previous frame's map at
+    // the reprojected location), cap the confidence low so fresh samples
+    // dominate and the reuse correlation the denoiser keeps as signal
+    // breaks up. D == 0 (unique) keeps the full cap.
+    let dval = textureLoad(dup_prev, best_tap, 0).r;
+    var cap = mix(TEMPORAL_CONFIDENCE_CAP, 1.0, pow(clamp(dval, 0.0, 1.0), 0.1));
+    // Debug bit 6: hard-shorten the temporal chain (cap 3)
     if ((input.restir_debug & 64u) != 0u) {
         cap = 3.0;
     }
@@ -2438,15 +2466,31 @@ fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
         dst_refl[i] = eval_reflectance_real_lagrange_3(rgb_and_phases[i].w, lagr);
     }
 
-    // Covering low-res cell (nearest-first over the 2x2 footprint). Cell
-    // selection depends only on GEOMETRY (material match + occupancy), never
-    // on the shift outcome, so shift failure -> 0 stays value-independent.
+    // Bilinear 2x2 resample of the low-res reservoir grid. Each full-res
+    // pixel's radiance is estimated by shifting all four covering cells'
+    // reservoirs onto THIS primary and blending them with bilinear
+    // footprint weights, renormalized over the cells whose shift is
+    // defined. Each shifted candidate F * W * J is an unbiased estimate of
+    // this pixel's radiance (GRIS, |R| = 1); a bilinear convex blend stays
+    // unbiased while removing the single-cell selection noise and
+    // block-boundary seams (the blocky look at low giScale). Cell occupancy
+    // is a GEOMETRY test (material match), value-independent.
     let gi_dims = textureDimensions(gi_gbuffer);
-    let base = vec2i(vec2f(pixel) * (vec2f(gi_dims) / vec2f(dims)));
-    var radiance = vec3f(0.0);
+    let scale = vec2f(gi_dims) / vec2f(dims);
+    // Full-res pixel centre in GI-grid space, biased so floor() gives the
+    // lower-left of the four surrounding cell centres (identity at scale 1)
+    let gc = (vec2f(pixel) + 0.5) * scale - 0.5;
+    let cbase = vec2i(floor(gc));
+    let frac = gc - floor(gc);
+    var accum = vec3f(0.0);
+    var wsum = 0.0;
     var it = 0u;
     for (var t = 0; t < 4; t++) {
-        let cell = clamp(base + vec2i(t & 1, (t >> 1) & 1), vec2i(0), vec2i(gi_dims) - 1);
+        let tx = t & 1;
+        let ty = (t >> 1) & 1;
+        let b = mix(1.0 - frac.x, frac.x, f32(tx)) * mix(1.0 - frac.y, frac.y, f32(ty));
+        if (b <= 0.0) { continue; } // zero-footprint cell: skip the shift
+        let cell = clamp(cbase + vec2i(tx, ty), vec2i(0), vec2i(gi_dims) - 1);
         let g_gi = textureLoad(gi_gbuffer, cell, 0);
         if (g_gi.w < 0.0 || (u32(g_gi.w) & 3u) != mat_idx) { continue; }
         let r = reservoirs[reservoir_index(vec2u(cell), gi_dims, input.rng_frame & 1u)];
@@ -2467,14 +2511,53 @@ fn shadeMain(@builtin(global_invocation_id) global_id: vec3u) {
         src_s.pos += src_s.normal * RAY_OFFSET;
         let fwd = shift_reconnect(r, dst_s, dst_refl, rgb_and_phases, wavelength_u, src_s, false, 0.005, &it);
         if (fwd.jacobian > 0.0) {
-            radiance = project_spectral(fwd.f, rgb_and_phases) * r.w * fwd.jacobian;
+            let c = project_spectral(fwd.f, rgb_and_phases) * r.w * fwd.jacobian;
+            if (c.x + c.y + c.z < 1e20) {
+                accum += b * c;
+                wsum += b;
+            }
         }
-        break; // first geometrically-valid cell decides (value-independent)
     }
-    if (!(radiance.x + radiance.y + radiance.z < 1e20)) { radiance = vec3f(0.0); }
+    var radiance = vec3f(0.0);
+    if (wsum > 0.0) { radiance = accum / wsum; }
     radiance = clamp(radiance, vec3f(0.0), vec3f(100.0));
     textureStore(illum_out, pixel, vec4f(radiance, 1.0));
     write_output(pixel, dims, radiance);
+}
+
+// ReSTIR PT pass 5: duplication map (Enhanced Sec.5). For each GI reservoir
+// cell, count the fraction of a strided window that shares its birth id (a
+// reused sample carries its birth id everywhere it spreads). Written to the
+// dup ping-pong; next frame's temporal reuse reads it to lower the
+// confidence cap where duplication is high, decorrelating the reuse
+// artifacts a denoiser would otherwise preserve as signal.
+@compute @workgroup_size(8, 8)
+fn dupMain(@builtin(global_invocation_id) gid: vec3u) {
+    let dims = textureDimensions(dup_out);
+    if gid.x >= dims.x || gid.y >= dims.y { return; }
+    let pixel = gid.xy;
+    let c = reservoirs[reservoir_index(pixel, dims, input.rng_frame & 1u)];
+    if (!(c.w > 0.0) || (c.path_flags & 15u) < 2u) {
+        textureStore(dup_out, pixel, vec4f(0.0));
+        return;
+    }
+    let sid = c.init_seed;
+    var count = 0.0;
+    var total = 0.0;
+    // Strided 17x17 window (stride 2 -> 81 taps), self excluded so an
+    // un-spread sample gives D = 0 and keeps the full temporal cap
+    for (var dy = -8; dy <= 8; dy += 2) {
+        for (var dx = -8; dx <= 8; dx += 2) {
+            if (dx == 0 && dy == 0) { continue; }
+            let q = vec2i(pixel) + vec2i(dx, dy);
+            if (any(q < vec2i(0)) || any(q >= vec2i(dims))) { continue; }
+            total += 1.0;
+            let r = reservoirs[reservoir_index(vec2u(q), dims, input.rng_frame & 1u)];
+            if ((r.w > 0.0) && r.init_seed == sid) { count += 1.0; }
+        }
+    }
+    let d = select(0.0, count / total, total > 0.0);
+    textureStore(dup_out, pixel, vec4f(d, 0.0, 0.0, 0.0));
 }
 
 // ============================================================================

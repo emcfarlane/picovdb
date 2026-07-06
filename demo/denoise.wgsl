@@ -72,6 +72,17 @@ struct DenoiseParams {
 // grows, so the denoised view CONVERGES to the reference instead of
 // plateauing at the EMA/a-trous steady state
 @group(0) @binding(13) var<storage, read> accumulation: array<vec4f>;
+// Per-material linear-RGB diffuse albedo (authored colours). SVGF albedo
+// demodulation: filter irradiance = radiance / albedo (smooth, denoisable)
+// and remodulate at resolve, so the a-trous blurs the LIGHTING without
+// smearing the sharp material colour (the co-design 1-spp signal).
+@group(0) @binding(14) var<uniform> material_albedo: array<vec4f, 8>;
+
+// Demodulation albedo for a G-buffer texel (1 for env/miss = no demod)
+fn demod_albedo(g_w: f32) -> vec3f {
+    if (g_w < 0.0) { return vec3f(1.0); }
+    return max(material_albedo[u32(g_w) & 3u].rgb, vec3f(0.04));
+}
 
 fn dn_luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.2126, 0.7152, 0.0722));
@@ -114,8 +125,10 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
     if gid.x >= dims.x || gid.y >= dims.y { return; }
     let pixel = gid.xy;
 
-    let c_in = textureLoad(illum, pixel, 0).rgb;
     let g = textureLoad(gbuf, pixel, 0);
+    // Albedo-demodulate: the denoiser works on irradiance, not radiance
+    let alb = demod_albedo(g.w);
+    let c_in = textureLoad(illum, pixel, 0).rgb / alb;
     let l_in = dn_luminance(c_in);
 
     var color = c_in;
@@ -221,7 +234,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
                     continue;
                 }
-                csum += textureLoad(illum, vec2u(q), 0).rgb;
+                csum += textureLoad(illum, vec2u(q), 0).rgb / alb;
                 ccnt += 1.0;
             }
         }
@@ -252,7 +265,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c || dot(gq.xyz, g.xyz) <= 0.75) {
                     continue;
                 }
-                let lq = dn_luminance(textureLoad(illum, vec2u(q), 0).rgb);
+                let lq = dn_luminance(textureLoad(illum, vec2u(q), 0).rgb / alb);
                 s1 += lq;
                 s2 += lq * lq;
                 cnt += 1.0;
@@ -372,6 +385,8 @@ fn resolveMain(@builtin(global_invocation_id) gid: vec3u) {
     let dims = textureDimensions(atrous_src);
     if gid.x >= dims.x || gid.y >= dims.y { return; }
     var color = textureLoad(atrous_src, vec2i(gid.xy), 0).rgb;
+    // Remodulate the filtered irradiance by the material albedo
+    color = color * demod_albedo(textureLoad(gbuf, vec2i(gid.xy), 0).w);
     // Converge to the reference: blend toward the progressive accumulation
     // mean as the static-scene sample count grows (motion resets the
     // accumulation, so interaction stays on the pure denoised path). The
@@ -379,7 +394,7 @@ fn resolveMain(@builtin(global_invocation_id) gid: vec3u) {
     // image never settles past "filtered noise" no matter how long it sits.
     let acc = accumulation[gid.y * dims.x + gid.x];
     if (acc.a > 0.0) {
-        let t = acc.a / (acc.a + 64.0);
+        let t = acc.a / (acc.a + 24.0);
         color = mix(color, acc.rgb / acc.a, t);
     }
     color = dn_tonemap(color);

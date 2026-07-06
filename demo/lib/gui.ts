@@ -23,6 +23,8 @@ export interface Controls {
 	domeIntensity: number;
 	exposure: number;
 	maxBounces: number;
+	modelRoughness: number;
+	paintFinish: 'Dry' | 'Wet';
 	renderScale: number;
 	giScale: number;
 }
@@ -37,6 +39,8 @@ export interface GUIControllers {
 	rotationController: ReturnType<GUI['add']>;
 	debugController: ReturnType<GUI['add']>;
 	illuminantController: ReturnType<GUI['add']>;
+	paintController: ReturnType<GUI['add']>;
+	roughnessController: ReturnType<GUI['add']>;
 }
 
 export function initGUI(models: ModelConfig[], illuminants: string[], initialModelName?: string): GUIControllers {
@@ -58,6 +62,8 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 		domeIntensity: 0.5,
 		exposure: 1.0,
 		maxBounces: 3,
+		modelRoughness: 0.7,
+		paintFinish: 'Dry',
 		renderScale: 0.5,
 		giScale: 0.5,
 		// Temporal + paired-spatial ReSTIR DI: measured at parity with the
@@ -83,9 +89,11 @@ export function initGUI(models: ModelConfig[], illuminants: string[], initialMod
 	lighting.add(controls, 'domeIntensity', 0, 4, 0.05).name('Dome Intensity');
 	lighting.add(controls, 'exposure', 0.01, 4, 0.01).name('Exposure');
 	lighting.add(controls, 'maxBounces', 1, 8, 1).name('Max Bounces');
+	const paintController = lighting.add(controls, 'paintFinish', ['Dry', 'Wet']).name('Paint Finish');
+	const roughnessController = lighting.add(controls, 'modelRoughness', 0.02, 0.9, 0.01).name('Model Roughness');
 	lighting.add(controls, 'renderScale', { '25%': 0.25, '50%': 0.5, '100%': 1 }).name('Render Scale');
 	lighting.add(controls, 'giScale', { '25%': 0.25, '50%': 0.5, '100%': 1 }).name('GI Scale');
 	// ReSTIR DI for direct lighting; off = pure path-traced reference
 
-	return { controls, gui, modelController, pauseController, cameraController, highDPIController, rotationController, debugController, illuminantController };
+	return { controls, gui, modelController, pauseController, cameraController, highDPIController, rotationController, debugController, illuminantController, paintController, roughnessController };
 }
