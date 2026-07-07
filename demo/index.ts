@@ -91,6 +91,7 @@ let dataBindGroup: GPUBindGroup;
 // Two pass bind groups with the G-buffer ping-pong swapped
 let passBindGroups: GPUBindGroup[] = [];
 let gdepthTexture: GPUTexture;
+let hitdistTexture: GPUTexture;
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
@@ -216,8 +217,6 @@ let lowersBuffer: GPUBuffer;
 let leavesBuffer: GPUBuffer;
 let dataBuffer: GPUBuffer;
 let currentModelConfig: ModelConfig = models[0];
-// ReSTIR PT path reservoirs: one buffer, two ping-pong halves (64 B/pixel
-// each), the written half selected by rng_frame parity
 
 // Create size-dependent GPU resources
 function createGPUResources() {
@@ -303,7 +302,8 @@ function createGPUResources() {
     label: `G-buffer ${i}`,
     size: [renderWidth, renderHeight],
     format: 'rgba32float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+    // COPY_SRC: __readGbuf debug readback
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
   }));
 
   const denoiseTex = (label: string) => device.createTexture({
@@ -322,6 +322,15 @@ function createGPUResources() {
   histTextures = [denoiseTex('Denoise hist 0'), denoiseTex('Denoise hist 1')];
   momentsTextures = [denoiseTex('Denoise moments 0'), denoiseTex('Denoise moments 1')];
   atrousTextures = [denoiseTex('Denoise atrous 0'), denoiseTex('Denoise atrous 1')];
+  // Accumulated first-bounce distance -> ReBLUR blur radius (read by the blur
+  // pass, so it must exist before createDenoiseBindGroups())
+  hitdistTexture?.destroy();
+  hitdistTexture = device.createTexture({
+    label: 'Hit distance',
+    size: [renderWidth, renderHeight],
+    format: 'r32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+  });
   createDenoiseBindGroups();
 
   // Exact primary depth (r32float; the P4 duplication map becomes a buffer)
@@ -360,6 +369,7 @@ function createGPUResources() {
       { binding: 0, resource: raytracedTexture.createView() },
       { binding: 1, resource: { buffer: accumulationBuffer } },
       { binding: 2, resource: specTexture.createView() },
+      { binding: 6, resource: hitdistTexture.createView() },
       { binding: 4, resource: { buffer: gbufferAccumBuffer } },
       { binding: 3, resource: gbufferTextures[1 - parity].createView() },
       { binding: 5, resource: illumTexture.createView() },
@@ -532,8 +542,8 @@ controls.resetCamera = () => {
 };
 
 
-// Input uniform, must match struct Input in compute.wgsl (208 bytes)
-const inputValues = new ArrayBuffer(208);
+// Input uniform, must match struct Input in compute.wgsl (224 bytes)
+const inputValues = new ArrayBuffer(224);
 const inputViews = {
   camera_matrix: new Float32Array(inputValues, 0, 16),
   fov_scale: new Float32Array(inputValues, 64, 1),
@@ -549,10 +559,15 @@ const inputViews = {
   light_count: new Uint32Array(inputValues, 104, 1),
   white_background: new Uint32Array(inputValues, 108, 1),
   rng_frame: new Uint32Array(inputValues, 112, 1),
-  restir_debug: new Uint32Array(inputValues, 116, 1),
+  pass_mode: new Uint32Array(inputValues, 116, 1),
   prev_view: new Float32Array(inputValues, 128, 16),
   prev_camera_pos: new Float32Array(inputValues, 192, 3),
   wavelength_u: new Float32Array(inputValues, 204, 1),
+  jitter: new Float32Array(inputValues, 208, 2),
+  jitter_mean: new Float32Array(inputValues, 216, 2),
+  // Previous frame's jitter_mean (the denoiser's history-fetch offset),
+  // packed in the old _pad1/_pad2 slot
+  jitter_mean_prev: new Float32Array(inputValues, 120, 2),
 };
 const inputBuffer = device.createBuffer({
   label: 'Input Uniforms',
@@ -875,6 +890,27 @@ rotationController.onChange(() => {
 const MAX_ACCUM_FRAMES = 65536;
 let accumFrameIndex = 0;
 let rngFrame = 0;
+// Sum of the sub-pixel jitters folded into gbuffer_accum since the last
+// accumulation reset; its mean rides in the uniform so the denoiser's
+// world_pos reconstruction looks through the same offset as the rays did
+const jitterSum = [0, 0];
+
+// Halton radical-inverse (low-discrepancy) for stable sub-pixel jitter:
+// a white-noise per-frame offset makes silhouette coverage a random binary
+// each frame -> high-frequency edge flicker; a Halton sequence distributes
+// the offsets evenly so the temporal average converges smoothly with far
+// less edge variance (the standard TAA jitter).
+function halton(index: number, base: number): number {
+  let f = 1;
+  let r = 0;
+  let i = index;
+  while (i > 0) {
+    f /= base;
+    r += f * (i % base);
+    i = Math.floor(i / base);
+  }
+  return r;
+}
 // Last frame's world->camera matrix + camera position for ReSTIR
 const prevViewMatrix = new Float32Array(16);
 mat4.identity(prevViewMatrix);
@@ -901,6 +937,21 @@ function resetAccumulation(cause = 'unknown') {
   gui.controllersRecursive().forEach(c => c.updateDisplay());
   resetAccumulation('test-set');
   return `${prop}=${value}`;
+};
+// Headless-test hook: both G-buffer ping-pong textures at a pixel
+// (normal.xyz, w = material + depth/16384; w < 0 = miss)
+(window as any).__readGbuf = async (x: number, y: number) => {
+  const out: number[][] = [];
+  for (const tex of gbufferTextures) {
+    const buf = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    const enc = device.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: tex, origin: [x, y] }, { buffer: buf, bytesPerRow: 256 }, [1, 1]);
+    device.queue.submit([enc.finish()]);
+    await buf.mapAsync(GPUMapMode.READ);
+    out.push(Array.from(new Float32Array(buf.getMappedRange().slice(0, 16))));
+    buf.unmap(); buf.destroy();
+  }
+  return JSON.stringify({ tex0_w: out[0][3], tex1_w: out[1][3], tex0_n: out[0].slice(0, 3), tex1_n: out[1].slice(0, 3) });
 };
 // Headless-test hook: denoiser history (rgb, history length) at a pixel
 (window as any).__readHist = async (x: number, y: number) => {
@@ -996,12 +1047,31 @@ function updateInput(deltaTime: number) {
 
   shouldDispatch = accumFrameIndex < MAX_ACCUM_FRAMES;
   inputViews.frame_index[0] = accumFrameIndex;
+  // Halton(2,3) sub-pixel jitter (cycled over 64 frames, same key the RNG
+  // seed uses) + the running mean of the jitters accumulated since reset.
+  // The PREVIOUS frame's mean also rides along: history texels correspond
+  // to surfaces seen through last frame's mean offset, so the denoiser
+  // subtracts it when fetching history (static = exact identity fetch).
+  if (shouldDispatch) {
+    const h = (rngFrame & 63) + 1;
+    const jx = halton(h, 2) - 0.5;
+    const jy = halton(h, 3) - 0.5;
+    if (accumFrameIndex === 0) { jitterSum[0] = 0; jitterSum[1] = 0; }
+    inputViews.jitter_mean_prev.set(inputViews.jitter_mean);
+    jitterSum[0] += jx;
+    jitterSum[1] += jy;
+    inputViews.jitter.set([jx, jy]);
+    inputViews.jitter_mean.set([
+      jitterSum[0] / (accumFrameIndex + 1),
+      jitterSum[1] / (accumFrameIndex + 1),
+    ]);
+  }
   if (shouldDispatch) { accumFrameIndex++; }
   // Monotonic RNG frame: samples stay fresh across accumulation resets
   inputViews.rng_frame[0] = rngFrame;
-  // pass_mode rides in the (now-free) restir_debug slot; read by blit.wgsl
+  // Pass debug visualizer selection; read by blit.wgsl
   const PASS = { 'Final': 0, 'Denoised': 1, 'Raw': 2, 'GBuffer Normals': 3, 'Motion Vectors': 4, 'Depth': 5, 'Iterations': 6 } as const;
-  inputViews.restir_debug[0] = PASS[controls.passMode as keyof typeof PASS] ?? 0;
+  inputViews.pass_mode[0] = PASS[controls.passMode as keyof typeof PASS] ?? 0;
   // ReSTIR reprojection state: last frame's view matrix + object motion
   inputViews.prev_view.set(prevViewMatrix);
   inputViews.prev_camera_pos.set(prevCameraPos);
@@ -1090,6 +1160,7 @@ const passBindGroupLayout = device.createBindGroupLayout({
     { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
+    { binding: 6, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
@@ -1162,6 +1233,8 @@ function createDenoiseBindGroups() {
       { binding: 8, resource: histTextures[1 - P].createView() },
       { binding: 9, resource: momentsTextures[1 - P].createView() },
       { binding: 11, resource: atrousTextures[0].createView() },
+      // ReBLUR anti-lag: last frame's stabilization confidence (in .a)
+      { binding: 17, resource: stabTextures[P].createView() },
     ]
   }));
   denoiseAtrousGroups = [0, 1].map(P =>
@@ -1176,6 +1249,7 @@ function createDenoiseBindGroups() {
         { binding: 8, resource: histTextures[1 - P].createView() },
         { binding: 10, resource: atrousTextures[i % 2].createView() },
         { binding: 11, resource: atrousTextures[(i + 1) % 2].createView() },
+        { binding: 19, resource: hitdistTexture.createView() },
       ]
     })));
   denoiseResolveGroups = [0, 1].map(P => device.createBindGroup({

@@ -33,12 +33,12 @@ struct Input {
     // Monotonic frame counter for RNG seeding (never resets, unlike
     // frame_index, so samples stay fresh while accumulation restarts)
     rng_frame: u32,
-    // Debug bitmask for reuse-bias bisection (0 in normal operation):
-    // bit 0: spatial skips d==2 candidates | bit 1: skips d==3 NEE |
-    // bit 2: skips d==3 escape | bit 3: skips d>=4
-    restir_debug: u32,
-    _pad1: u32,
-    _pad2: u32,
+    // Pass debug visualizer selection (read by blit.wgsl)
+    pass_mode: u32,
+    // PREVIOUS frame's jitter_mean: the denoiser's history-fetch offset.
+    // History texel p holds the surface seen through p + 0.5 + that mean,
+    // so reprojection must subtract it when converting uv -> texels.
+    jitter_mean_prev: vec2f,
     // Previous frame's view matrix (world -> camera): temporal reprojection
     // for the denoiser, combined with per-object motion matrices
     prev_view: mat4x4f,
@@ -50,6 +50,12 @@ struct Input {
     // hue swings whenever motion resets accumulation); the wavelength shift
     // rebases reused samples between per-pixel bases instead.
     wavelength_u: f32,
+    // This frame's sub-pixel jitter (host-computed Halton(2,3)) and the
+    // running mean of the jitters folded into gbuffer_accum since the last
+    // reset: world-position reconstruction from the accumulated depth must
+    // look through the same sub-pixel offset the rays actually used.
+    jitter: vec2f,
+    jitter_mean: vec2f,
 }
 
 // --- Object types ---
@@ -135,6 +141,8 @@ const MAX_LIGHTS: u32 = 8u;
 // the sub-pixel jitter at silhouettes (the denoiser only sees the stable
 // average, so its edges stop shimmering).
 @group(2) @binding(4) var<storage, read_write> gbuffer_accum: array<vec4f>;
+// Accumulated first-bounce distance (ReBLUR blur radius); dsum.z holds the sum
+@group(2) @binding(6) var hitdist_out: texture_storage_2d<r32float, write>;
 
 // CMF-project a per-wavelength contribution vector to RGB
 fn project_spectral(f: vec4f, rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>) -> vec3f {
@@ -146,6 +154,9 @@ fn project_spectral(f: vec4f, rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COU
 }
 
 const MAX_DIST: f32 = 1e7;
+// Cap for the denoiser hit distance (first-bounce distance drives the ReBLUR
+// blur radius; env/no-bounce = a wide low-frequency blur)
+const HITDIST_CAP: f32 = 1000.0;
 const PI = 3.14159265359;
 
 struct Intersection {
@@ -769,7 +780,7 @@ fn clear_gbuffer(pixel: vec2u) {
     textureStore(gbuffer_out, pixel, vec4f(0.0, 0.0, 0.0, -1.0));
 }
 
-fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>, primary_albedo: ptr<function, vec3f>, primary_normal: ptr<function, vec3f>, primary_depth: ptr<function, f32>, primary_mat: ptr<function, u32>, primary_hit: ptr<function, bool>, spec_out: ptr<function, vec3f>) -> vec3f {
+fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations: ptr<function, u32>, primary_albedo: ptr<function, vec3f>, primary_normal: ptr<function, vec3f>, primary_depth: ptr<function, f32>, primary_mat: ptr<function, u32>, primary_hit: ptr<function, bool>, spec_out: ptr<function, vec3f>, hitdist_out: ptr<function, f32>) -> vec3f {
     // Primary (k==1) specular is split off: it is fresnel-white, NOT albedo-
     // colored, so it must NOT ride in radiance/albedo (the demod would divide
     // it by the tiny low-albedo channels and amplify noise). Denoise it and
@@ -781,6 +792,7 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
     *primary_mat = 0u;
     *primary_hit = false;
     *spec_out = vec3f(0.0);
+    *hitdist_out = HITDIST_CAP;
     var ray = ray_in;
     // MIS weight applied when a BRDF-sampled ray reaches the environment
     // (competes with sample_environment() NEE from the previous vertex)
@@ -801,6 +813,9 @@ fn path_trace(ray_in: Ray, pixel: vec2u, seed: ptr<function, vec2u>, iterations:
     for (var k = 1u; k <= input.max_bounces; k++) {
         let light_hit = intersect_lights(ray);
         let hit = intersect_scene(ray, iterations);
+        // First-bounce distance = local geometry scale (short at contacts/AO,
+        // long in the open) -> the denoiser's blur radius
+        if (k == 2u) { *hitdist_out = min(hit.distance, HITDIST_CAP); }
         // Direct view / BRDF-sampled hit of a light: MIS-weighted emission
         if (light_hit.index >= 0 && light_hit.t < hit.distance) {
             for (var i = 0u; i < WAVELENGTH_SAMPLE_COUNT; i++) {
@@ -1079,24 +1094,6 @@ fn write_output(pixel: vec2u, dims: vec2u, radiance_in: vec3f) {
     textureStore(output_texture, pixel, vec4f(color, 1.0));
 }
 
-// Halton radical-inverse (low-discrepancy) for stable sub-pixel jitter:
-// a white-noise per-frame offset makes silhouette coverage a random binary
-// each frame -> high-frequency edge flicker; a Halton sequence distributes
-// the offsets evenly so the temporal average converges smoothly with far
-// less edge variance (the standard TAA jitter).
-fn halton(index: u32, base: u32) -> f32 {
-    var f = 1.0;
-    var r = 0.0;
-    var i = index;
-    for (var k = 0u; k < 16u; k++) {
-        if (i == 0u) { break; }
-        f = f / f32(base);
-        r = r + f * f32(i % base);
-        i = i / base;
-    }
-    return r;
-}
-
 // Reference: the frozen single-kernel path tracer (ground truth)
 @compute @workgroup_size(8, 8)
 fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
@@ -1104,15 +1101,14 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     if global_id.x >= dims.x || global_id.y >= dims.y { return; }
 
     var seed = vec2u(global_id.xy) ^ vec2u(input.rng_frame << 16u, (input.rng_frame + 237u) << 16u);
-    // Low-discrepancy Halton(2,3) sub-pixel jitter (cycled over 64 frames)
-    let h = (input.rng_frame & 63u) + 1u;
-    let jitter = vec2f(halton(h, 2u), halton(h, 3u)) - 0.5;
-    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5 + jitter, vec2f(dims));
+    // Low-discrepancy Halton(2,3) sub-pixel jitter, host-computed (see
+    // updateInput) so the denoiser also knows the accumulated jitter mean
+    let ray = generate_camera_ray(vec2f(global_id.xy) + 0.5 + input.jitter, vec2f(dims));
 
     var iterations = 0u;
     var pa = vec3f(1.0); var pn = vec3f(0.0, 0.0, 1.0); var pd = 0.0; var pm = 0u; var phit = false;
-    var pspec = vec3f(0.0);
-    let radiance = path_trace(ray, global_id.xy, &seed, &iterations, &pa, &pn, &pd, &pm, &phit, &pspec);
+    var pspec = vec3f(0.0); var phd = HITDIST_CAP;
+    let radiance = path_trace(ray, global_id.xy, &seed, &iterations, &pa, &pn, &pd, &pm, &phit, &pspec, &phd);
 
     // Accumulate the G-buffer + demodulated diffuse irradiance + separated
     // specular over jittered frames -> stable, anti-aliased values (reset when
@@ -1129,7 +1125,19 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     // hit gives each object pixel the stable average of its OWN irradiance
     // (radiance is DIFFUSE here, so the demod by albedo stays clean).
     if (phit) {
-        nsum += vec4f(pn, 1.0); dsum.x += pd; dsum.y = f32(pm);
+        nsum += vec4f(pn, 1.0); dsum.x += pd; dsum.z += phd;
+        // Majority-vote the pixel's material id (Boyer-Moore, counter in
+        // dsum.w). The old last-writer-wins id FLIPPED at model-ground
+        // silhouettes in step with the jitter (rays alternately hit each
+        // surface), so the resolve remod alternated blue/white albedo —
+        // the per-frame edge flicker. The majority id is stable.
+        if (dsum.w < 0.5) {
+            dsum.y = f32(pm); dsum.w = 1.0;
+        } else if (u32(dsum.y) == pm) {
+            dsum.w += 1.0;
+        } else {
+            dsum.w -= 1.0;
+        }
         isum += vec4f(radiance / max(pa, vec3f(0.02)), 1.0);
         ssum += vec4f(pspec, 1.0);
     }
@@ -1153,9 +1161,11 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     if (nsum.w > 0.5) {
         textureStore(illum_out, global_id.xy, vec4f(isum.rgb / max(isum.w, 1.0), 1.0));
         textureStore(spec_out, global_id.xy, vec4f(ssum.rgb / max(ssum.w, 1.0), 1.0));
+        textureStore(hitdist_out, global_id.xy, vec4f(dsum.z / nsum.w, 0.0, 0.0, 0.0));
     } else {
         textureStore(illum_out, global_id.xy, vec4f(radiance, 1.0));
         textureStore(spec_out, global_id.xy, vec4f(0.0, 0.0, 0.0, 1.0));
+        textureStore(hitdist_out, global_id.xy, vec4f(HITDIST_CAP, 0.0, 0.0, 0.0));
     }
     write_output(global_id.xy, dims, radiance + pspec);
 }

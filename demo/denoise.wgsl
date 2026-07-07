@@ -24,12 +24,20 @@ struct Input {
     light_count: u32,
     white_background: u32,
     rng_frame: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
+    pass_mode: u32,
+    // PREVIOUS frame's jitter_mean: the history-fetch offset. History texel
+    // p holds the surface seen through p + 0.5 + that mean, so reprojection
+    // must subtract it when converting uv -> texel coordinates. When static
+    // it cancels world_pos's jitter_mean shift (an exact identity fetch).
+    jitter_mean_prev: vec2f,
     prev_view: mat4x4f,
     prev_camera_pos: vec3f,
     wavelength_u: f32,
+    // This frame's sub-pixel jitter and the running mean of the jitters
+    // folded into the accumulated G-buffer since the last reset (host-
+    // computed; see compute.wgsl Input)
+    jitter: vec2f,
+    jitter_mean: vec2f,
 }
 
 struct Object {
@@ -52,7 +60,7 @@ struct DenoiseParams {
 @group(0) @binding(0) var<uniform> input: Input;
 @group(0) @binding(1) var<storage> objects: array<Object>;
 @group(0) @binding(2) var<uniform> params: DenoiseParams;
-// Per-frame raw radiance from the ReSTIR shade pass
+// Accumulated demodulated irradiance from the path tracer (computeMain)
 @group(0) @binding(3) var illum: texture_2d<f32>;
 // Current G-buffer (normal.xyz, material + 4*depth; w < 0 = miss)
 @group(0) @binding(4) var gbuf: texture_2d<f32>;
@@ -82,6 +90,8 @@ struct DenoiseParams {
 @group(0) @binding(16) var denoised_in: texture_2d<f32>;
 @group(0) @binding(17) var stab_prev: texture_2d<f32>;
 @group(0) @binding(18) var stab_out: texture_storage_2d<rgba32float, write>;
+// Accumulated first-bounce distance -> ReBLUR blur radius (blur pass)
+@group(0) @binding(19) var hitdist_tex: texture_2d<f32>;
 
 // Demodulation albedo for a G-buffer texel (1 for env/miss = no demod)
 fn demod_albedo(g_w: f32) -> vec3f {
@@ -93,9 +103,15 @@ fn dn_luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.2126, 0.7152, 0.0722));
 }
 
-// Reconstruct the primary-hit world position from the G-buffer depth
+// Reconstruct the primary-hit world position from the G-buffer depth.
+// The stored depth was traced along JITTERED rays, so reconstruct through
+// the mean accumulated jitter, not the pixel center: during motion the
+// G-buffer is a single jittered sample (accumulation resets every frame)
+// and a center-ray assumption put every reprojection off by up to +-0.5px,
+// varying per frame with the Halton sequence (edge shimmer, history kills).
+// Once accumulation runs, the mean tends to the center and this is a no-op.
 fn world_pos(pixel: vec2u, dims: vec2u, depth: f32) -> vec3f {
-    let uv = (vec2f(pixel) + 0.5) / vec2f(dims) * 2.0 - 1.0;
+    let uv = (vec2f(pixel) + 0.5 + input.jitter_mean) / vec2f(dims) * 2.0 - 1.0;
     let aspect = f32(dims.x) / f32(dims.y);
     let dir_cam = normalize(vec3f(uv.x * aspect * input.fov_scale, uv.y * input.fov_scale, -1.0));
     let origin = (input.camera_matrix * vec4f(0.0, 0.0, 0.0, 1.0)).xyz;
@@ -154,19 +170,6 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
             color = mix(h.rgb, c_in, alpha);
             mu = mix(m.xy, mu, alpha);
         }
-    } else if (material_boundary(pixel, dims, u32(g.w) & 3u)) {
-        // Material-boundary (silhouette) pixels flip material under the AA
-        // jitter every frame; ANY material-gated history dies immediately
-        // and the pixel never settles (the edge jitter). Their converged
-        // value is the jitter-weighted MIX of both materials, so always
-        // accumulate the identity tap — one consistent estimator. The 0.15
-        // alpha floor keeps motion ghosting on the ~1px rim short-lived.
-        let h = textureLoad(hist_prev, vec2i(pixel), 0);
-        let m = textureLoad(moments_prev, vec2i(pixel), 0);
-        hist_len = min(h.a + 1.0, 64.0);
-        let alpha = max(0.15, 1.0 / hist_len);
-        color = mix(h.rgb, c_in, alpha);
-        mu = mix(m.xy, mu, alpha);
     } else {
         let mat_idx = u32(g.w) & 3u;
         let depth = (g.w - f32(mat_idx)) * 16384.0;
@@ -175,6 +178,14 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
         let obj = objects[min(mat_idx, 1u)];
         let pos_prev = (obj.motion * vec4f(pos, 1.0)).xyz;
         let cam_prev = (input.prev_view * vec4f(pos_prev, 1.0)).xyz;
+        // Material-boundary (silhouette) pixels flip material under the AA
+        // jitter every frame; material/normal-gated history dies immediately
+        // and the pixel never settles (the edge jitter). So they accumulate
+        // without those gates — one consistent estimator — but REPROJECTED,
+        // so during motion the rim's history follows the surface instead of
+        // sticking to the screen as a trailing ghost (the identity tap it
+        // replaced). The 0.15 alpha floor keeps residual rim lag short.
+        let boundary = material_boundary(pixel, dims, mat_idx);
         if (cam_prev.z < 0.0) {
             let aspect = f32(dims.x) / f32(dims.y);
             let uv = vec2f(
@@ -184,7 +195,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
             // 2x2 bilinear reprojection with PER-TAP validation (SVGF
             // §4.1): invalid taps redistribute their weight — voxel-normal
             // noise no longer kills whole pixels' history
-            let base_f = uv * vec2f(dims) - 0.5;
+            let base_f = uv * vec2f(dims) - 0.5 - input.jitter_mean_prev;
             let base = vec2i(floor(base_f));
             let frac = base_f - floor(base_f);
             let n_prev = normalize((obj.motion * vec4f(g.xyz, 0.0)).xyz);
@@ -197,8 +208,13 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                     if (any(pp < vec2i(0)) || any(pp >= vec2i(dims))) {
                         continue;
                     }
+                    // Boundary pixels skip the material/normal gates (their
+                    // converged signal IS the mix of the two hit materials)
+                    // but must still drop MISS taps: a miss pixel's history
+                    // is the white backdrop at linear 6/exposure, and any
+                    // bilinear blend of it brightens the rim every frame.
                     let gp = textureLoad(gbuf_prev, pp, 0);
-                    if (gp.w < 0.0 || (u32(gp.w) & 3u) != mat_idx || dot(gp.xyz, n_prev) <= 0.75) {
+                    if (gp.w < 0.0 || (!boundary && ((u32(gp.w) & 3u) != mat_idx || dot(gp.xyz, n_prev) <= 0.75))) {
                         continue;
                     }
                     let bw = mix(1.0 - frac.x, frac.x, f32(tx)) * mix(1.0 - frac.y, frac.y, f32(ty));
@@ -211,13 +227,22 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                 let h = h_sum / w_sum;
                 let m = m_sum / w_sum;
                 hist_len = min(h.a + 1.0, 64.0);
-                // Converge like an average early, EMA later. Floor lowered
-                // 0.1 -> 0.05 now that the illum is shade-side albedo-
-                // demodulated (cast-free): the residual per-frame variance
-                // is smaller, so longer temporal averaging is cheap and it
-                // replaces the removed accumulation-blend crutch's stability
-                // (~20-frame EMA). Motion/disocclusion still resets history.
-                let alpha = max(0.05, 1.0 / hist_len);
+                // ReBLUR anti-lag feedback (Sec. 49.11): last frame's
+                // stabilization wrote a per-pixel confidence, low where the
+                // slow (temporal-accum) and slower (stabilization) histories
+                // diverged — a shadow moving over STATIC ground, which motion
+                // vectors can't track. Cut the accumulated frame count so
+                // accumulation re-converges from a lower A instead of leaving
+                // the stale (bright) value streaking behind the shadow.
+                // NEVER cut at material boundaries: the silhouette's luma
+                // delta is coverage noise, not signal change, and cutting
+                // there locks edge pixels into a hist_len 1<->3 oscillation
+                // (EMA vs fresh-pixel fallback = per-frame edge flicker).
+                if (!boundary) {
+                    let conf = textureLoad(stab_prev, clamp(base, vec2i(0), vec2i(dims) - 1), 0).a;
+                    hist_len = max(1.0, hist_len * conf);
+                }
+                let alpha = max(select(0.05, 0.15, boundary), 1.0 / hist_len);
                 color = mix(h.rgb, c_in, alpha);
                 mu = mix(m, mu, alpha);
             }
@@ -289,12 +314,30 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // ============================================================================
-// Pass 2 (x5): edge-avoiding a-trous wavelet (SVGF §4.3-4.4)
+// Pass 2 (xN): ReBLUR recurrent world-space blur (Zhdan, "Fast Denoising with
+// Self-Stabilizing Recurrent Blurs"). Replaces SVGF's fixed screen-space
+// a-trous with a Poisson-disk blur whose radius is set in WORLD space and
+// depth-projected to screen. Two adaptive drivers:
+//   - accumulated frame count A (moments.w): wide when A is low (fresh /
+//     disoccluded -> lean on the spatial fallback), shrinking as ~1/sqrt(A)
+//     so a settled pixel trusts its temporal history (the self-stabilizing,
+//     recurrent part — the effective footprint emerges over frames).
+//   - hit distance (first-bounce distance): tight at contacts/AO (high-freq
+//     shadow detail), wide in the open (low-freq GI).
+// The dispatch runs it N times with growing sample spacing (params.step) so a
+// few passes cover a large footprint, à-trous style. Geometry (plane distance,
+// normal) + variance-guided luminance edge-stopping, same as SVGF.
 // ============================================================================
-const KERNEL = array<f32, 3>(3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
 const SIGMA_Z = 1.0;
 const SIGMA_N = 128.0;
 const SIGMA_L = 4.0;
+const TAU = 6.28318530718;
+// 8-point Poisson disk (unit radius)
+const POISSON = array<vec2f, 8>(
+    vec2f(-0.326, -0.406), vec2f(-0.840, -0.074), vec2f(-0.696, 0.457),
+    vec2f(-0.203, 0.621), vec2f(0.962, -0.195), vec2f(0.473, -0.480),
+    vec2f(0.519, 0.767), vec2f(0.185, -0.893),
+);
 
 @compute @workgroup_size(8, 8)
 fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
@@ -308,7 +351,6 @@ fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
         // Miss pixels (backdrop) pass through unfiltered
         textureStore(atrous_dst, gid.xy, center);
         if (params.write_history == 1u) {
-            // moments slot holds THIS frame's moments; w = history length
             textureStore(hist_out, gid.xy, vec4f(center.rgb, textureLoad(moments_prev, pixel, 0).w));
         }
         return;
@@ -335,43 +377,52 @@ fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
     }
     let sigma_l_den = SIGMA_L * sqrt(max(var_pre, 1e-10));
 
-    let step = i32(1u << params.step);
-    var sum_c = vec3f(0.0);
-    var sum_v = 0.0;
-    var sum_w = 0.0;
-    for (var dy = -2; dy <= 2; dy++) {
-        for (var dx = -2; dx <= 2; dx++) {
-            let q = pixel + vec2i(dx, dy) * step;
-            if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
-                continue;
-            }
-            let gq = textureLoad(gbuf, q, 0);
-            if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
-                continue;
-            }
-            let sq = textureLoad(atrous_src, q, 0);
-            var kern = KERNEL;
-            let h = kern[abs(dx)] * kern[abs(dy)];
-            // Edge-stopping: plane distance (depth), normal cosine power,
-            // variance-normalized luminance
-            let depth_q = (gq.w - f32(u32(gq.w) & 3u)) * 16384.0;
-            let pos_q = world_pos(vec2u(q), dims, depth_q);
-            let plane_d = abs(dot(n_c, pos_q - pos_c));
-            let wz = exp(-plane_d / (SIGMA_Z * (0.01 * depth_c) + 1e-4));
-            let wn = pow(max(dot(n_c, gq.xyz), 0.0), SIGMA_N);
-            let wl = exp(-abs(dn_luminance(sq.rgb) - l_c) / (sigma_l_den + 1e-8));
-            let w = h * wz * wn * wl;
-            sum_c += w * sq.rgb;
-            sum_v += w * w * sq.a;
-            sum_w += w;
+    // ReBLUR blur radius. World radius from hit distance, shrunk by 1/sqrt(A);
+    // depth-project to screen pixels. params.step grows the footprint over the
+    // dispatched passes (1x, 2x, 4x, ...) so a few passes cover a wide area.
+    let a_frames = textureLoad(moments_prev, pixel, 0).w;
+    let hitdist = textureLoad(hitdist_tex, pixel, 0).r;
+    let noise_scale = clamp(inverseSqrt(max(a_frames, 1.0)), 0.15, 1.0);
+    let r_world = clamp(hitdist * 0.25, 6.0, 220.0);
+    let proj = f32(dims.y) * 0.5 / input.fov_scale;
+    let r_full = r_world * proj / max(depth_c, 1.0) * noise_scale;
+    let r_screen = clamp(r_full * f32(1u << params.step) / 8.0, 1.0, 28.0);
+
+    // Per-pixel rotation of the disk (decorrelates the sample pattern spatially
+    // without adding temporal noise — no frame term, so it can't flicker)
+    let hash = (u32(pixel.x) * 1973u + u32(pixel.y) * 9277u) & 1023u;
+    let ang = f32(hash) / 1024.0 * TAU;
+    let ca = cos(ang);
+    let sa = sin(ang);
+
+    var sum_c = center.rgb;
+    var sum_v = center.a;
+    var sum_w = 1.0;
+    for (var i = 0u; i < 8u; i++) {
+        let po = POISSON[i];
+        let ro = vec2f(po.x * ca - po.y * sa, po.x * sa + po.y * ca) * r_screen;
+        let q = pixel + vec2i(round(ro));
+        if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
+            continue;
         }
+        let gq = textureLoad(gbuf, q, 0);
+        if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
+            continue;
+        }
+        let sq = textureLoad(atrous_src, q, 0);
+        let depth_q = (gq.w - f32(u32(gq.w) & 3u)) * 16384.0;
+        let pos_q = world_pos(vec2u(q), dims, depth_q);
+        let plane_d = abs(dot(n_c, pos_q - pos_c));
+        let wz = exp(-plane_d / (SIGMA_Z * (0.01 * depth_c) + 1e-4));
+        let wn = pow(max(dot(n_c, gq.xyz), 0.0), SIGMA_N);
+        let wl = exp(-abs(dn_luminance(sq.rgb) - l_c) / (sigma_l_den + 1e-8));
+        let w = wz * wn * wl;
+        sum_c += w * sq.rgb;
+        sum_v += w * w * sq.a;
+        sum_w += w;
     }
-    var out_c = center.rgb;
-    var out_v = center.a;
-    if (sum_w > 1e-8) {
-        out_c = sum_c / sum_w;
-        out_v = sum_v / (sum_w * sum_w);
-    }
+    let out_c = sum_c / sum_w;
+    let out_v = sum_v / (sum_w * sum_w);
     textureStore(atrous_dst, gid.xy, vec4f(out_c, out_v));
     // First iteration's output becomes next frame's color history (SVGF)
     if (params.write_history == 1u) {
@@ -433,22 +484,39 @@ fn stabilizeMain(@builtin(global_invocation_id) gid: vec3u) {
     let cur = textureLoad(denoised_in, vec2i(pixel), 0).rgb;
     let g = textureLoad(gbuf, vec2i(pixel), 0);
 
-    // 3x3 neighborhood colour box (mean +/- k*stddev) in YCoCg
+    // 3x3 neighborhood colour box (mean +/- k*stddev) in YCoCg, gated to
+    // taps on the SAME side of a silhouette/material edge as the center.
+    // The white backdrop is far brighter (linear 6/exposure) than object
+    // radiance, so an ungated box at a silhouette was blown wide open —
+    // the clamp stopped bounding history and cross-edge history leaked in
+    // at 0.9/frame as a bright, lagging rim (the edge highlighting).
     var m1 = vec3f(0.0);
     var m2 = vec3f(0.0);
+    var box_n = 0.0;
     for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
             let q = clamp(vec2i(pixel) + vec2i(dx, dy), vec2i(0), vec2i(dims) - 1);
+            let gq = textureLoad(gbuf, q, 0);
+            if ((gq.w < 0.0) != (g.w < 0.0)) {
+                continue;
+            }
+            if (g.w >= 0.0 && (u32(gq.w) & 3u) != (u32(g.w) & 3u)) {
+                continue;
+            }
             let c = rgb2ycocg(textureLoad(denoised_in, q, 0).rgb);
             m1 += c;
             m2 += c * c;
+            box_n += 1.0;
         }
     }
-    let mean = m1 / 9.0;
-    let sd = sqrt(max(m2 / 9.0 - mean * mean, vec3f(0.0))) + 1e-4;
+    // The center tap always passes its own gates, so box_n >= 1
+    let mean = m1 / box_n;
+    let sd = sqrt(max(m2 / box_n - mean * mean, vec3f(0.0))) + 1e-4;
 
     var outc = cur;
+    var confidence = 1.0; // miss/backdrop: no anti-lag reduction
     if (g.w >= 0.0) {
+        confidence = 0.0; // object: treated as disoccluded until reprojected
         let mat_idx = u32(g.w) & 3u;
         let depth = (g.w - f32(mat_idx)) * 16384.0;
         let pos = world_pos(pixel, dims, depth);
@@ -462,8 +530,26 @@ fn stabilizeMain(@builtin(global_invocation_id) gid: vec3u) {
                 (cam_prev.y / (-cam_prev.z)) / input.fov_scale,
             ) * 0.5 + 0.5;
             if (all(uv >= vec2f(0.0)) && all(uv < vec2f(1.0))) {
-                let pp = vec2i(uv * vec2f(dims));
-                let hist = textureLoad(stab_prev, pp, 0).rgb;
+                // Bilinear history fetch (the TAA standard): the previous
+                // nearest-texel snap made history walk in whole-pixel steps
+                // under slow motion — visible stepping shimmer at edges
+                let base_f = uv * vec2f(dims) - 0.5 - input.jitter_mean_prev;
+                let base = vec2i(floor(base_f));
+                let frac = base_f - floor(base_f);
+                var h_sum = vec3f(0.0);
+                var hw_sum = 0.0;
+                for (var ty = 0; ty < 2; ty++) {
+                    for (var tx = 0; tx < 2; tx++) {
+                        let pp = base + vec2i(tx, ty);
+                        if (any(pp < vec2i(0)) || any(pp >= vec2i(dims))) {
+                            continue;
+                        }
+                        let bw = mix(1.0 - frac.x, frac.x, f32(tx)) * mix(1.0 - frac.y, frac.y, f32(ty));
+                        h_sum += bw * textureLoad(stab_prev, pp, 0).rgb;
+                        hw_sum += bw;
+                    }
+                }
+                let hist = h_sum / max(hw_sum, 1e-4);
                 // Anti-lag: measure how far the reprojected history sits
                 // outside the local neighborhood box (in std units). Small ->
                 // trust it, blend slowly for stability; large -> disocclusion
@@ -483,10 +569,27 @@ fn stabilizeMain(@builtin(global_invocation_id) gid: vec3u) {
                 let luma_dev = abs(hist_yc.x - mean.x) / sd.x;
                 let alpha = select(0.1, 1.0, luma_dev > 4.0);
                 outc = mix(clamped, cur, alpha);
+                // ReBLUR anti-lag (Sec. 49.11): relative INTENSITY delta
+                // between the SLOW (current denoised = temporal-accumulation
+                // result) and SLOWER (reprojected stabilization history)
+                // signals. A high delta means the signal changed faster than
+                // the slow history tracks (a shadow sliding over static
+                // ground) -> low confidence, which next frame's temporal
+                // accumulation reads back to cut its accumulated frame count
+                // and re-converge quickly instead of streaking.
+                // Compare against the CLAMPED history: both signals are then
+                // noise-bounded (ReBLUR compares two averaged histories). A
+                // real signal change moves the neighborhood box itself, so
+                // the clamped history still diverges from cur and the cut
+                // fires; a reprojection outlier no longer poisons confidence.
+                let lum_cur = dn_luminance(cur);
+                let lum_hist = dn_luminance(clamped);
+                let idelta = abs(lum_cur - lum_hist) / (max(lum_cur, lum_hist) + 0.05);
+                confidence = smoothstep(0.15, 0.03, idelta);
             }
         }
     }
-    textureStore(stab_out, pixel, vec4f(outc, 1.0));
+    textureStore(stab_out, pixel, vec4f(outc, confidence));
     var disp = dn_tonemap(outc);
     disp = pow(disp, vec3f(1.0 / 2.2));
     textureStore(resolve_out, pixel, vec4f(disp, 1.0));
