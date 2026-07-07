@@ -108,5 +108,5 @@ fn fragmentMain(@location(0) uv: vec2f) -> @location(0) vec4f {
         let mv = (uv - uv_prev) * 8.0; // amplify for visibility
         return vec4f(clamp(mv.x * 0.5 + 0.5, 0.0, 1.0), clamp(mv.y * 0.5 + 0.5, 0.0, 1.0), 0.5, 1.0);
     }
-    return textureSample(raytracedTexture, textureSampler, uv);
+    return textureLoad(raytracedTexture, px, 0);
 }

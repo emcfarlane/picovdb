@@ -70,37 +70,27 @@ let renderWidth = width;
 let renderHeight = height;
 let raytracedTexture: GPUTexture;
 let accumulationBuffer: GPUBuffer;
+let gbufferAccumBuffer: GPUBuffer;
 // Primary-hit G-buffer ping-pong (denoiser temporal input)
 let gbufferTextures: GPUTexture[] = [];
 // SVGF denoiser textures: raw radiance + history/moments/a-trous ping-pongs
 let illumTexture: GPUTexture;
+let specTexture: GPUTexture;
+let denoisedTexture: GPUTexture;
+let stabTextures: GPUTexture[] = [];
 let histTextures: GPUTexture[] = [];
 let momentsTextures: GPUTexture[] = [];
 let atrousTextures: GPUTexture[] = [];
 let denoiseTemporalGroups: GPUBindGroup[] = [];
 let denoiseAtrousGroups: GPUBindGroup[][] = [];
-let denoiseWalrGroups: GPUBindGroup[][] = [];
 let denoiseResolveGroups: GPUBindGroup[] = [];
+let denoiseStabilizeGroups: GPUBindGroup[] = [];
 let displayBindGroups: GPUBindGroup[] = [];
 let perFrameBindGroup: GPUBindGroup;
 let dataBindGroup: GPUBindGroup;
 // Two pass bind groups with the G-buffer ping-pong swapped
 let passBindGroups: GPUBindGroup[] = [];
-// Reuse-pass variants (current G-buffer + exact depth as sampled inputs)
-let reuseBindGroups: GPUBindGroup[] = [];
 let gdepthTexture: GPUTexture;
-// Low-res GI reservoir grid: reservoir passes run at giWidth x giHeight
-// (<= render res); primary/G-buffer/shade/denoise stay at full render res
-// and shade reconnection-shifts the low-res reservoir onto each full-res
-// primary (sharp silhouettes + full-res visibility from low-res GI).
-let giWidth = 1, giHeight = 1;
-let giGbufferTextures: GPUTexture[] = [];
-let giGdepthTexture: GPUTexture;
-let initialBindGroups: GPUBindGroup[] = [];
-let shadeBindGroups: GPUBindGroup[] = [];
-// P4 duplication map ping-pong (GI res) + its bind groups
-let dupTextures: GPUTexture[] = [];
-let dupBindGroups: GPUBindGroup[] = [];
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
@@ -148,6 +138,11 @@ if (adapter.limits.maxStorageBuffersPerShaderStage > 8) {
 // 256 MB buffer) — request what the adapter actually offers.
 requiredLimits.maxStorageBufferBindingSize = adapter.limits.maxStorageBufferBindingSize;
 requiredLimits.maxBufferSize = adapter.limits.maxBufferSize;
+// computeMain writes 5 storage textures (output, spec, gbuffer, illum, depth)
+if (adapter.limits.maxStorageTexturesPerShaderStage > 4) {
+  requiredLimits.maxStorageTexturesPerShaderStage =
+    Math.min(8, adapter.limits.maxStorageTexturesPerShaderStage);
+}
 
 const device = await adapter.requestDevice({ requiredFeatures, requiredLimits });
 device.addEventListener('uncapturederror', event => {
@@ -223,7 +218,6 @@ let dataBuffer: GPUBuffer;
 let currentModelConfig: ModelConfig = models[0];
 // ReSTIR PT path reservoirs: one buffer, two ping-pong halves (64 B/pixel
 // each), the written half selected by rng_frame parity
-let reservoirBuffer: GPUBuffer;
 
 // Create size-dependent GPU resources
 function createGPUResources() {
@@ -242,10 +236,6 @@ function createGPUResources() {
   }
   renderWidth = Math.max(1, Math.floor(width * scale));
   renderHeight = Math.max(1, Math.floor(height * scale));
-  // Low-res GI grid resolution (reservoir passes run here)
-  const giScale = Number(controls.giScale) || 1.0;
-  giWidth = Math.max(1, Math.round(renderWidth * giScale));
-  giHeight = Math.max(1, Math.round(renderHeight * giScale));
 
   raytracedTexture = device.createTexture({
     size: [renderWidth, renderHeight],
@@ -262,21 +252,15 @@ function createGPUResources() {
     // COPY_SRC: __readAccum debug readback
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
+  // G-buffer accumulation (stride 2 vec4/pixel): stable anti-aliased normal/depth
+  gbufferAccumBuffer?.destroy();
+  gbufferAccumBuffer = device.createBuffer({
+    label: 'G-buffer + illum accumulation',
+    size: renderWidth * renderHeight * 4 * 16,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
   resetAccumulation("gpu-resources");
 
-  displayBindGroups = [0, 1].map(P => device.createBindGroup({
-    label: `Display bind group ${P}`,
-    layout: displayPipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: raytracedTexture.createView() },
-      { binding: 1, resource: displaySampler },
-      { binding: 2, resource: gbufferTextures[1 - P].createView() },
-      { binding: 3, resource: gdepthTexture.createView() },
-      { binding: 4, resource: illumTexture.createView() },
-      { binding: 5, resource: { buffer: inputBuffer } },
-      { binding: 6, resource: { buffer: objectsBuffer } },
-    ]
-  }));
 
   // Bind group 0: per-frame
   perFrameBindGroup = device.createBindGroup({
@@ -322,42 +306,6 @@ function createGPUResources() {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   }));
 
-  // ReSTIR PT reservoirs at GI resolution (one buffer, 3 regions: final
-  // ping-pong x2 + post-temporal scratch). GI-sized -> the reservoir memory
-  // and all reuse-pass work scale with giScale^2.
-  reservoirBuffer?.destroy();
-  reservoirBuffer = device.createBuffer({
-    label: 'Path reservoirs',
-    size: giWidth * giHeight * 80 * 3,
-    // COPY_SRC: __readReservoir debug readback
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
-  });
-  // Low-res GI G-buffer (ping-pong) + exact depth, written by initialMain,
-  // read by temporal/spatial reuse and by shade (the shift source)
-  giGbufferTextures.forEach(t => t?.destroy());
-  giGbufferTextures = [0, 1].map(i => device.createTexture({
-    label: `GI G-buffer ${i}`,
-    size: [giWidth, giHeight],
-    format: 'rgba32float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
-  }));
-  giGdepthTexture?.destroy();
-  giGdepthTexture = device.createTexture({
-    label: 'GI primary depth',
-    size: [giWidth, giHeight],
-    format: 'r32float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
-  });
-  // P4 duplication map (GI res, r32float ping-pong): dupMain writes cur,
-  // temporal reads prev
-  dupTextures.forEach(t => t?.destroy());
-  dupTextures = [0, 1].map(i => device.createTexture({
-    label: `Duplication map ${i}`,
-    size: [giWidth, giHeight],
-    format: 'r32float',
-    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
-  }));
-
   const denoiseTex = (label: string) => device.createTexture({
     label,
     size: [renderWidth, renderHeight],
@@ -365,9 +313,12 @@ function createGPUResources() {
     // COPY_SRC: __readHist debug readback
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
   });
-  [illumTexture, ...histTextures, ...momentsTextures, ...atrousTextures]
+  [illumTexture, specTexture, denoisedTexture, ...stabTextures, ...histTextures, ...momentsTextures, ...atrousTextures]
     .forEach(t => t?.destroy());
   illumTexture = denoiseTex('Denoise illum');
+  specTexture = denoiseTex('Denoise specular');
+  denoisedTexture = denoiseTex('Denoise resolved (linear)');
+  stabTextures = [denoiseTex('Stab hist 0'), denoiseTex('Stab hist 1')];
   histTextures = [denoiseTex('Denoise hist 0'), denoiseTex('Denoise hist 1')];
   momentsTextures = [denoiseTex('Denoise moments 0'), denoiseTex('Denoise moments 1')];
   atrousTextures = [denoiseTex('Denoise atrous 0'), denoiseTex('Denoise atrous 1')];
@@ -382,72 +333,37 @@ function createGPUResources() {
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   });
 
+  displayBindGroups = [0, 1].map(P => device.createBindGroup({
+    label: `Display bind group ${P}`,
+    layout: displayPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: raytracedTexture.createView() },
+      { binding: 1, resource: displaySampler },
+      { binding: 2, resource: gbufferTextures[1 - P].createView() },
+      { binding: 3, resource: gdepthTexture.createView() },
+      { binding: 4, resource: illumTexture.createView() },
+      { binding: 5, resource: { buffer: inputBuffer } },
+      { binding: 6, resource: { buffer: objectsBuffer } },
+    ]
+  }));
+
+
   // Bind group 2 variants (parity = ping-pong; gbuffer_out = [1 - parity]).
   // passBindGroups: full-res — Reference megakernel + primaryMain (writes
   // full-res G-buffer 3 + depth 8; other bindings present but unused).
+  // Bind group 2 for computeMain (PT): writes G-buffer 3 + depth 8 + illum 5
+  // + output 0 + accumulation 1 (parity: gbuffer_out = [1 - parity])
   passBindGroups = [0, 1].map(parity => device.createBindGroup({
     label: `Pass bind group ${parity}`,
     layout: passBindGroupLayout,
     entries: [
       { binding: 0, resource: raytracedTexture.createView() },
       { binding: 1, resource: { buffer: accumulationBuffer } },
-      { binding: 2, resource: gbufferTextures[parity].createView() },
+      { binding: 2, resource: specTexture.createView() },
+      { binding: 4, resource: { buffer: gbufferAccumBuffer } },
       { binding: 3, resource: gbufferTextures[1 - parity].createView() },
-      { binding: 4, resource: { buffer: reservoirBuffer } },
       { binding: 5, resource: illumTexture.createView() },
       { binding: 8, resource: gdepthTexture.createView() },
-    ]
-  }));
-  // initialMain: writes the GI-res G-buffer (3) + depth (8) + reservoirs (4)
-  initialBindGroups = [0, 1].map(parity => device.createBindGroup({
-    label: `Initial bind group ${parity}`,
-    layout: passBindGroupLayout,
-    entries: [
-      { binding: 0, resource: raytracedTexture.createView() },
-      { binding: 1, resource: { buffer: accumulationBuffer } },
-      { binding: 2, resource: giGbufferTextures[parity].createView() },
-      { binding: 3, resource: giGbufferTextures[1 - parity].createView() },
-      { binding: 4, resource: { buffer: reservoirBuffer } },
-      { binding: 5, resource: illumTexture.createView() },
-      { binding: 8, resource: giGdepthTexture.createView() },
-    ]
-  }));
-  // temporal/spatial reuse: GI-res G-buffer (cur = [1-parity]) + depth
-  reuseBindGroups = [0, 1].map(parity => device.createBindGroup({
-    label: `Reuse bind group ${parity}`,
-    layout: reusePassBindGroupLayout,
-    entries: [
-      { binding: 2, resource: giGbufferTextures[parity].createView() },
-      { binding: 4, resource: { buffer: reservoirBuffer } },
-      { binding: 6, resource: giGbufferTextures[1 - parity].createView() },
-      { binding: 7, resource: giGdepthTexture.createView() },
-      // temporal reads the PREVIOUS frame's duplication map
-      { binding: 12, resource: dupTextures[1 - parity].createView() },
-    ]
-  }));
-  // dupMain: reads final reservoirs, writes THIS frame's duplication map
-  dupBindGroups = [0, 1].map(parity => device.createBindGroup({
-    label: `Dup bind group ${parity}`,
-    layout: dupBindGroupLayout,
-    entries: [
-      { binding: 4, resource: { buffer: reservoirBuffer } },
-      { binding: 11, resource: dupTextures[parity].createView() },
-    ]
-  }));
-  // shade: full-res dst G-buffer/depth (6/7) + GI-res src G-buffer/depth
-  // (9/10) + reservoirs (4), writing full-res output/illum/accumulation
-  shadeBindGroups = [0, 1].map(parity => device.createBindGroup({
-    label: `Shade bind group ${parity}`,
-    layout: shadeBindGroupLayout,
-    entries: [
-      { binding: 0, resource: raytracedTexture.createView() },
-      { binding: 1, resource: { buffer: accumulationBuffer } },
-      { binding: 4, resource: { buffer: reservoirBuffer } },
-      { binding: 5, resource: illumTexture.createView() },
-      { binding: 6, resource: gbufferTextures[1 - parity].createView() },
-      { binding: 7, resource: gdepthTexture.createView() },
-      { binding: 9, resource: giGbufferTextures[1 - parity].createView() },
-      { binding: 10, resource: giGdepthTexture.createView() },
     ]
   }));
 }
@@ -1011,42 +927,17 @@ function resetAccumulation(cause = 'unknown') {
   buf.unmap(); buf.destroy();
   return JSON.stringify({ mean: [f[0]/f[3], f[1]/f[3], f[2]/f[3]], count: f[3] });
 };
-// Headless-test hook: read one pixel's reservoir struct (80 B) from a
-// region (0/1 = final ping-pong, 2 = post-temporal scratch) for bias audits
-(window as any).__readDup = async () => {
-  const w = giWidth, h = giHeight;
-  const bpr = Math.ceil((w * 4) / 256) * 256;
-  const buf = device.createBuffer({ size: bpr * h, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+// Debug: read the accumulation buffer's isum (illum sum + count) at center
+(window as any).__accSamp = async () => {
+  const idx = (Math.floor(renderHeight / 2) * renderWidth + Math.floor(renderWidth / 2)) * 4;
+  const buf = device.createBuffer({ size: 48, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const enc = device.createCommandEncoder();
-  enc.copyTextureToBuffer({ texture: dupTextures[(rngFrame - 1) & 1] }, { buffer: buf, bytesPerRow: bpr }, [w, h]);
-  device.queue.submit([enc.finish()]);
-  await buf.mapAsync(GPUMapMode.READ);
-  const dv = new DataView(buf.getMappedRange());
-  let mx = 0, sum = 0, nz = 0, n = 0;
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const d = dv.getFloat32(y * bpr + x * 4, true);
-    mx = Math.max(mx, d); sum += d; if (d > 0.01) nz++; n++;
-  }
-  buf.unmap(); buf.destroy();
-  return JSON.stringify({ maxD: +mx.toFixed(3), meanD: +(sum / n).toFixed(4), fracNonzero: +(nz / n).toFixed(3) });
-};
-(window as any).__giDims = () => JSON.stringify({ giWidth, giHeight, renderWidth, renderHeight });
-(window as any).__readReservoir = async (x: number, y: number, region: number) => {
-  const idx = (region * giWidth * giHeight + y * giWidth + x) * 80;
-  const buf = device.createBuffer({ size: 80, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-  const enc = device.createCommandEncoder();
-  enc.copyBufferToBuffer(reservoirBuffer, idx, buf, 0, 80);
+  enc.copyBufferToBuffer(gbufferAccumBuffer, idx * 16, buf, 0, 48);
   device.queue.submit([enc.finish()]);
   await buf.mapAsync(GPUMapMode.READ);
   const f = new Float32Array(buf.getMappedRange().slice(0));
-  const u = new Uint32Array(f.buffer);
   buf.unmap(); buf.destroy();
-  return JSON.stringify({
-    f: [f[0], f[1], f[2], f[3]], rc_rad: [f[4], f[5], f[6], f[7]],
-    rc_pos: [f[8], f[9], f[10]], w: f[11], m: f[12],
-    path_flags: u[16], d: u[16] & 15, env: !!(u[16] & 16), nee: !!(u[16] & 32),
-    wavelength_u: f[17], rc_wi: [f[14], f[18], f[19]], rngFrame,
-  });
+  return JSON.stringify({ nsum_hitCount: f[3], dsum_depthSum: f[4], isum_rgb: [f[8], f[9], f[10]], isum_count: f[11], frame: (window as any).__dbg().accumFrameIndex });
 };
 // Headless-test hook: GPU readback of the presented (tonemapped) texture at
 // render resolution — measurement without daemon screenshots or UI overlay
@@ -1192,88 +1083,23 @@ const dataBindGroupLayout = device.createBindGroupLayout({
   ]
 });
 
-// --- Bind group 2: pass ---
+// --- Bind group 2: pass (computeMain PT) ---
 const passBindGroupLayout = device.createBindGroupLayout({
   label: 'Pass Bind Group Layout',
   entries: [
-    {
-      binding: 0, visibility: GPUShaderStage.COMPUTE,
-      storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' },
-    },
-    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    {
-      binding: 3, visibility: GPUShaderStage.COMPUTE,
-      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
-    },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    {
-      binding: 5, visibility: GPUShaderStage.COMPUTE,
-      storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' },
-    },
-    {
-      binding: 8, visibility: GPUShaderStage.COMPUTE,
-      storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' },
-    },
-  ]
-});
-
-// Reuse-pass variant of group 2 (temporal/spatial): the current G-buffer +
-// exact primary depth become sampled inputs (they only READ the G-buffer,
-// so no storage-usage conflict), replacing the deterministic primary
-// re-traces with reconstruction
-const reusePassBindGroupLayout = device.createBindGroupLayout({
-  label: 'Reuse Pass Bind Group Layout',
-  entries: [
-    { binding: 2, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 12, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-  ]
-});
-
-// P4 duplication map pass: reads reservoirs (4), writes the dup map (11)
-const dupBindGroupLayout = device.createBindGroupLayout({
-  label: 'Dup Bind Group Layout',
-  entries: [
-    { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-    { binding: 11, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' } },
-  ]
-});
-
-// Shade layout: full-res dst G-buffer/depth (6/7) + low-res GI src
-// G-buffer/depth (9/10) + reservoirs (4) + output/accum/illum, all bound
-// together so the full-res shade can reconnection-shift the GI reservoir
-const shadeBindGroupLayout = device.createBindGroupLayout({
-  label: 'Shade Bind Group Layout',
-  entries: [
     { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension: '2d' } },
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
-    { binding: 6, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 7, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 9, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
-    { binding: 10, visibility: GPUShaderStage.COMPUTE, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+    { binding: 8, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' } },
   ]
 });
 
 const computePipelineLayout = device.createPipelineLayout({
   label: 'Compute Pipeline Layout',
   bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, passBindGroupLayout],
-});
-const reusePipelineLayout = device.createPipelineLayout({
-  label: 'Reuse Pipeline Layout',
-  bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, reusePassBindGroupLayout],
-});
-const shadePipelineLayout = device.createPipelineLayout({
-  label: 'Shade Pipeline Layout',
-  bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, shadeBindGroupLayout],
-});
-const dupPipelineLayout = device.createPipelineLayout({
-  label: 'Dup Pipeline Layout',
-  bindGroupLayouts: [perFrameBindGroupLayout, dataBindGroupLayout, dupBindGroupLayout],
 });
 
 const computePipeline = await device.createComputePipelineAsync({
@@ -1286,38 +1112,6 @@ const computePipeline = await device.createComputePipelineAsync({
   throw error;
 });
 
-// ReSTIR PT passes (docs/restir-pt-plan.md): primary -> initial -> reuse -> shade
-const primaryPipeline = await device.createComputePipelineAsync({
-  label: 'ReSTIR Primary Visibility',
-  layout: computePipelineLayout,
-  compute: { module: computeShaderModule, entryPoint: 'primaryMain' },
-});
-const initialPipeline = await device.createComputePipelineAsync({
-  label: 'ReSTIR Initial Sampling',
-  layout: computePipelineLayout,
-  compute: { module: computeShaderModule, entryPoint: 'initialMain' },
-});
-const spatialPipeline = await device.createComputePipelineAsync({
-  label: 'ReSTIR Spatial Reuse',
-  layout: reusePipelineLayout,
-  compute: { module: computeShaderModule, entryPoint: 'spatialMain' },
-});
-const temporalPipeline = await device.createComputePipelineAsync({
-  label: 'ReSTIR Temporal Reuse',
-  layout: reusePipelineLayout,
-  compute: { module: computeShaderModule, entryPoint: 'temporalMain' },
-});
-const shadePipeline = await device.createComputePipelineAsync({
-  label: 'ReSTIR Shade',
-  layout: shadePipelineLayout,
-  compute: { module: computeShaderModule, entryPoint: 'shadeMain' },
-});
-const dupPipeline = await device.createComputePipelineAsync({
-  label: 'ReSTIR Duplication Map',
-  layout: dupPipelineLayout,
-  compute: { module: computeShaderModule, entryPoint: 'dupMain' },
-});
-
 // --- SVGF denoiser (demo/denoise.wgsl, auto layouts per entry point) ---
 const denoiseModule = device.createShaderModule({ label: 'Denoise', code: DenoiseShader });
 const denoiseTemporalPipeline = await device.createComputePipelineAsync({
@@ -1328,15 +1122,13 @@ const denoiseAtrousPipeline = await device.createComputePipelineAsync({
   label: 'Denoise A-Trous', layout: 'auto',
   compute: { module: denoiseModule, entryPoint: 'atrousMain' },
 });
-// WALR (weighted a-trous linear regression) spatial filter — same bindings
-// as atrousMain, its own 'auto' layout (WebGPU auto layouts are not shared)
-const denoiseWalrPipeline = await device.createComputePipelineAsync({
-  label: 'Denoise WALR', layout: 'auto',
-  compute: { module: denoiseModule, entryPoint: 'walrMain' },
-});
 const denoiseResolvePipeline = await device.createComputePipelineAsync({
   label: 'Denoise Resolve', layout: 'auto',
   compute: { module: denoiseModule, entryPoint: 'resolveMain' },
+});
+const denoiseStabilizePipeline = await device.createComputePipelineAsync({
+  label: 'Denoise Stabilize (anti-lag)', layout: 'auto',
+  compute: { module: denoiseModule, entryPoint: 'stabilizeMain' },
 });
 // One params buffer per a-trous iteration: (step, write_history)
 const ATROUS_ITERATIONS = 5;
@@ -1386,29 +1178,30 @@ function createDenoiseBindGroups() {
         { binding: 11, resource: atrousTextures[(i + 1) % 2].createView() },
       ]
     })));
-  denoiseWalrGroups = [0, 1].map(P =>
-    Array.from({ length: ATROUS_ITERATIONS }, (_, i) => device.createBindGroup({
-      label: `Denoise walr ${P}.${i}`,
-      layout: denoiseWalrPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: inputBuffer } },
-        { binding: 2, resource: { buffer: atrousParamBuffers[i] } },
-        { binding: 4, resource: gbufferTextures[1 - P].createView() },
-        { binding: 7, resource: momentsTextures[1 - P].createView() },
-        { binding: 8, resource: histTextures[1 - P].createView() },
-        { binding: 10, resource: atrousTextures[i % 2].createView() },
-        { binding: 11, resource: atrousTextures[(i + 1) % 2].createView() },
-      ]
-    })));
   denoiseResolveGroups = [0, 1].map(P => device.createBindGroup({
     label: `Denoise resolve ${P}`,
     layout: denoiseResolvePipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: { buffer: inputBuffer } },
       { binding: 4, resource: gbufferTextures[1 - P].createView() },
       { binding: 10, resource: atrousTextures[ATROUS_ITERATIONS % 2].createView() },
-      { binding: 12, resource: raytracedTexture.createView() },
+      { binding: 13, resource: specTexture.createView() },
       { binding: 14, resource: { buffer: materialAlbedoBuffer } },
+      { binding: 15, resource: denoisedTexture.createView() },
+    ]
+  }));
+  // Anti-lag stabilization: reproject the stab history (ping-pong P),
+  // neighborhood-clamp, blend, tonemap to the display.
+  denoiseStabilizeGroups = [0, 1].map(P => device.createBindGroup({
+    label: `Denoise stabilize ${P}`,
+    layout: denoiseStabilizePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: inputBuffer } },
+      { binding: 1, resource: { buffer: objectsBuffer } },
+      { binding: 4, resource: gbufferTextures[1 - P].createView() },
+      { binding: 12, resource: raytracedTexture.createView() },
+      { binding: 16, resource: denoisedTexture.createView() },
+      { binding: 17, resource: stabTextures[P].createView() },
+      { binding: 18, resource: stabTextures[1 - P].createView() },
     ]
   }));
 }
@@ -1499,59 +1292,28 @@ function requestFrame() {
     computePass.setBindGroup(1, dataBindGroup);
     // rngFrame was already advanced for this frame in updateInput
     const p = (rngFrame - 1) & 1;
-    const giWgX = Math.ceil(giWidth / 8);
-    const giWgY = Math.ceil(giHeight / 8);
     computePass.setBindGroup(2, passBindGroups[p]);
-    if (controls.lightingMode === 'ReSTIR') {
-      // Full-res primary visibility -> full-res G-buffer + depth
-      computePass.setPipeline(primaryPipeline);
-      computePass.dispatchWorkgroups(wgX, wgY, 1);
-      // GI-res reservoir passes (initial + reuse) run on the low-res grid
-      computePass.setBindGroup(2, initialBindGroups[p]);
-      computePass.setPipeline(initialPipeline);
-      computePass.dispatchWorkgroups(giWgX, giWgY, 1);
-      computePass.setBindGroup(2, reuseBindGroups[p]);
-      // Debug bisection toggles (headless __set('temporalReuse'|'spatialReuse', false))
-      if ((controls as any).temporalReuse !== false) {
-        computePass.setPipeline(temporalPipeline);
-        computePass.dispatchWorkgroups(giWgX, giWgY, 1);
-      }
-      if ((controls as any).spatialReuse !== false) {
-        computePass.setPipeline(spatialPipeline);
-        computePass.dispatchWorkgroups(giWgX, giWgY, 1);
-      }
-      // P4 duplication map from the final reservoirs (read next frame by
-      // temporal reuse to decorrelate over-duplicated samples)
-      if ((controls as any).dupMap !== false) {
-        computePass.setBindGroup(2, dupBindGroups[p]);
-        computePass.setPipeline(dupPipeline);
-        computePass.dispatchWorkgroups(giWgX, giWgY, 1);
-      }
-      // Full-res shade: reconnection-shift the GI reservoir onto each primary
-      computePass.setBindGroup(2, shadeBindGroups[p]);
-      computePass.setPipeline(shadePipeline);
-      computePass.dispatchWorkgroups(wgX, wgY, 1);
-    } else {
-      // Reference megakernel writes G-buffer + depth + raw illum + accum,
-      // so the denoiser can run on plain 1spp PT (no reservoirs)
-      computePass.setPipeline(computePipeline);
-      computePass.dispatchWorkgroups(wgX, wgY, 1);
-    }
-    // SVGF denoiser (both modes): consumes illum + full-res G-buffer
-    if (controls.denoise) {
+    // Plain path tracer: writes G-buffer + depth + raw (demodulated) illum
+    // + accumulation; the denoiser + Pass visualizer consume those.
+    computePass.setPipeline(computePipeline);
+    computePass.dispatchWorkgroups(wgX, wgY, 1);
+    // Denoiser runs for the Final/Denoised passes; other passes visualize
+    // upstream buffers directly (and Iterations needs the raw heatmap)
+    if (controls.denoise && (controls.passMode === 'Final' || controls.passMode === 'Denoised')) {
       const P = (rngFrame - 1) & 1;
       computePass.setPipeline(denoiseTemporalPipeline);
       computePass.setBindGroup(0, denoiseTemporalGroups[P]);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
-      const useWalr = (controls as any).denoiserMode === 'WALR';
-      computePass.setPipeline(useWalr ? denoiseWalrPipeline : denoiseAtrousPipeline);
-      const spatialGroups = useWalr ? denoiseWalrGroups : denoiseAtrousGroups;
+      computePass.setPipeline(denoiseAtrousPipeline);
       for (let i = 0; i < ATROUS_ITERATIONS; i++) {
-        computePass.setBindGroup(0, spatialGroups[P][i]);
+        computePass.setBindGroup(0, denoiseAtrousGroups[P][i]);
         computePass.dispatchWorkgroups(wgX, wgY, 1);
       }
       computePass.setPipeline(denoiseResolvePipeline);
       computePass.setBindGroup(0, denoiseResolveGroups[P]);
+      computePass.dispatchWorkgroups(wgX, wgY, 1);
+      computePass.setPipeline(denoiseStabilizePipeline);
+      computePass.setBindGroup(0, denoiseStabilizeGroups[P]);
       computePass.dispatchWorkgroups(wgX, wgY, 1);
     }
     computePass.end();

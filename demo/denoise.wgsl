@@ -72,6 +72,16 @@ struct DenoiseParams {
 // and remodulate at resolve, so the a-trous blurs the LIGHTING without
 // smearing the sharp material colour (the co-design 1-spp signal).
 @group(0) @binding(14) var<uniform> material_albedo: array<vec4f, 8>;
+// Separated primary specular (accumulated), added after the diffuse remod
+@group(0) @binding(13) var spec_tex: texture_2d<f32>;
+// ReBLUR temporal stabilization (anti-lag): resolve writes LINEAR denoised
+// radiance to 15; stabilize reads it (16) + its own history (17), clamps the
+// reprojected history to the local neighborhood and blends, writing the
+// display (12) + next history (18).
+@group(0) @binding(15) var denoised_out: texture_storage_2d<rgba32float, write>;
+@group(0) @binding(16) var denoised_in: texture_2d<f32>;
+@group(0) @binding(17) var stab_prev: texture_2d<f32>;
+@group(0) @binding(18) var stab_out: texture_storage_2d<rgba32float, write>;
 
 // Demodulation albedo for a G-buffer texel (1 for env/miss = no demod)
 fn demod_albedo(g_w: f32) -> vec3f {
@@ -370,137 +380,6 @@ fn atrousMain(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // ============================================================================
-// Pass 2 (alt): WALR — Weighted A-Trous Linear Regression (src-walr, AMD 2022)
-// Instead of the a-trous weighted AVERAGE, fit a per-pixel weighted linear
-// model of the (demodulated) irradiance against position-offset features
-// [1, dx, dy, dz] over the 5x5 stride window (moving least squares), solved
-// by 4x4 Cholesky. The intercept beta0 IS the denoised centre value. A
-// planar fit preserves the smooth gradients of indirect shadows/highlights
-// that averaging flattens into piecewise-constant patches, so large filters
-// stay usable on a 1-spp signal. Regularisation degrades gracefully to the
-// weighted average when the neighbourhood is degenerate (flat/too few taps).
-// ============================================================================
-@compute @workgroup_size(8, 8)
-fn walrMain(@builtin(global_invocation_id) gid: vec3u) {
-    let dims = textureDimensions(atrous_src);
-    if gid.x >= dims.x || gid.y >= dims.y { return; }
-    let pixel = vec2i(gid.xy);
-
-    let center = textureLoad(atrous_src, pixel, 0);
-    let g = textureLoad(gbuf, pixel, 0);
-    if (g.w < 0.0) {
-        textureStore(atrous_dst, gid.xy, center);
-        if (params.write_history == 1u) {
-            textureStore(hist_out, gid.xy, vec4f(center.rgb, textureLoad(moments_prev, pixel, 0).w));
-        }
-        return;
-    }
-    let mat_c = u32(g.w) & 3u;
-    let depth_c = (g.w - f32(mat_c)) * 16384.0;
-    let n_c = g.xyz;
-    let pos_c = world_pos(gid.xy, dims, depth_c);
-    let step = i32(1u << params.step);
-    // Scale position deltas to ~unit magnitude over the footprint so the
-    // 4x4 normal-equation matrix stays well conditioned
-    let fscale = 1.0 / (0.01 * depth_c * f32(step) + 1e-4);
-    let l_c = dn_luminance(center.rgb);
-    // 3x3-prefiltered variance drives the luminance edge-stop. This is
-    // ESSENTIAL, not optional: on a flat plane the geometric weights
-    // (plane-distance/normal) are identical for lit and shadowed pixels, so
-    // only the luminance weight stops the regression from fitting ACROSS a
-    // hard shadow edge and smearing it (the removed-shadow + ghosting bug).
-    var var_pre = 0.0;
-    {
-        var vwsum = 0.0;
-        for (var dy = -1; dy <= 1; dy++) {
-            for (var dx = -1; dx <= 1; dx++) {
-                let q = clamp(pixel + vec2i(dx, dy), vec2i(0), vec2i(dims) - 1);
-                let wg = select(select(1.0, 2.0, (dx == 0) != (dy == 0)), 4.0, dx == 0 && dy == 0);
-                var_pre += wg * textureLoad(atrous_src, q, 0).a;
-                vwsum += wg;
-            }
-        }
-        var_pre /= vwsum;
-    }
-    let sigma_l_den = SIGMA_L * sqrt(max(var_pre, 1e-10));
-
-    // Weighted normal-equation moments: M (4x4 symmetric upper triangle) and
-    // b = X^T W y (one vec3 per feature row)
-    var m00 = 0.0; var m01 = 0.0; var m02 = 0.0; var m03 = 0.0;
-    var m11 = 0.0; var m12 = 0.0; var m13 = 0.0;
-    var m22 = 0.0; var m23 = 0.0; var m33 = 0.0;
-    var b0 = vec3f(0.0); var b1 = vec3f(0.0); var b2 = vec3f(0.0); var b3 = vec3f(0.0);
-    var wsum = 0.0;
-    var sum_v = 0.0;
-    for (var dy = -2; dy <= 2; dy++) {
-        for (var dx = -2; dx <= 2; dx++) {
-            let q = pixel + vec2i(dx, dy) * step;
-            if (any(q < vec2i(0)) || any(q >= vec2i(dims))) { continue; }
-            let gq = textureLoad(gbuf, q, 0);
-            if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) { continue; }
-            let depth_q = (gq.w - f32(u32(gq.w) & 3u)) * 16384.0;
-            let pos_q = world_pos(vec2u(q), dims, depth_q);
-            let sq = textureLoad(atrous_src, q, 0);
-            let y = sq.rgb;
-            // Edge-stopping: plane distance + normal + variance-guided
-            // LUMINANCE (the last preserves hard shadow discontinuities)
-            let plane_d = abs(dot(n_c, pos_q - pos_c));
-            let wz = exp(-plane_d / (SIGMA_Z * (0.01 * depth_c) + 1e-4));
-            let wn = pow(max(dot(n_c, gq.xyz), 0.0), SIGMA_N);
-            let wl = exp(-abs(dn_luminance(y) - l_c) / (sigma_l_den + 1e-8));
-            var kern = KERNEL;
-            let h = kern[abs(dx)] * kern[abs(dy)];
-            let w = h * wz * wn * wl;
-            if (w <= 0.0) { continue; }
-            let d = (pos_q - pos_c) * fscale;
-            sum_v += w * w * sq.a;
-            // accumulate w * x x^T (x = [1, d.x, d.y, d.z]) and w * x y
-            m00 += w;          m01 += w * d.x;      m02 += w * d.y;      m03 += w * d.z;
-            m11 += w * d.x*d.x; m12 += w * d.x*d.y;  m13 += w * d.x*d.z;
-            m22 += w * d.y*d.y; m23 += w * d.y*d.z;
-            m33 += w * d.z*d.z;
-            b0 += w * y; b1 += w * (d.x * y); b2 += w * (d.y * y); b3 += w * (d.z * y);
-            wsum += w;
-        }
-    }
-    var out_c = center.rgb;
-    if (m00 > 1e-8) {
-        // Ridge regularisation on the gradient terms: pulls beta_{1..3} -> 0
-        // (i.e. toward the plain weighted average beta0 = sum(w*y)/sum(w))
-        // when the fit is under-determined. 0.3 keeps a mild bias for
-        // stability while still fitting real gradients.
-        let lambda = 0.3 * m00;
-        m11 += lambda; m22 += lambda; m33 += lambda;
-        // Cholesky M = L L^T (lower), then forward/back substitution.
-        let l00 = sqrt(max(m00, 1e-8));
-        let l10 = m01 / l00; let l20 = m02 / l00; let l30 = m03 / l00;
-        let l11 = sqrt(max(m11 - l10*l10, 1e-8));
-        let l21 = (m12 - l20*l10) / l11; let l31 = (m13 - l30*l10) / l11;
-        let l22 = sqrt(max(m22 - l20*l20 - l21*l21, 1e-8));
-        let l32 = (m23 - l30*l20 - l31*l21) / l22;
-        let l33 = sqrt(max(m33 - l30*l30 - l31*l31 - l32*l32, 1e-8));
-        let z0 = b0 / l00;
-        let z1 = (b1 - l10*z0) / l11;
-        let z2 = (b2 - l20*z0 - l21*z1) / l22;
-        let z3 = (b3 - l30*z0 - l31*z1 - l32*z2) / l33;
-        let beta3 = z3 / l33;
-        let beta2 = (z2 - l32*beta3) / l22;
-        let beta1 = (z1 - l21*beta2 - l31*beta3) / l11;
-        let beta0 = (z0 - l10*beta1 - l20*beta2 - l30*beta3) / l00;
-        // beta0 is the fit at the centre (x = [1,0,0,0]); clamp to the
-        // neighbourhood mean +/- guard to reject extrapolation overshoot
-        let mean = b0 / wsum;
-        out_c = clamp(beta0, mean - abs(mean) - vec3f(0.05), mean + abs(mean) + vec3f(0.05));
-        out_c = max(out_c, vec3f(0.0));
-    }
-    let out_v = select(center.a, sum_v / (wsum * wsum), wsum > 1e-8);
-    textureStore(atrous_dst, gid.xy, vec4f(out_c, out_v));
-    if (params.write_history == 1u) {
-        textureStore(hist_out, gid.xy, vec4f(out_c, textureLoad(moments_prev, pixel, 0).w));
-    }
-}
-
-// ============================================================================
 // Pass 3: resolve — tonemap the filtered radiance to the display target
 // ============================================================================
 fn dn_tonemap(color: vec3f) -> vec3f {
@@ -519,7 +398,96 @@ fn resolveMain(@builtin(global_invocation_id) gid: vec3u) {
     // a-trous removes the residual, so the image settles on its own with
     // low lag (SVGF as designed).
     color = color * demod_albedo(textureLoad(gbuf, vec2i(gid.xy), 0).w);
-    color = dn_tonemap(color);
-    color = pow(color, vec3f(1.0 / 2.2));
-    textureStore(resolve_out, gid.xy, vec4f(color, 1.0));
+    // Recombine the separated specular AFTER the diffuse BRDF remod (ReBLUR
+    // "material out"): specular is fresnel-white, not albedo-modulated. Leave
+    // it LINEAR (no tonemap) — the stabilization pass tonemaps for display.
+    color += textureLoad(spec_tex, vec2i(gid.xy), 0).rgb;
+    textureStore(denoised_out, gid.xy, vec4f(color, 1.0));
+}
+
+// ============================================================================
+// Pass 4: temporal stabilization / anti-lag (ReBLUR "Fast Denoising with
+// Self-Stabilizing Recurrent Blurs"). A recurrent TAA on the denoised
+// radiance: reproject a SEPARATE history, clamp it to the current frame's
+// 3x3 neighborhood colour box, and blend. The clamp is the anti-lag — when
+// the signal changes faster than the history predicts (dynamic light, an
+// edit, or the residual silhouette shimmer), the stale history is snapped
+// back into the current local range instead of lagging/ghosting.
+// ============================================================================
+// YCoCg keeps luma and chroma on separate axes, so the TAA neighborhood
+// clamp bounds brightness and colour COHERENTLY. A per-channel RGB clamp
+// pulls each of R,G,B independently and can synthesise a hue that was never
+// in the neighborhood (the cyan/green motion halo); clamping in YCoCg cannot.
+fn rgb2ycocg(c: vec3f) -> vec3f {
+    return vec3f(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
+}
+fn ycocg2rgb(c: vec3f) -> vec3f {
+    return vec3f(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+
+@compute @workgroup_size(8, 8)
+fn stabilizeMain(@builtin(global_invocation_id) gid: vec3u) {
+    let dims = textureDimensions(denoised_in);
+    if gid.x >= dims.x || gid.y >= dims.y { return; }
+    let pixel = gid.xy;
+    let cur = textureLoad(denoised_in, vec2i(pixel), 0).rgb;
+    let g = textureLoad(gbuf, vec2i(pixel), 0);
+
+    // 3x3 neighborhood colour box (mean +/- k*stddev) in YCoCg
+    var m1 = vec3f(0.0);
+    var m2 = vec3f(0.0);
+    for (var dy = -1; dy <= 1; dy++) {
+        for (var dx = -1; dx <= 1; dx++) {
+            let q = clamp(vec2i(pixel) + vec2i(dx, dy), vec2i(0), vec2i(dims) - 1);
+            let c = rgb2ycocg(textureLoad(denoised_in, q, 0).rgb);
+            m1 += c;
+            m2 += c * c;
+        }
+    }
+    let mean = m1 / 9.0;
+    let sd = sqrt(max(m2 / 9.0 - mean * mean, vec3f(0.0))) + 1e-4;
+
+    var outc = cur;
+    if (g.w >= 0.0) {
+        let mat_idx = u32(g.w) & 3u;
+        let depth = (g.w - f32(mat_idx)) * 16384.0;
+        let pos = world_pos(pixel, dims, depth);
+        let obj = objects[min(mat_idx, 1u)];
+        let pos_prev = (obj.motion * vec4f(pos, 1.0)).xyz;
+        let cam_prev = (input.prev_view * vec4f(pos_prev, 1.0)).xyz;
+        if (cam_prev.z < 0.0) {
+            let aspect = f32(dims.x) / f32(dims.y);
+            let uv = vec2f(
+                (cam_prev.x / (-cam_prev.z)) / (aspect * input.fov_scale),
+                (cam_prev.y / (-cam_prev.z)) / input.fov_scale,
+            ) * 0.5 + 0.5;
+            if (all(uv >= vec2f(0.0)) && all(uv < vec2f(1.0))) {
+                let pp = vec2i(uv * vec2f(dims));
+                let hist = textureLoad(stab_prev, pp, 0).rgb;
+                // Anti-lag: measure how far the reprojected history sits
+                // outside the local neighborhood box (in std units). Small ->
+                // trust it, blend slowly for stability; large -> disocclusion
+                // or the signal changed faster than motion predicts, so ramp
+                // the blend toward the current frame (responsive, no ghost).
+                let hist_yc = rgb2ycocg(hist);
+                // Clamp all three axes to the box (the chroma clamp kills the
+                // hue halo), then blend at a fixed low rate for stability. The
+                // CLAMP is the anti-lag: history can never sit outside the
+                // local neighborhood, so it can't lag/ghost more than the
+                // neighborhood's spread — no gradual dev-ramp (that ramp added
+                // static shimmer at pixels whose history rode the box edge).
+                let clamped = ycocg2rgb(clamp(hist_yc, mean - sd, mean + sd));
+                // Hard reject only on a true disocclusion, judged by LUMA (the
+                // chroma of a flat material is near-constant): the reprojected
+                // history is a different surface, so drop it entirely.
+                let luma_dev = abs(hist_yc.x - mean.x) / sd.x;
+                let alpha = select(0.1, 1.0, luma_dev > 4.0);
+                outc = mix(clamped, cur, alpha);
+            }
+        }
+    }
+    textureStore(stab_out, pixel, vec4f(outc, 1.0));
+    var disp = dn_tonemap(outc);
+    disp = pow(disp, vec3f(1.0 / 2.2));
+    textureStore(resolve_out, pixel, vec4f(disp, 1.0));
 }
