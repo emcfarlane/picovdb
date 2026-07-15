@@ -75,14 +75,11 @@ fn appendValue(data_buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, va
     }
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    for (args) |arg| {
+        std.log.info("arg: {s}", .{arg});
+    }
     if (args.len < 2) {
         try printUsage();
         return;
@@ -138,7 +135,7 @@ pub fn main() !void {
             return;
         }
 
-        try processConversion(allocator, src_path, dst_path, value_type);
+        try processConversion(init.io, init.gpa, src_path, dst_path, value_type);
     } else {
         std.debug.print("Error: Unknown command '{s}'\n", .{command});
         try printUsage();
@@ -151,24 +148,25 @@ fn printUsage() !void {
     std.debug.print("  convert [--type f32|u8] <src>.nvdb <dst>.pvdb    Convert NanoVDB file to PicoVDB format\n", .{});
 }
 
-fn processConversion(allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, value_type: ValueType) !void {
+fn processConversion(io: std.Io, allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, value_type: ValueType) !void {
     std.debug.print("Converting '{s}' to '{s}' (type: {s})...\n", .{ src_path, dst_path, @tagName(value_type) });
+    const cwd = std.Io.Dir.cwd();
 
     // Open and read the source file
-    const src_file = std.fs.cwd().openFile(src_path, .{}) catch |err| {
+    const src_file = cwd.openFile(io, src_path, .{}) catch |err| {
         std.debug.print("Error: Could not open source file '{s}': {}\n", .{ src_path, err });
         return;
     };
-    defer src_file.close();
+    defer src_file.close(io);
 
-    const src_stat = try src_file.stat();
+    const src_stat = try src_file.stat(io);
     std.debug.print("Source file size: {} bytes ({:.2} MB)\n", .{ src_stat.size, @as(f64, @floatFromInt(src_stat.size)) / 1024.0 / 1024.0 });
 
     // Read entire file into memory
     const file_buffer = try allocator.alloc(u8, std.mem.alignForward(usize, src_stat.size, 4));
     defer allocator.free(file_buffer);
 
-    _ = try src_file.readAll(file_buffer);
+    _ = try src_file.readPositionalAll(io, file_buffer, 0);
     std.debug.print("File read into memory successfully\n", .{});
 
     // Convert NanoVDB to PicoVDB format
@@ -178,7 +176,7 @@ fn processConversion(allocator: std.mem.Allocator, src_path: []const u8, dst_pat
     try convertNanoVDBToPicoVDB(allocator, file_buffer, &picovdb_file, value_type);
 
     // Write PicoVDB file
-    try writePicoVDBFile(dst_path, &picovdb_file);
+    try writePicoVDBFile(io, dst_path, &picovdb_file);
 
     std.debug.print("Conversion completed successfully!\n", .{});
 }
@@ -737,14 +735,15 @@ fn convertGridWithMetadata(allocator: std.mem.Allocator, buffer: []const u8, off
     return try convertGrid(allocator, buffer, grid_offset, picovdb_file, grid_index, value_type, is_fog);
 }
 
-fn writePicoVDBFile(dst_path: []const u8, picovdb_file: *picovdb.PicoVDBFileMutable) !void {
+fn writePicoVDBFile(io: std.Io, dst_path: []const u8, picovdb_file: *picovdb.PicoVDBFileMutable) !void {
     std.debug.print("\n=== Writing PicoVDB File ===\n", .{});
 
-    const dst_file = std.fs.cwd().createFile(dst_path, .{}) catch |err| {
+    const cwd = std.Io.Dir.cwd();
+    const dst_file = cwd.createFile(io, dst_path, .{}) catch |err| {
         std.debug.print("Error: Could not create output file '{s}': {}\n", .{ dst_path, err });
         return;
     };
-    defer dst_file.close();
+    defer dst_file.close(io);
 
     // Calculate padded sizes for alignment
     const root_count = picovdb_file.roots.items.len;
@@ -763,39 +762,39 @@ fn writePicoVDBFile(dst_path: []const u8, picovdb_file: *picovdb.PicoVDBFileMuta
 
     // Write PicoVDB file header
     const header_bytes = std.mem.asBytes(&picovdb_file.header);
-    _ = try dst_file.writeAll(header_bytes);
+    try dst_file.writeStreamingAll(io, header_bytes);
 
     // Write grids
     const grids_bytes = std.mem.sliceAsBytes(picovdb_file.grids.items);
-    _ = try dst_file.writeAll(grids_bytes);
+    try dst_file.writeStreamingAll(io, grids_bytes);
 
     // Write roots (padded to 16-byte alignment via even count)
     const roots_bytes = std.mem.sliceAsBytes(picovdb_file.roots.items);
-    _ = try dst_file.writeAll(roots_bytes);
+    try dst_file.writeStreamingAll(io, roots_bytes);
     if (root_needs_padding) {
         // Add padding root for 16-byte alignment
         const padding_root = picovdb.PicoVDBRoot{ .key = [2]u32{ 0, 0 } };
-        _ = try dst_file.writeAll(std.mem.asBytes(&padding_root));
+        try dst_file.writeStreamingAll(io, std.mem.asBytes(&padding_root));
     }
 
     // Write uppers
     const uppers_bytes = std.mem.sliceAsBytes(picovdb_file.uppers.items);
-    _ = try dst_file.writeAll(uppers_bytes);
+    try dst_file.writeStreamingAll(io, uppers_bytes);
 
     // Write lowers
     const lowers_bytes = std.mem.sliceAsBytes(picovdb_file.lowers.items);
-    _ = try dst_file.writeAll(lowers_bytes);
+    try dst_file.writeStreamingAll(io, lowers_bytes);
 
     // Write leaves
     const leaves_bytes = std.mem.sliceAsBytes(picovdb_file.leaves.items);
-    _ = try dst_file.writeAll(leaves_bytes);
+    try dst_file.writeStreamingAll(io, leaves_bytes);
 
     // Write data buffer (padded to 16 bytes)
-    _ = try dst_file.writeAll(picovdb_file.data_buffer.items);
+    try dst_file.writeStreamingAll(io, picovdb_file.data_buffer.items);
     const data_padding = data_size_padded - data_size;
     if (data_padding > 0) {
         const padding = [_]u8{0} ** 16;
-        _ = try dst_file.writeAll(padding[0..data_padding]);
+        try dst_file.writeStreamingAll(io, padding[0..data_padding]);
     }
 
     std.debug.print("PicoVDB file written: {s}\n", .{dst_path});
@@ -840,13 +839,15 @@ test "picovdb file loader from bytes" {
 
     // Convert sphere.nvdb to PicoVDB format in memory
     const test_file = "data/sphere.nvdb";
-    const file = try std.fs.cwd().openFile(test_file, .{});
-    defer file.close();
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.openFile(io, test_file, .{});
+    defer file.close(io);
 
-    const file_size = try file.getEndPos();
+    const file_size = (try file.stat(io)).size;
     const nvdb_buffer = try allocator.alloc(u8, std.mem.alignForward(usize, file_size, 4));
     defer allocator.free(nvdb_buffer);
-    _ = try file.readAll(nvdb_buffer);
+    _ = try file.readPositionalAll(io, nvdb_buffer, 0);
 
     // Convert to PicoVDB format
     var picovdb_file_mutable = picovdb.PicoVDBFileMutable.init();
@@ -887,13 +888,15 @@ test "read accessor integration with data files" {
         //"data/bunny.nvdb",
     };
     for (test_files) |test_file| {
-        const file = try std.fs.cwd().openFile(test_file, .{});
-        defer file.close();
+        const io = std.testing.io;
+        const cwd = std.Io.Dir.cwd();
+        const file = try cwd.openFile(io, test_file, .{});
+        defer file.close(io);
 
-        const file_size = try file.getEndPos();
+        const file_size = (try file.stat(io)).size;
         const buffer = try allocator.alloc(u8, std.mem.alignForward(usize, file_size, 16));
         defer allocator.free(buffer);
-        _ = try file.readAll(buffer);
+        _ = try file.readPositionalAll(io, buffer, 0);
 
         std.log.info("Using test file: {s} ({} bytes)", .{ test_file, file_size });
 
@@ -1000,13 +1003,15 @@ test "u8 quantization round-trip" {
     const allocator = std.testing.allocator;
 
     const test_file = "data/sphere.nvdb";
-    const file = try std.fs.cwd().openFile(test_file, .{});
-    defer file.close();
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.openFile(io, test_file, .{});
+    defer file.close(io);
 
-    const file_size = try file.getEndPos();
+    const file_size = (try file.stat(io)).size;
     const nvdb_buffer = try allocator.alloc(u8, std.mem.alignForward(usize, file_size, 16));
     defer allocator.free(nvdb_buffer);
-    _ = try file.readAll(nvdb_buffer);
+    _ = try file.readPositionalAll(io, nvdb_buffer, 0);
 
     // Convert with u8 encoding
     var picovdb_file_mutable = picovdb.PicoVDBFileMutable.init();
