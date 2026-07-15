@@ -92,6 +92,16 @@ struct DenoiseParams {
 @group(0) @binding(18) var stab_out: texture_storage_2d<rgba32float, write>;
 // Accumulated first-bounce distance -> ReBLUR blur radius (blur pass)
 @group(0) @binding(19) var hitdist_tex: texture_2d<f32>;
+// ReBLUR fast history: a parallel luma EMA capped at ~6 frames (ping-pong).
+// Each frame the SLOW history's luma is clamped to the fast history's local
+// range, structurally bounding lag to ~6 frames without cutting A.
+@group(0) @binding(20) var fast_prev: texture_2d<f32>;
+@group(0) @binding(21) var fast_out: texture_storage_2d<r32float, write>;
+// Mean radiance of the pixel's MISS frames (backdrop/env behind the object).
+// The denoiser filters hit-gated object radiance only; the display composites
+// mix(backdrop, denoised, coverage) — coverage rides in illum alpha — to
+// recover the box-filtered AA the sub-pixel jitter produces.
+@group(0) @binding(22) var backdrop_tex: texture_2d<f32>;
 
 // Demodulation albedo for a G-buffer texel (1 for env/miss = no demod)
 fn demod_albedo(g_w: f32) -> vec3f {
@@ -155,6 +165,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
     var color = c_in;
     var mu = vec2f(l_in, l_in * l_in);
     var hist_len = 1.0;
+    var fast = l_in;
 
     if (g.w < 0.0) {
         // Primary miss (backdrop/env): accumulate in place — the value is
@@ -165,13 +176,44 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
         if (gp.w < 0.0) {
             let h = textureLoad(hist_prev, vec2i(pixel), 0);
             let m = textureLoad(moments_prev, vec2i(pixel), 0);
-            hist_len = min(h.a + 1.0, 64.0);
+            hist_len = min(h.a + 1.0, 30.0);
             let alpha = max(0.1, 1.0 / hist_len);
             color = mix(h.rgb, c_in, alpha);
             mu = mix(m.xy, mu, alpha);
         }
     } else {
         let mat_idx = u32(g.w) & 3u;
+        // NRD PrePass equivalent: the temporal input is a 3x3 material-
+        // gated mean of the illum, feeding BOTH the slow and fast histories
+        // (same per-pixel expectation -> no bias between them). The raw
+        // 1-spp demodulated luma swings +-200% per frame, which inflated
+        // every sigma-based band (fast-history clamp, anti-lag dead zone)
+        // past the size of real lighting changes; the mean cuts sigma ~3x
+        // so changes escape the bands. The recurrent blur passes dwarf the
+        // extra 3x3 footprint, and this subsumes the old fresh-pixel
+        // fallback (which computed exactly this mean).
+        var c_pre = vec3f(0.0);
+        var pcnt = 0.0;
+        for (var dy = -1; dy <= 1; dy++) {
+            for (var dx = -1; dx <= 1; dx++) {
+                let q = vec2i(pixel) + vec2i(dx, dy);
+                if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
+                    continue;
+                }
+                let gq = textureLoad(gbuf, q, 0);
+                if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_idx) {
+                    continue;
+                }
+                c_pre += textureLoad(illum, vec2u(q), 0).rgb;
+                pcnt += 1.0;
+            }
+        }
+        c_pre = c_pre / max(pcnt, 1.0); // the center tap always passes
+        let l_pre = dn_luminance(c_pre);
+        let mu_pre = vec2f(l_pre, l_pre * l_pre);
+        color = c_pre;
+        mu = mu_pre;
+        fast = max(l_pre, 0.0);
         let depth = (g.w - f32(mat_idx)) * 16384.0;
         let pos = world_pos(pixel, dims, depth);
         // Our two objects map 1:1 to materials (0 = model, 1 = ground)
@@ -201,6 +243,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
             let n_prev = normalize((obj.motion * vec4f(g.xyz, 0.0)).xyz);
             var h_sum = vec4f(0.0);
             var m_sum = vec2f(0.0);
+            var f_sum = 0.0;
             var w_sum = 0.0;
             for (var ty = 0; ty < 2; ty++) {
                 for (var tx = 0; tx < 2; tx++) {
@@ -220,60 +263,91 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
                     let bw = mix(1.0 - frac.x, frac.x, f32(tx)) * mix(1.0 - frac.y, frac.y, f32(ty));
                     h_sum += bw * textureLoad(hist_prev, pp, 0);
                     m_sum += bw * textureLoad(moments_prev, pp, 0).xy;
+                    f_sum += bw * textureLoad(fast_prev, pp, 0).r;
                     w_sum += bw;
                 }
             }
             if (w_sum > 0.02) {
                 let h = h_sum / w_sum;
                 let m = m_sum / w_sum;
-                hist_len = min(h.a + 1.0, 64.0);
-                // ReBLUR anti-lag feedback (Sec. 49.11): last frame's
-                // stabilization wrote a per-pixel confidence, low where the
-                // slow (temporal-accum) and slower (stabilization) histories
-                // diverged — a shadow moving over STATIC ground, which motion
-                // vectors can't track. Cut the accumulated frame count so
-                // accumulation re-converges from a lower A instead of leaving
-                // the stale (bright) value streaking behind the shadow.
-                // NEVER cut at material boundaries: the silhouette's luma
-                // delta is coverage noise, not signal change, and cutting
-                // there locks edge pixels into a hist_len 1<->3 oscillation
-                // (EMA vs fresh-pixel fallback = per-frame edge flicker).
-                if (!boundary) {
-                    let conf = textureLoad(stab_prev, clamp(base, vec2i(0), vec2i(dims) - 1), 0).a;
-                    hist_len = max(1.0, hist_len * conf);
+                hist_len = min(h.a + 1.0, 30.0);
+                // ReBLUR anti-lag (NRD REBLUR_TemporalStabilization): last
+                // frame's stabilization wrote a per-pixel confidence, low
+                // where the stabilization history sat outside the current
+                // neighborhood's 2-sigma dead zone — a signal change motion
+                // vectors can't track (a shadow sliding over static ground).
+                // Cut the accumulated frame count so accumulation
+                // re-converges instead of streaking. FLOORED AT 4 frames
+                // (NRD: historyFixFrameNum), never 1: the cut must not
+                // re-enter the fresh-pixel fallback, or edge pixels lock
+                // into an EMA-vs-fallback oscillation. Below 4 the mix is a
+                // no-op, and the writer's sensitivity scales with A, so a
+                // freshly cut pixel cannot be cut again (self-quenching).
+                let antilag = textureLoad(stab_prev, clamp(base, vec2i(0), vec2i(dims) - 1), 0).a;
+                hist_len = mix(min(hist_len, 4.0), hist_len, antilag);
+                // No alpha floor (NRD: alpha = 1/(1+A)): a floor makes
+                // anti-lag cuts above its knee (0.05 = 20 frames) no-ops.
+                // Deep smoothing is safe BECAUSE the cuts and the fast
+                // clamp own responsiveness now.
+                let alpha = max(select(0.0, 0.15, boundary), 1.0 / hist_len);
+                color = mix(h.rgb, c_pre, alpha);
+                mu = mix(m, mu_pre, alpha);
+                // Fast history (NRD REBLUR_TemporalAccumulation): a parallel
+                // per-pixel luma EMA over the SAME reprojected footprint,
+                // capped at ~6 frames; the slow result's luma is then
+                // clamped to the fast history's local range. Lighting/edit
+                // changes reach the display within a few frames regardless
+                // of the 64-frame slow cap — lag is bounded structurally.
+                let f_prev = f_sum / w_sum;
+                fast = mix(f_prev, max(l_pre, 0.0), max(1.0 / 6.0, 1.0 / hist_len));
+                if (hist_len > 6.0) {
+                    // 5x5 window (NRD HistoryFix): a 3x3 of converged fast
+                    // values has near-zero sigma and the clamp re-noised
+                    // sparse high-contrast pixels; 5x5 folds real spatial
+                    // variation into the band.
+                    var f1 = 0.0;
+                    var f2 = 0.0;
+                    var fc = 0.0;
+                    for (var dy = -2; dy <= 2; dy++) {
+                        for (var dx = -2; dx <= 2; dx++) {
+                            let q = base + vec2i(dx, dy);
+                            if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
+                                continue;
+                            }
+                            let gq = textureLoad(gbuf_prev, q, 0);
+                            if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_idx) {
+                                continue;
+                            }
+                            let fq = textureLoad(fast_prev, q, 0).r;
+                            f1 += fq;
+                            f2 += fq * fq;
+                            fc += 1.0;
+                        }
+                    }
+                    let l_slow = dn_luminance(color);
+                    // The ratio luma rescale EXPLODES around zero — the
+                    // demodulated irradiance is ~0 (even negative) in AO
+                    // creases, and one exploded frame seeds a firefly that
+                    // the stabilization history then perpetuates (the
+                    // magenta sparkle clusters). Skip dark pixels entirely
+                    // and bound the scale.
+                    if (fc > 1.0 && l_slow > 0.05) {
+                        let fmean = f1 / fc;
+                        // NRD fastHistoryClampingSigmaScale = 2. The small
+                        // relative floor keeps a fully converged fast
+                        // neighborhood (near-zero sigma) from pinching the
+                        // slow value and re-noising it.
+                        let fsig = 2.0 * sqrt(max(f2 / fc - fmean * fmean, 0.0)) + 0.02 * abs(fmean) + 1e-4;
+                        let l_cl = clamp(l_slow, fmean - fsig, fmean + fsig);
+                        // NRD HistoryFix applies the clamp weighted by A:
+                        // full for long histories (which is where lag lives),
+                        // fading out for short ones (fresh data is already
+                        // responsive; clamping it only adds noise).
+                        let l_new = mix(l_cl, l_slow, 1.0 / (1.0 + 2.0 * hist_len));
+                        color *= clamp(l_new / l_slow, 0.25, 4.0);
+                    }
                 }
-                let alpha = max(select(0.05, 0.15, boundary), 1.0 / hist_len);
-                color = mix(h.rgb, c_in, alpha);
-                mu = mix(m, mu, alpha);
             }
-        }
-    }
-
-    // Fresh/disoccluded pixels (boundary pixels are handled above): fall
-    // back to a material-gated 3x3 mean of the raw input instead of
-    // passing single-sample noise through (the dark edge fringe)
-    if (hist_len < 2.0 && g.w >= 0.0) {
-        let mat_c = u32(g.w) & 3u;
-        var csum = vec3f(0.0);
-        var ccnt = 0.0;
-        for (var dy = -1; dy <= 1; dy++) {
-            for (var dx = -1; dx <= 1; dx++) {
-                let q = vec2i(pixel) + vec2i(dx, dy);
-                if (any(q < vec2i(0)) || any(q >= vec2i(dims))) {
-                    continue;
-                }
-                let gq = textureLoad(gbuf, q, 0);
-                if (gq.w < 0.0 || (u32(gq.w) & 3u) != mat_c) {
-                    continue;
-                }
-                csum += textureLoad(illum, vec2u(q), 0).rgb;
-                ccnt += 1.0;
-            }
-        }
-        if (ccnt > 1.0) {
-            color = csum / ccnt;
-            let l = dn_luminance(color);
-            mu = vec2f(l, l * l);
         }
     }
 
@@ -309,6 +383,7 @@ fn temporalAccumMain(@builtin(global_invocation_id) gid: vec3u) {
     }
     textureStore(hist_out, pixel, vec4f(color, hist_len));
     textureStore(moments_out, pixel, vec4f(mu, variance, hist_len));
+    textureStore(fast_out, pixel, vec4f(fast, 0.0, 0.0, 0.0));
     // Seed the a-trous chain: (color, variance)
     textureStore(atrous_dst, pixel, vec4f(color, variance));
 }
@@ -472,9 +547,6 @@ fn resolveMain(@builtin(global_invocation_id) gid: vec3u) {
 fn rgb2ycocg(c: vec3f) -> vec3f {
     return vec3f(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b);
 }
-fn ycocg2rgb(c: vec3f) -> vec3f {
-    return vec3f(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
-}
 
 @compute @workgroup_size(8, 8)
 fn stabilizeMain(@builtin(global_invocation_id) gid: vec3u) {
@@ -550,47 +622,59 @@ fn stabilizeMain(@builtin(global_invocation_id) gid: vec3u) {
                     }
                 }
                 let hist = h_sum / max(hw_sum, 1e-4);
-                // Anti-lag: measure how far the reprojected history sits
-                // outside the local neighborhood box (in std units). Small ->
-                // trust it, blend slowly for stability; large -> disocclusion
-                // or the signal changed faster than motion predicts, so ramp
-                // the blend toward the current frame (responsive, no ghost).
                 let hist_yc = rgb2ycocg(hist);
-                // Clamp all three axes to the box (the chroma clamp kills the
-                // hue halo), then blend at a fixed low rate for stability. The
-                // CLAMP is the anti-lag: history can never sit outside the
-                // local neighborhood, so it can't lag/ghost more than the
-                // neighborhood's spread — no gradual dev-ramp (that ramp added
-                // static shimmer at pixels whose history rode the box edge).
-                let clamped = ycocg2rgb(clamp(hist_yc, mean - sd, mean + sd));
-                // Hard reject only on a true disocclusion, judged by LUMA (the
-                // chroma of a flat material is near-constant): the reprojected
-                // history is a different surface, so drop it entirely.
-                let luma_dev = abs(hist_yc.x - mean.x) / sd.x;
-                let alpha = select(0.1, 1.0, luma_dev > 4.0);
-                outc = mix(clamped, cur, alpha);
-                // ReBLUR anti-lag (Sec. 49.11): relative INTENSITY delta
-                // between the SLOW (current denoised = temporal-accumulation
-                // result) and SLOWER (reprojected stabilization history)
-                // signals. A high delta means the signal changed faster than
-                // the slow history tracks (a shadow sliding over static
-                // ground) -> low confidence, which next frame's temporal
-                // accumulation reads back to cut its accumulated frame count
-                // and re-converge quickly instead of streaking.
-                // Compare against the CLAMPED history: both signals are then
-                // noise-bounded (ReBLUR compares two averaged histories). A
-                // real signal change moves the neighborhood box itself, so
-                // the clamped history still diverges from cur and the cut
-                // fires; a reprojection outlier no longer poisons confidence.
-                let lum_cur = dn_luminance(cur);
-                let lum_hist = dn_luminance(clamped);
-                let idelta = abs(lum_cur - lum_hist) / (max(lum_cur, lum_hist) + 0.05);
-                confidence = smoothstep(0.15, 0.03, idelta);
+                // NRD ComputeAntilag (mode 2; defaults sigmaScale 2,
+                // sensitivity 3): relative distance the reprojected history
+                // luma sits OUTSIDE the neighborhood's 2-sigma dead zone,
+                // ramped to a FULL cut at threshold 3/(1+A). At A=64 a ~5%
+                // divergence is already a full cut — the responsiveness
+                // engine — while a freshly cut pixel (A~4) needs ~60% and
+                // stays quiet while it re-converges (self-quenching). Inside
+                // the dead zone d = 0, so noise never triggers.
+                let a_frames = textureLoad(moments_prev, vec2i(pixel), 0).w;
+                let h_l = max(hist_yc.x, 0.0);
+                let dead = clamp(h_l, mean.x - 2.0 * sd.x, mean.x + 2.0 * sd.x);
+                let d = abs(h_l - dead) / (max(h_l, dead) + 1e-6);
+                let antilag = saturate(1.0 - d * (a_frames + 1.0) / 3.0);
+                // NRD GetTemporalAccumulationParams: history weight grows
+                // with the (antilag-cut) A and collapses with antilag, so
+                // the DISPLAY responds on the cut frame itself instead of
+                // trailing at a fixed blend; the clamp box widens 1 -> 4
+                // sigma as trust grows (trusted history may deviate for
+                // stability, distrusted history is snapped to the current
+                // frame's local stats).
+                let a_cut = mix(min(a_frames, 4.0), a_frames, antilag);
+                let w = (1.0 - 1.0 / (1.0 + a_cut)) * antilag;
+                let box_scale = 1.0 + 3.0 * w;
+                // NRD stabilizes LUMA ONLY (ChangeLuma): chroma always
+                // comes from the current denoised frame. Blending
+                // full-color history let one bad frame ride the trusted
+                // (4-sigma) box as a persistent magenta firefly; a
+                // luma-only history cannot carry a hue at all. Skip the
+                // rescale on near-zero luma (ratio blow-up).
+                let l_hist = clamp(h_l, mean.x - sd.x * box_scale, mean.x + sd.x * box_scale);
+                let l_cur = rgb2ycocg(cur).x;
+                if (l_cur > 0.05) {
+                    let l_stab = mix(l_cur, l_hist, min(w, 0.95));
+                    outc = cur * clamp(l_stab / l_cur, 0.25, 4.0);
+                }
+                confidence = antilag;
             }
         }
     }
+    // History stays OBJECT-side (pre-composition): backdrop must never
+    // enter the temporal loop (the original edge-flicker source)
     textureStore(stab_out, pixel, vec4f(outc, confidence));
-    var disp = dn_tonemap(outc);
+    // Composite the coverage-weighted backdrop back in for display: this is
+    // the jitter's anti-aliasing. A silhouette pixel hit by 40% of the
+    // jittered rays displays 0.4*object + 0.6*backdrop, exactly like the
+    // raw accumulated path trace, instead of a hard object-dilated edge.
+    // (Miss pixels keep outc: their temporal accumulation IS the smoothed
+    // backdrop — the hue-flicker fix — and coverage is 0 by construction.)
+    let coverage = textureLoad(illum, vec2i(pixel), 0).a;
+    let backdrop = textureLoad(backdrop_tex, vec2i(pixel), 0).rgb;
+    let composed = select(outc, mix(backdrop, outc, coverage), g.w >= 0.0);
+    var disp = dn_tonemap(composed);
     disp = pow(disp, vec3f(1.0 / 2.2));
     textureStore(resolve_out, pixel, vec4f(disp, 1.0));
 }

@@ -79,6 +79,8 @@ let specTexture: GPUTexture;
 let denoisedTexture: GPUTexture;
 let stabTextures: GPUTexture[] = [];
 let histTextures: GPUTexture[] = [];
+// ReBLUR fast history: ~6-frame luma EMA ping-pong (r32float)
+let fastTextures: GPUTexture[] = [];
 let momentsTextures: GPUTexture[] = [];
 let atrousTextures: GPUTexture[] = [];
 let denoiseTemporalGroups: GPUBindGroup[] = [];
@@ -92,6 +94,7 @@ let dataBindGroup: GPUBindGroup;
 let passBindGroups: GPUBindGroup[] = [];
 let gdepthTexture: GPUTexture;
 let hitdistTexture: GPUTexture;
+let backdropTexture: GPUTexture;
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
@@ -255,7 +258,8 @@ function createGPUResources() {
   gbufferAccumBuffer?.destroy();
   gbufferAccumBuffer = device.createBuffer({
     label: 'G-buffer + illum accumulation',
-    size: renderWidth * renderHeight * 4 * 16,
+    // Stride 5 vec4/pixel: nsum, dsum, isum, ssum, msum (miss/backdrop)
+    size: renderWidth * renderHeight * 5 * 16,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
   });
   resetAccumulation("gpu-resources");
@@ -320,6 +324,14 @@ function createGPUResources() {
   denoisedTexture = denoiseTex('Denoise resolved (linear)');
   stabTextures = [denoiseTex('Stab hist 0'), denoiseTex('Stab hist 1')];
   histTextures = [denoiseTex('Denoise hist 0'), denoiseTex('Denoise hist 1')];
+  fastTextures.forEach(t => t.destroy());
+  fastTextures = [0, 1].map(i => device.createTexture({
+    label: `Fast history ${i}`,
+    size: [renderWidth, renderHeight],
+    format: 'r32float',
+    // COPY_SRC: __readTex debug readback
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
+  }));
   momentsTextures = [denoiseTex('Denoise moments 0'), denoiseTex('Denoise moments 1')];
   atrousTextures = [denoiseTex('Denoise atrous 0'), denoiseTex('Denoise atrous 1')];
   // Accumulated first-bounce distance -> ReBLUR blur radius (read by the blur
@@ -329,6 +341,15 @@ function createGPUResources() {
     label: 'Hit distance',
     size: [renderWidth, renderHeight],
     format: 'r32float',
+    usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
+  });
+  // Mean miss-frame radiance: the display composites
+  // mix(backdrop, denoised, coverage) to keep the jitter's AA
+  backdropTexture?.destroy();
+  backdropTexture = device.createTexture({
+    label: 'Backdrop (miss mean)',
+    size: [renderWidth, renderHeight],
+    format: 'rgba32float',
     usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.STORAGE_BINDING,
   });
   createDenoiseBindGroups();
@@ -370,6 +391,7 @@ function createGPUResources() {
       { binding: 1, resource: { buffer: accumulationBuffer } },
       { binding: 2, resource: specTexture.createView() },
       { binding: 6, resource: hitdistTexture.createView() },
+      { binding: 7, resource: backdropTexture.createView() },
       { binding: 4, resource: { buffer: gbufferAccumBuffer } },
       { binding: 3, resource: gbufferTextures[1 - parity].createView() },
       { binding: 5, resource: illumTexture.createView() },
@@ -938,6 +960,23 @@ function resetAccumulation(cause = 'unknown') {
   resetAccumulation('test-set');
   return `${prop}=${value}`;
 };
+// Headless-test hook: raw texel of a named denoiser texture
+(window as any).__readTex = async (name: string, x: number, y: number) => {
+  const map: Record<string, GPUTexture> = {
+    fast0: fastTextures[0], fast1: fastTextures[1],
+    illum: illumTexture, denoised: denoisedTexture,
+    stab0: stabTextures[0], stab1: stabTextures[1],
+    moments0: momentsTextures[0], moments1: momentsTextures[1],
+  };
+  const buf = device.createBuffer({ size: 256, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+  const enc = device.createCommandEncoder();
+  enc.copyTextureToBuffer({ texture: map[name], origin: [x, y] }, { buffer: buf, bytesPerRow: 256 }, [1, 1]);
+  device.queue.submit([enc.finish()]);
+  await buf.mapAsync(GPUMapMode.READ);
+  const f = Array.from(new Float32Array(buf.getMappedRange().slice(0, 16)));
+  buf.unmap(); buf.destroy();
+  return JSON.stringify(f.map(v => +v.toPrecision(5)));
+};
 // Headless-test hook: both G-buffer ping-pong textures at a pixel
 // (normal.xyz, w = material + depth/16384; w < 0 = miss)
 (window as any).__readGbuf = async (x: number, y: number) => {
@@ -980,7 +1019,7 @@ function resetAccumulation(cause = 'unknown') {
 };
 // Debug: read the accumulation buffer's isum (illum sum + count) at center
 (window as any).__accSamp = async () => {
-  const idx = (Math.floor(renderHeight / 2) * renderWidth + Math.floor(renderWidth / 2)) * 4;
+  const idx = (Math.floor(renderHeight / 2) * renderWidth + Math.floor(renderWidth / 2)) * 5;
   const buf = device.createBuffer({ size: 48, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
   const enc = device.createCommandEncoder();
   enc.copyBufferToBuffer(gbufferAccumBuffer, idx * 16, buf, 0, 48);
@@ -1161,6 +1200,7 @@ const passBindGroupLayout = device.createBindGroupLayout({
     { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 2, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
     { binding: 6, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d' } },
+    { binding: 7, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
     { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     { binding: 3, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
     { binding: 5, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: 'write-only', format: 'rgba32float', viewDimension: '2d' } },
@@ -1235,6 +1275,9 @@ function createDenoiseBindGroups() {
       { binding: 11, resource: atrousTextures[0].createView() },
       // ReBLUR anti-lag: last frame's stabilization confidence (in .a)
       { binding: 17, resource: stabTextures[P].createView() },
+      // ReBLUR fast history ping-pong (luma EMA, ~6-frame cap)
+      { binding: 20, resource: fastTextures[P].createView() },
+      { binding: 21, resource: fastTextures[1 - P].createView() },
     ]
   }));
   denoiseAtrousGroups = [0, 1].map(P =>
@@ -1272,6 +1315,12 @@ function createDenoiseBindGroups() {
       { binding: 0, resource: { buffer: inputBuffer } },
       { binding: 1, resource: { buffer: objectsBuffer } },
       { binding: 4, resource: gbufferTextures[1 - P].createView() },
+      // Current accumulated frame count A (moments written this frame)
+      // scales the anti-lag confidence's sensitivity
+      { binding: 7, resource: momentsTextures[1 - P].createView() },
+      // Coverage (illum alpha) + miss-side backdrop for the display AA mix
+      { binding: 3, resource: illumTexture.createView() },
+      { binding: 22, resource: backdropTexture.createView() },
       { binding: 12, resource: raytracedTexture.createView() },
       { binding: 16, resource: denoisedTexture.createView() },
       { binding: 17, resource: stabTextures[P].createView() },

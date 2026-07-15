@@ -143,6 +143,12 @@ const MAX_LIGHTS: u32 = 8u;
 @group(2) @binding(4) var<storage, read_write> gbuffer_accum: array<vec4f>;
 // Accumulated first-bounce distance (ReBLUR blur radius); dsum.z holds the sum
 @group(2) @binding(6) var hitdist_out: texture_storage_2d<r32float, write>;
+// Mean radiance of the MISS frames (msum) + coverage in illum alpha: the
+// denoiser works on hit-gated object radiance only (NRD keeps sky out of the
+// denoiser), so the display must composite mix(backdrop, denoised, coverage)
+// to recover the AA the jitter paid for — otherwise silhouettes are hard,
+// object-dilated edges instead of the raw path trace's soft coverage blend.
+@group(2) @binding(7) var backdrop_out: texture_storage_2d<rgba32float, write>;
 
 // CMF-project a per-wavelength contribution vector to RGB
 fn project_spectral(f: vec4f, rgb_and_phases: array<vec4f, WAVELENGTH_SAMPLE_COUNT>) -> vec3f {
@@ -1111,12 +1117,13 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     let radiance = path_trace(ray, global_id.xy, &seed, &iterations, &pa, &pn, &pd, &pm, &phit, &pspec, &phd);
 
     // Accumulate the G-buffer + demodulated diffuse irradiance + separated
-    // specular over jittered frames -> stable, anti-aliased values (reset when
-    // frame_index == 0, same as the radiance sum). Stride 4 vec4/pixel.
-    let gi = 4u * (global_id.y * dims.x + global_id.x);
-    var nsum = vec4f(0.0); var dsum = vec4f(0.0); var isum = vec4f(0.0); var ssum = vec4f(0.0);
+    // specular + miss-side backdrop over jittered frames -> stable,
+    // anti-aliased values (reset when frame_index == 0, same as the radiance
+    // sum). Stride 5 vec4/pixel.
+    let gi = 5u * (global_id.y * dims.x + global_id.x);
+    var nsum = vec4f(0.0); var dsum = vec4f(0.0); var isum = vec4f(0.0); var ssum = vec4f(0.0); var msum = vec4f(0.0);
     if (input.frame_index > 0u) {
-        nsum = gbuffer_accum[gi]; dsum = gbuffer_accum[gi + 1u]; isum = gbuffer_accum[gi + 2u]; ssum = gbuffer_accum[gi + 3u];
+        nsum = gbuffer_accum[gi]; dsum = gbuffer_accum[gi + 1u]; isum = gbuffer_accum[gi + 2u]; ssum = gbuffer_accum[gi + 3u]; msum = gbuffer_accum[gi + 4u];
     }
     // Accumulate diffuse irradiance + specular ONLY on frames that HIT the
     // surface. A silhouette pixel is sticky-object but the jittered ray
@@ -1124,13 +1131,12 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     // object's illum is what made the edge flip object/backdrop. Gating by
     // hit gives each object pixel the stable average of its OWN irradiance
     // (radiance is DIFFUSE here, so the demod by albedo stays clean).
+    // Majority-vote the pixel's material id (Boyer-Moore, counter in
+    // dsum.w). The old last-writer-wins id FLIPPED at model-ground
+    // silhouettes in step with the jitter (rays alternately hit each
+    // surface), so the resolve remod alternated blue/white albedo —
+    // the per-frame edge flicker. The majority id is stable.
     if (phit) {
-        nsum += vec4f(pn, 1.0); dsum.x += pd; dsum.z += phd;
-        // Majority-vote the pixel's material id (Boyer-Moore, counter in
-        // dsum.w). The old last-writer-wins id FLIPPED at model-ground
-        // silhouettes in step with the jitter (rays alternately hit each
-        // surface), so the resolve remod alternated blue/white albedo —
-        // the per-frame edge flicker. The majority id is stable.
         if (dsum.w < 0.5) {
             dsum.y = f32(pm); dsum.w = 1.0;
         } else if (u32(dsum.y) == pm) {
@@ -1138,13 +1144,29 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
         } else {
             dsum.w -= 1.0;
         }
+    }
+    if (phit && u32(dsum.y) == pm) {
+        // Majority-surface hits: the denoised signal proper
+        nsum += vec4f(pn, 1.0); dsum.x += pd; dsum.z += phd;
         isum += vec4f(radiance / max(pa, vec3f(0.02)), 1.0);
         ssum += vec4f(pspec, 1.0);
+    } else {
+        // Everything that is NOT the pixel's majority surface — backdrop
+        // misses AND minority-material hits — accumulates as plain display
+        // radiance and re-enters at the display's coverage composition.
+        // This is where the jitter's anti-aliasing lives: gating it out of
+        // the denoised signal but compositing it back keeps BOTH kinds of
+        // silhouette (object/backdrop and model/ground) as soft as the raw
+        // path trace, and keeps minority irradiance from polluting the
+        // majority's albedo remodulation (the green edge fringe).
+        msum += vec4f(radiance + pspec, 1.0);
     }
     gbuffer_accum[gi] = nsum;
     gbuffer_accum[gi + 1u] = dsum;
     gbuffer_accum[gi + 2u] = isum;
     gbuffer_accum[gi + 3u] = ssum;
+    gbuffer_accum[gi + 4u] = msum;
+    textureStore(backdrop_out, global_id.xy, vec4f(msum.rgb / max(msum.w, 1.0), 1.0));
     if (nsum.w > 0.5) {
         let navg = normalize(nsum.xyz);
         let davg = dsum.x / nsum.w;
@@ -1159,11 +1181,14 @@ fn computeMain(@builtin(global_invocation_id) global_id: vec3u) {
     // radiance (demod_albedo = 1 for a miss, so no remod), which the
     // denoiser's miss branch accumulates in place.
     if (nsum.w > 0.5) {
-        textureStore(illum_out, global_id.xy, vec4f(isum.rgb / max(isum.w, 1.0), 1.0));
+        // illum alpha = COVERAGE: the fraction of jittered frames whose ray
+        // hit the object — the AA weight the display composites with
+        let coverage = nsum.w / f32(input.frame_index + 1u);
+        textureStore(illum_out, global_id.xy, vec4f(isum.rgb / max(isum.w, 1.0), coverage));
         textureStore(spec_out, global_id.xy, vec4f(ssum.rgb / max(ssum.w, 1.0), 1.0));
         textureStore(hitdist_out, global_id.xy, vec4f(dsum.z / nsum.w, 0.0, 0.0, 0.0));
     } else {
-        textureStore(illum_out, global_id.xy, vec4f(radiance, 1.0));
+        textureStore(illum_out, global_id.xy, vec4f(radiance, 0.0));
         textureStore(spec_out, global_id.xy, vec4f(0.0, 0.0, 0.0, 1.0));
         textureStore(hitdist_out, global_id.xy, vec4f(HITDIST_CAP, 0.0, 0.0, 0.0));
     }
