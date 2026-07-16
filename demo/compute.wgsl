@@ -76,12 +76,17 @@ fn intersect_picovdb(
     var accessor: PicoVDBReadAccessor;
     picovdbReadAccessorInit(&accessor, grid_index);
 
-    // Inside Check (Works even if camera is in background space)
-    let start_val = picovdbSampleTrilinear(&accessor, grid, ray.origin);
-    if start_val < 0.0 {
-        *hit_distance = tmin;
-        *hit_normal = -ray.direction;
-        return true;
+    // Inside Check (Works even if camera is in background space).
+    // Only probe when the origin is within grid bounds — outside them the
+    // origin can't be inside the surface, and the probe would pay 8 root
+    // lookups for nothing. A single voxel's sign is enough; no trilinear.
+    if (all(ray.origin >= vec3f(grid.indexBoundsMin)) && all(ray.origin < vec3f(grid.indexBoundsMax + vec3i(1)))) {
+        let res = picovdbReadAccessorGetLevelIndex(&accessor, vec3i(floor(ray.origin)), grid);
+        if (picovdbGetValue(grid, res.index) < 0.0) {
+            *hit_distance = tmin;
+            *hit_normal = -ray.direction;
+            return true;
+        }
     }
 
     return picovdbHDDAZeroCrossing(
@@ -160,6 +165,40 @@ fn intersect_scene(world_ray: Ray, iterations: ptr<function, u32>) -> Intersecti
     return min_hit;
 }
 
+// Occlusion query: any-hit semantics, returns at the first hit without
+// closest-hit bookkeeping (no distance sort, no normal transform).
+fn intersect_scene_shadow(world_ray: Ray) -> bool {
+    for (var i = 0i; i < i32(arrayLength(&objects)); i++) {
+        let obj = objects[i];
+        let idx_origin = (obj.transform * vec4f(world_ray.origin, 1.0)).xyz;
+        let idx_direction = normalize((obj.transform * vec4f(world_ray.direction, 0.0)).xyz);
+        let index_ray = Ray(idx_origin, idx_direction);
+
+        switch obj.object_type {
+            case OBJECT_TYPE_VDB: {
+                let vdb_grid = picovdb_grids[obj.type_index];
+                if (vdb_grid.gridType != GRID_TYPE_FOG_FLOAT) {
+                    var accessor: PicoVDBReadAccessor;
+                    picovdbReadAccessorInit(&accessor, obj.type_index);
+                    if (picovdbHDDAZeroCrossingAnyHit(&accessor, vdb_grid, index_ray.origin, 0.0, index_ray.direction, 10000.0)) {
+                        return true;
+                    }
+                }
+            }
+            case OBJECT_TYPE_SDF: {
+                var hit_distance = MAX_DIST;
+                var hit_normal = vec3f(0);
+                var hit_iterations = 0u;
+                if (intersect_sdf(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations)) {
+                    return true;
+                }
+            }
+            case default: {}
+        }
+    }
+    return false;
+}
+
 fn generate_camera_ray(screen_coord: vec2f, screen_size: vec2f) -> Ray {
     // Convert to normalized coordinates [-1, 1k
     let uv = (screen_coord / screen_size) * 2.0 - 1.0;
@@ -200,12 +239,7 @@ fn traceShadowRay(origin: vec3f, normal: vec3f) -> f32 {
     // Offset origin slightly along normal to avoid self-intersection
     let shadowOrigin = origin + normal * 0.01;
     let shadowRay = Ray(shadowOrigin, skyState.sunDirection);
-    var iterations: u32;
-    let hit = intersect_scene(shadowRay, &iterations);
-    if hit.object_index >= 0 {
-        return 0.0;  // Fully shadowed
-    }
-    return 1.0;  // Fully lit
+    return select(1.0, 0.0, intersect_scene_shadow(shadowRay));
 }
 
 fn applyFog(color: vec3f, distance: f32, rayDir: vec3f, fogDensity: f32) -> vec3f {
@@ -434,6 +468,9 @@ struct SkyState {
     params: array<f32, 27>,
     skyRadiances: array<f32, 3>,
     solarRadiances: array<f32, 3>,
+    // Cosine-convolved sky irradiance as SH-2 polynomial coefficients
+    // (see demo/lib/sky_irradiance.ts). xyz = RGB, w unused.
+    irradianceSH: array<vec4f, 9>,
 }
 
 fn radiance(theta: f32, gamma: f32, channel: u32, includeSun: bool) -> f32 {
@@ -491,29 +528,17 @@ fn sunIrradiance() -> vec3f {
     ) * sunSolidAngle;
 }
 
+// Diffuse sky irradiance from SH-2 coefficients precomputed on the CPU
+// (Ramamoorthi & Hanrahan polynomial form, sun disk excluded).
 fn skyIrradiance(n: vec3f) -> vec3f {
-    var irradiance = vec3f(0.0);
-    let SAMPLE_COUNT = 16u;
-    
-    for (var i = 0u; i < SAMPLE_COUNT; i++) {
-        let xi = hammersley(i, SAMPLE_COUNT);
-        
-        // Cosine-weighted hemisphere sampling
-        let phi = 2.0 * PI * xi.x;
-        let cosTheta = sqrt(1.0 - xi.y);  // Cosine-weighted
-        let sinTheta = sqrt(xi.y);
-
-        // To world space
-        let up = select(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 0.0, 1.0), abs(n.z) < 0.999);
-        let tangent = normalize(cross(up, n));
-        let bitangent = cross(n, tangent);
-
-        let sampleDir = normalize(
-            tangent * cos(phi) * sinTheta +
-            bitangent * sin(phi) * sinTheta +
-            n * cosTheta
-        );
-        irradiance += skyRadianceRGB(sampleDir, false);
-    }
-    return irradiance * PI / f32(SAMPLE_COUNT);
+    let e = skyState.irradianceSH[0].xyz
+        + skyState.irradianceSH[1].xyz * n.y
+        + skyState.irradianceSH[2].xyz * n.z
+        + skyState.irradianceSH[3].xyz * n.x
+        + skyState.irradianceSH[4].xyz * (n.x * n.y)
+        + skyState.irradianceSH[5].xyz * (n.y * n.z)
+        + skyState.irradianceSH[6].xyz * (3.0 * n.z * n.z - 1.0)
+        + skyState.irradianceSH[7].xyz * (n.x * n.z)
+        + skyState.irradianceSH[8].xyz * (n.x * n.x - n.y * n.y);
+    return max(e, vec3f(0.0));
 }

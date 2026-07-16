@@ -179,6 +179,22 @@ fn picovdbReadAccessorFindUpperIndex(
     return -1; // Not found
 }
 
+// Value index for a bit within a leaf element.
+// Branchless: value -> base + local + preceding, else -> 0 or 1 (state)
+// At leaf level, ALL value voxels (both surface and non-surface) store values,
+// so we count all value bits (not value & ~state).
+fn picovdbLeafElementValueIndex(elem: PicoVDBNodeElement, baseActiveIndex: u32, bit_index: u32) -> u32 {
+    let bit = 1u << bit_index;
+    let is_value = (elem.valueMask & bit) != 0u;
+    let is_state = (elem.stateMask & bit) != 0u;
+    let preceding_mask = elem.valueMask & ((1u << bit_index) - 1u);
+    return select(
+        u32(is_state),
+        baseActiveIndex + (elem.packedLocalIndicies & 0xFFFFu) + countOneBits(preceding_mask),
+        is_value
+    );
+}
+
 fn picovdbReadAccessorLeafGetLevelIndexAndCache(
     acc: ptr<function, PicoVDBReadAccessor>,
     ijk: vec3i,
@@ -194,15 +210,7 @@ fn picovdbReadAccessorLeafGetLevelIndexAndCache(
     let is_value = (elem.valueMask & bit) != 0u;
     let is_state = (elem.stateMask & bit) != 0u;
 
-    // Branchless: value -> base + local + preceding, else -> 0 or 1 (state)
-    // At leaf level, ALL value voxels (both surface and non-surface) store values,
-    // so we count all value bits (not value & ~state).
-    let preceding_mask = elem.valueMask & ((1u << bit_index) - 1u);
-    let index = select(
-        u32(is_state),
-        (*leaf).baseActiveIndex + (elem.packedLocalIndicies & 0xFFFFu) + countOneBits(preceding_mask),
-        is_value
-    );
+    let index = picovdbLeafElementValueIndex(elem, (*leaf).baseActiveIndex, bit_index);
     (*acc).key = select((*acc).key, ijk, is_value);
     return PicoVDBLevelIndex(0u, index, is_value && is_state);
 }
@@ -378,21 +386,14 @@ fn picovdbHDDAUpdate(
 }
 
 fn picovdbHDDAStep(hdda: ptr<function, PicoVDBHDDA>) -> bool {
-    // Determine which axis has the nearest boundary
+    // Determine which axis has the nearest boundary.
     let next = (*hdda).next;
-    if (next.x <= next.y && next.x <= next.z) { // X is smallest
-        (*hdda).tmin = (*hdda).next.x;
-        (*hdda).next.x += (*hdda).delta.x;
-        (*hdda).voxel.x += (*hdda).dim * (*hdda).step.x;
-    } else if (next.y < next.z) { // Y is smallest
-        (*hdda).tmin = (*hdda).next.y;
-        (*hdda).next.y += (*hdda).delta.y;
-        (*hdda).voxel.y += (*hdda).dim * (*hdda).step.y;
-    } else { // Z is smallest
-        (*hdda).tmin = (*hdda).next.z;
-        (*hdda).next.z += (*hdda).delta.z;
-        (*hdda).voxel.z += (*hdda).dim * (*hdda).step.z;
-    }
+    let is_x = next.x <= next.y && next.x <= next.z;
+    let is_y = !is_x && next.y < next.z;
+    let mask = vec3<bool>(is_x, is_y, !is_x && !is_y);
+    (*hdda).tmin = select(select(next.z, next.y, is_y), next.x, is_x);
+    (*hdda).next += select(vec3f(0.0), (*hdda).delta, mask);
+    (*hdda).voxel += select(vec3i(0), vec3i((*hdda).dim) * (*hdda).step, mask);
     return (*hdda).tmin <= (*hdda).tmax;
 }
 
@@ -490,7 +491,6 @@ fn picovdbHDDAZeroCrossing(
     // Get initial hierarchy level
     let start_pos = origin + direction * tmin_mut;
     let res0 = picovdbReadAccessorGetLevelIndex(acc, vec3i(floor(start_pos)), grid);
-    let v0 = picovdbGetValue(grid, res0.index);
 
     var hdda: PicoVDBHDDA;
     picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
@@ -540,9 +540,72 @@ fn picovdbHDDAZeroCrossing(
     return false;
 }
 
+// Occlusion-only variant of picovdbHDDAZeroCrossing.
+fn picovdbHDDAZeroCrossingAnyHit(
+    acc: ptr<function, PicoVDBReadAccessor>,
+    grid: PicoVDBGrid,
+    origin: vec3f,
+    tmin: f32,
+    direction: vec3f,
+    tmax: f32,
+) -> bool {
+    let direction_inv = 1 / direction;
+    var tmin_mut = tmin;
+    var tmax_mut = tmax;
+    if (!picovdbHDDARayClip(vec3f(grid.indexBoundsMin), vec3f(grid.indexBoundsMax + vec3i(1)), origin, &tmin_mut, direction_inv, &tmax_mut)) {
+        return false;
+    }
+
+    // Get initial hierarchy level
+    let start_pos = origin + direction * tmin_mut;
+    let res0 = picovdbReadAccessorGetLevelIndex(acc, vec3i(floor(start_pos)), grid);
+
+    var hdda: PicoVDBHDDA;
+    picovdbHDDAInit(&hdda, origin, tmin_mut, direction, tmax_mut, direction_inv, picovdbDimForLevel[res0.level]);
+
+    for (var i = 0; i < 512; i++) { // Fixed loop limit for GPU safety
+        let result = picovdbReadAccessorGetLevelIndex(acc, hdda.voxel, grid);
+        let target_dim = picovdbDimForLevel[result.level];
+
+        // If hierarchy changed, update HDDA and re-read
+        if (hdda.dim != target_dim) {
+            picovdbHDDAUpdate(&hdda, origin, target_dim, direction, direction_inv);
+            continue; // Re-evaluate with the new aligned voxel
+        }
+
+        if (hdda.dim == 1 && result.isSurface) {
+            let stencil = picovdbSampleStencil(acc, grid, hdda.voxel);
+            let o_local = clamp(origin + direction * hdda.tmin - vec3f(hdda.voxel), vec3f(0.0), vec3f(1.0));
+            let t_exit = min(min(hdda.next.x, hdda.next.y), hdda.next.z) - hdda.tmin;
+            if (picovdbVoxelIntersect(o_local, direction, t_exit, stencil).hit) {
+                return true;
+            }
+        }
+        // Step to next boundary
+        if (!picovdbHDDAStep(&hdda)) {
+            break;
+        }
+    }
+    return false;
+}
+
 struct PicoVDBStencil {
     v000: f32, v001: f32, v010: f32, v011: f32,
     v100: f32, v101: f32, v110: f32, v111: f32,
+}
+
+// Values for the corner pair (ijk, ijk+z) within one leaf. Requires both
+// corners in the same leaf: then bit_index = (y&3)<<3 | z <= 30, so the two
+// bits always share an element word and one load serves both corners.
+fn picovdbLeafValuePairZ(grid: PicoVDBGrid, leafIndex: u32, ijk: vec3i) -> vec2f {
+    let n = picovdbLeafCoordToOffset(ijk);
+    let bit_index = n & 31u;
+    let elem = picovdb_leaves[leafIndex].elements[n >> 5u];
+    let base = picovdb_leaves[leafIndex].baseActiveIndex;
+    return vec2f(
+        picovdbGetValue(grid, picovdbLeafElementValueIndex(elem, base, bit_index)),
+        picovdbGetValue(grid, picovdbLeafElementValueIndex(elem, base, bit_index + 1u)),
+    );
 }
 
 // Sample 2x2x2 stencil of voxel values around a point
@@ -551,6 +614,21 @@ fn picovdbSampleStencil(
     grid: PicoVDBGrid,
     ijk: vec3i,
 ) -> PicoVDBStencil {
+    // Fast path: when no corner sits on a leaf max boundary (~67% of voxels),
+    // all 8 corners live in the accessor's cached leaf — read them directly,
+    // skipping the per-corner accessor descent (4 element loads for 8 corners).
+    let dirty = picovdbReadAccessorComputeDirty(acc, ijk);
+    if (all((ijk & vec3i(7)) != vec3i(7))
+        && (*acc).leaf != PICOVDB_INVALID_INDEX
+        && (dirty & ~0x7i) == 0) {
+        let leafIndex = grid.leafStart + (*acc).leaf;
+        let v00 = picovdbLeafValuePairZ(grid, leafIndex, ijk);
+        let v01 = picovdbLeafValuePairZ(grid, leafIndex, ijk + vec3i(0, 1, 0));
+        let v10 = picovdbLeafValuePairZ(grid, leafIndex, ijk + vec3i(1, 0, 0));
+        let v11 = picovdbLeafValuePairZ(grid, leafIndex, ijk + vec3i(1, 1, 0));
+        return PicoVDBStencil(v00.x, v00.y, v01.x, v01.y, v10.x, v10.y, v11.x, v11.y);
+    }
+
     var s: PicoVDBStencil;
     s.v000 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk, grid).index);
     s.v100 = picovdbGetValue(grid, picovdbReadAccessorGetLevelIndex(acc, ijk + vec3i(1, 0, 0), grid).index);
