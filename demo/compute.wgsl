@@ -72,7 +72,6 @@ fn intersect_picovdb(
     let tmin = 0.0;
     let tmax = 10000.0;
 
-    let grid = picovdb_grids[grid_index];
     var accessor: PicoVDBReadAccessor;
     picovdbReadAccessorInit(&accessor, grid_index);
 
@@ -80,9 +79,10 @@ fn intersect_picovdb(
     // Only probe when the origin is within grid bounds — outside them the
     // origin can't be inside the surface, and the probe would pay 8 root
     // lookups for nothing. A single voxel's sign is enough; no trilinear.
-    if (all(ray.origin >= vec3f(grid.indexBoundsMin)) && all(ray.origin < vec3f(grid.indexBoundsMax + vec3i(1)))) {
-        let res = picovdbReadAccessorGetLevelIndex(&accessor, vec3i(floor(ray.origin)), grid);
-        if (picovdbGetValue(grid, res.index) < 0.0) {
+    if (all(ray.origin >= vec3f(picovdb_grids[grid_index].indexBoundsMin))
+        && all(ray.origin < vec3f(picovdb_grids[grid_index].indexBoundsMax + vec3i(1)))) {
+        let res = picovdbReadAccessorGetLevelIndex(&accessor, vec3i(floor(ray.origin)));
+        if (picovdbGetValue(grid_index, res.index) < 0.0) {
             *hit_distance = tmin;
             *hit_normal = -ray.direction;
             return true;
@@ -90,7 +90,7 @@ fn intersect_picovdb(
     }
 
     return picovdbHDDAZeroCrossing(
-        &accessor, grid, ray.origin, tmin, ray.direction, tmax, input.pixel_radius, hit_distance, hit_normal, hit_iterations,
+        &accessor, ray.origin, tmin, ray.direction, tmax, input.pixel_radius, hit_distance, hit_normal, hit_iterations,
     );
 }
 
@@ -134,8 +134,7 @@ fn intersect_scene(world_ray: Ray, iterations: ptr<function, u32>) -> Intersecti
         switch obj.object_type {
             case OBJECT_TYPE_VDB: {
                 // Skip fog grids during surface intersection — they use volumetric marching instead
-                let vdb_grid = picovdb_grids[obj.type_index];
-                if (vdb_grid.gridType != GRID_TYPE_FOG_FLOAT) {
+                if (picovdb_grids[obj.type_index].gridType != GRID_TYPE_FOG_FLOAT) {
                     hit = intersect_picovdb(index_ray, obj.type_index, &hit_distance, &hit_normal, &hit_iterations);
                 }
             }
@@ -176,11 +175,10 @@ fn intersect_scene_shadow(world_ray: Ray) -> bool {
 
         switch obj.object_type {
             case OBJECT_TYPE_VDB: {
-                let vdb_grid = picovdb_grids[obj.type_index];
-                if (vdb_grid.gridType != GRID_TYPE_FOG_FLOAT) {
+                if (picovdb_grids[obj.type_index].gridType != GRID_TYPE_FOG_FLOAT) {
                     var accessor: PicoVDBReadAccessor;
                     picovdbReadAccessorInit(&accessor, obj.type_index);
-                    if (picovdbHDDAZeroCrossingAnyHit(&accessor, vdb_grid, index_ray.origin, 0.0, index_ray.direction, 10000.0)) {
+                    if (picovdbHDDAZeroCrossingAnyHit(&accessor, index_ray.origin, 0.0, index_ray.direction, 10000.0)) {
                         return true;
                     }
                 }
