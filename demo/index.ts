@@ -15,6 +15,7 @@ const models: ModelConfig[] = [
   { name: 'Dragon u8', url: `${MODEL_BASE}dragon.u8.pvdb.gz`, translation: [0, 80, 0], scale: 240 },
   //{ name: 'Smoke', url: `${MODEL_BASE}smoke.pvdb.gz`, translation: [0, 0, 0], scale: 60 },
   { name: 'Sphere', url: `${MODEL_BASE}sphere.pvdb.gz`, translation: [0, 0, 0], scale: 30 },
+  //{ name: 'Skeleton', url: `${MODEL_BASE}skeleton.pvdb.gz`, translation: [0, 240, 0], scale: 120 },
 ];
 
 const modelParam = new URLSearchParams(window.location.search).get('model');
@@ -22,6 +23,7 @@ const initialModel = models.find(m => m.url.endsWith('/' + modelParam)) ?? model
 
 const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models, initialModel.name);
 import { createSkyState } from "./lib/hw_skymodel";
+import { computeSkyIrradianceSH } from "./lib/sky_irradiance";
 import { TimestampQueryManager } from './lib/TimestampQueryManager';
 import { Stats } from './lib/Stats';
 
@@ -430,7 +432,7 @@ const skyState = createSkyState({
   turbidity: 2.0,
   albedo: [0.3, 0.3, 0.3],
 })
-const skyStateData = new ArrayBuffer(144);
+const skyStateData = new ArrayBuffer(288);
 const skyStateBuffer = device.createBuffer({
   label: 'SkyState',
   size: skyStateData.byteLength,
@@ -441,11 +443,13 @@ const skyStateView = {
   params: new Float32Array(skyStateData, 12, 27),
   skyRadiances: new Float32Array(skyStateData, 120, 3),
   solarRadiances: new Float32Array(skyStateData, 132, 3),
+  irradianceSH: new Float32Array(skyStateData, 144, 36),
 };
 skyStateView.sunDirection.set(sunDirection);
 skyStateView.params.set(skyState.params);
 skyStateView.skyRadiances.set(skyState.skyRadiances);
 skyStateView.solarRadiances.set(skyState.solarRadiances);
+skyStateView.irradianceSH.set(computeSkyIrradianceSH(skyState, sunDirection));
 console.log("SKY STATE", skyState);
 device.queue.writeBuffer(skyStateBuffer, 0, skyStateData);
 
