@@ -158,7 +158,8 @@ fn picovdbLeafCoordToOffset(ijk: vec3i) -> u32 {
 
 
 // Find root/upper index for coordinate within grid bounds.
-// Roots are 1:1 with uppers, so the returned index works for both.
+// Returns the grid-relative index (roots are 1:1 with uppers, so it works for
+// both), matching the grid-relative indices cached in the accessor.
 fn picovdbReadAccessorFindUpperIndex(
     ijk: vec3i,
     gridIndex: u32,
@@ -173,7 +174,7 @@ fn picovdbReadAccessorFindUpperIndex(
     for (var i = startIndex; i < endIndex; i++) {
         let root = picovdb_roots[i];
         if (coordKey.x == root.key.x && coordKey.y == root.key.y) {
-            return i32(i);
+            return i32(i - startIndex);
         }
     }
     return -1; // Not found

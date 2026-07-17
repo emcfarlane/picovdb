@@ -4,9 +4,17 @@ const std = @import("std");
 // Include tests from picovdb.zig
 test {
     std.testing.refAllDecls(@import("picovdb.zig"));
+    std.testing.refAllDecls(@import("stl.zig"));
+    std.testing.refAllDecls(@import("mesh2ls.zig"));
 }
 
 const picovdb = @import("picovdb.zig");
+
+// STL mesh parsing
+pub const stl = @import("stl.zig");
+
+// Mesh -> narrow-band SDF -> PicoVDB conversion
+pub const mesh2ls = @import("mesh2ls.zig");
 
 // Re-export PicoVDB structures from picovdb.zig
 pub const PicoVDBGrid = picovdb.PicoVDBGrid;
