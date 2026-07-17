@@ -136,6 +136,8 @@ pub fn main(init: std.process.Init) !void {
         }
 
         try processConversion(init.io, init.gpa, src_path, dst_path, value_type);
+    } else if (std.mem.eql(u8, command, "mesh")) {
+        try meshCommand(init.io, init.gpa, args[2..]);
     } else {
         std.debug.print("Error: Unknown command '{s}'\n", .{command});
         try printUsage();
@@ -146,6 +148,153 @@ fn printUsage() !void {
     std.debug.print("Usage: picovdb <command> [args]\n", .{});
     std.debug.print("\nCommands:\n", .{});
     std.debug.print("  convert [--type f32|u8] <src>.nvdb <dst>.pvdb    Convert NanoVDB file to PicoVDB format\n", .{});
+    std.debug.print("  mesh --voxel <size> [--width <hw>] [--rotate-x|y|z <deg>]... [--type f32|u8] <src>.stl <dst>.pvdb\n", .{});
+    std.debug.print("                                                   Voxelize an STL mesh to a PicoVDB level set\n", .{});
+    std.debug.print("                                                   (rotations apply in command-line order)\n", .{});
+}
+
+fn meshCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
+    const Rotation = struct { axis: picovdb.stl.Axis, degrees: f32 };
+    var voxel_size: ?f32 = null;
+    var half_width: f32 = picovdb.LEVEL_SET_HALF_WIDTH;
+    var rotations: std.ArrayList(Rotation) = .empty;
+    defer rotations.deinit(allocator);
+    var value_type: picovdb.mesh2ls.ValueType = .f32;
+    var positional: [2]?[]const u8 = .{ null, null };
+    var positional_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--voxel") or std.mem.eql(u8, arg, "--width") or
+            std.mem.eql(u8, arg, "--rotate-x") or std.mem.eql(u8, arg, "--rotate-y") or
+            std.mem.eql(u8, arg, "--rotate-z") or std.mem.eql(u8, arg, "--type"))
+        {
+            i += 1;
+            if (i >= args.len) {
+                std.debug.print("Error: {s} requires a value\n", .{arg});
+                return;
+            }
+            const value = args[i];
+            if (std.mem.eql(u8, arg, "--type")) {
+                if (std.mem.eql(u8, value, "f32")) {
+                    value_type = .f32;
+                } else if (std.mem.eql(u8, value, "u8")) {
+                    value_type = .u8;
+                } else {
+                    std.debug.print("Error: Unknown type '{s}'. Use 'f32' or 'u8'\n", .{value});
+                    return;
+                }
+                continue;
+            }
+            const parsed = std.fmt.parseFloat(f32, value) catch {
+                std.debug.print("Error: Invalid number '{s}' for {s}\n", .{ value, arg });
+                return;
+            };
+            if (std.mem.eql(u8, arg, "--voxel")) {
+                voxel_size = parsed;
+            } else if (std.mem.eql(u8, arg, "--width")) {
+                half_width = parsed;
+            } else {
+                const axis: picovdb.stl.Axis = switch (arg[arg.len - 1]) {
+                    'x' => .x,
+                    'y' => .y,
+                    else => .z,
+                };
+                try rotations.append(allocator, .{ .axis = axis, .degrees = parsed });
+            }
+        } else if (std.mem.startsWith(u8, arg, "--")) {
+            std.debug.print("Error: Unknown flag '{s}'\n", .{arg});
+            return;
+        } else {
+            if (positional_count >= 2) {
+                std.debug.print("Error: Too many arguments\n", .{});
+                try printUsage();
+                return;
+            }
+            positional[positional_count] = arg;
+            positional_count += 1;
+        }
+    }
+
+    if (positional_count != 2 or voxel_size == null) {
+        std.debug.print("Error: mesh command requires --voxel <size> plus <src>.stl <dst>.pvdb\n", .{});
+        try printUsage();
+        return;
+    }
+    if (voxel_size.? <= 0) {
+        std.debug.print("Error: --voxel must be > 0\n", .{});
+        return;
+    }
+    const src_path = positional[0].?;
+    const dst_path = positional[1].?;
+    if (!std.mem.endsWith(u8, src_path, ".stl")) {
+        std.debug.print("Error: Source file must have .stl extension\n", .{});
+        return;
+    }
+    if (!std.mem.endsWith(u8, dst_path, ".pvdb")) {
+        std.debug.print("Error: Destination file must have .pvdb extension\n", .{});
+        return;
+    }
+
+    std.debug.print("Voxelizing '{s}' to '{s}' (voxel: {d}, width: {d}, type: {s})...\n", .{ src_path, dst_path, voxel_size.?, half_width, @tagName(value_type) });
+
+    const cwd = std.Io.Dir.cwd();
+    const src_file = cwd.openFile(io, src_path, .{}) catch |err| {
+        std.debug.print("Error: Could not open source file '{s}': {}\n", .{ src_path, err });
+        return;
+    };
+    defer src_file.close(io);
+
+    const src_stat = try src_file.stat(io);
+    const file_buffer = try allocator.alloc(u8, src_stat.size);
+    defer allocator.free(file_buffer);
+    _ = try src_file.readPositionalAll(io, file_buffer, 0);
+
+    var mesh = picovdb.stl.parse(allocator, file_buffer) catch |err| {
+        std.debug.print("Error: Failed to parse STL: {}\n", .{err});
+        return;
+    };
+    defer mesh.deinit(allocator);
+
+    const b = mesh.bounds();
+    std.debug.print("Mesh: {} triangles, {} vertices, bounds [{d:.3}, {d:.3}, {d:.3}] to [{d:.3}, {d:.3}, {d:.3}]\n", .{
+        mesh.triangleCount(), mesh.vertexCount(), b[0][0], b[0][1], b[0][2], b[1][0], b[1][1], b[1][2],
+    });
+
+    // Rotations apply in command-line order.
+    for (rotations.items) |rotation| {
+        std.debug.print("Rotating mesh {d} degrees about {s}\n", .{ rotation.degrees, @tagName(rotation.axis) });
+        mesh.rotate(rotation.axis, rotation.degrees * std.math.pi / 180.0);
+    }
+
+    var picovdb_file = picovdb.PicoVDBFileMutable.init();
+    defer picovdb_file.deinit(allocator);
+
+    const stats = picovdb.mesh2ls.meshToPicoVDB(allocator, &picovdb_file, mesh.vertices, mesh.triangles, .{
+        .voxel_size = voxel_size.?,
+        .half_width = half_width,
+        .value_type = value_type,
+    }) catch |err| {
+        std.debug.print("Error: Mesh conversion failed: {}\n", .{err});
+        return;
+    };
+
+    const res = [3]i32{
+        stats.index_bounds_max[0] - stats.index_bounds_min[0] + 1,
+        stats.index_bounds_max[1] - stats.index_bounds_min[1] + 1,
+        stats.index_bounds_max[2] - stats.index_bounds_min[2] + 1,
+    };
+    std.debug.print("Voxelized: resolution {}x{}x{}, {} active voxels, {} surface voxels\n", .{
+        res[0], res[1], res[2], stats.active_voxels, stats.surface_voxels,
+    });
+    std.debug.print("Tree: {} uppers, {} lowers, {} leaves\n", .{ stats.upper_count, stats.lower_count, stats.leaf_count });
+    std.debug.print("Index bbox: [{}, {}, {}] to [{}, {}, {}]\n", .{
+        stats.index_bounds_min[0], stats.index_bounds_min[1], stats.index_bounds_min[2],
+        stats.index_bounds_max[0], stats.index_bounds_max[1], stats.index_bounds_max[2],
+    });
+
+    try writePicoVDBFile(io, dst_path, &picovdb_file);
 }
 
 fn processConversion(io: std.Io, allocator: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, value_type: ValueType) !void {
@@ -195,12 +344,12 @@ fn convertNanoVDBToPicoVDB(allocator: std.mem.Allocator, buffer: []const u8, pic
         var offset: usize = 16;
         for (0..file_header_ptr.grid_count) |grid_index| {
             std.debug.print("Converting grid {}...\n", .{grid_index});
-            offset = try convertGridWithMetadata(allocator, buffer, offset, picovdb_file, @intCast(grid_index), value_type);
+            offset = try convertGridWithMetadata(allocator, buffer, offset, picovdb_file, value_type);
         }
     } else if (file_header_ptr.magic == c.PNANOVDB_MAGIC_GRID) {
         // Single grid format (no metadata, assume level set)
         std.debug.print("Converting single grid...\n", .{});
-        _ = try convertGrid(allocator, buffer, 0, picovdb_file, 0, value_type, false);
+        _ = try convertGrid(allocator, buffer, 0, picovdb_file, value_type, false);
     }
 
     // Calculate total active voxels we extracted
@@ -291,7 +440,7 @@ fn convertUpperNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
     // Base offsets at the start of this node (grid-relative)
     const base_child_offset: u32 = @intCast(picovdb_file.lowers.items.len - picovdb_grid.lower_start);
     const data_elem_size = value_type.elemSize();
-    const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
+    const base_value_offset: u32 = @intCast((picovdb_file.data_buffer.items.len - picovdb_grid.data_start * 16) / data_elem_size);
 
     // Cumulative local counts within this node
     var local_state_count: u32 = 0; // (value & state) = children
@@ -376,7 +525,7 @@ fn convertLowerNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf
     // Base offsets at the start of this node (grid-relative)
     const base_child_offset: u32 = @intCast(picovdb_file.leaves.items.len - picovdb_grid.leaf_start);
     const data_elem_size = value_type.elemSize();
-    const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
+    const base_value_offset: u32 = @intCast((picovdb_file.data_buffer.items.len - picovdb_grid.data_start * 16) / data_elem_size);
 
     var local_state_count: u32 = 0;
     var local_value_count: u32 = 0;
@@ -560,7 +709,7 @@ fn convertLeafNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_
 
     // Phase 3: Build elements and write values
     const data_elem_size = value_type.elemSize();
-    const base_value_offset: u32 = @intCast(picovdb_file.data_buffer.items.len / data_elem_size - picovdb_grid.data_start * 16);
+    const base_value_offset: u32 = @intCast((picovdb_file.data_buffer.items.len - picovdb_grid.data_start * 16) / data_elem_size);
 
     var local_value_count: u32 = 0;
     var local_state_count: u32 = 0;
@@ -595,7 +744,7 @@ fn convertLeafNodesFromHandle(allocator: std.mem.Allocator, buf: c.pnanovdb_buf_
     try picovdb_file.leaves.append(allocator, pico_leaf);
 }
 
-fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, picovdb_file: *picovdb.PicoVDBFileMutable, grid_index: u32, value_type: ValueType, is_fog: bool) !usize {
+fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, picovdb_file: *picovdb.PicoVDBFileMutable, value_type: ValueType, is_fog: bool) !usize {
     // Copy remaining buffer from grid offset to end into aligned buffer
     const remaining_len = buffer.len - offset;
     const aligned_len = std.mem.alignForward(usize, remaining_len, @alignOf(c.pnanovdb_grid_t));
@@ -651,7 +800,9 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
 
     // Create PicoVDB grid
     var picovdb_grid = picovdb.PicoVDBGrid{
-        .grid_index = grid_index,
+        // The accessor resolves a grid's root-tile range via grids[grid_index + 1],
+        // so this must be the position in the output grids array.
+        .grid_index = @intCast(picovdb_file.grids.items.len),
         .upper_start = @intCast(picovdb_file.uppers.items.len), // Current upper array length (= root start)
         .lower_start = @intCast(picovdb_file.lowers.items.len), // Current lower array length
         .leaf_start = @intCast(picovdb_file.leaves.items.len), // Current leaf array length
@@ -717,7 +868,7 @@ fn convertGrid(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, 
 // NanoVDB grid class constants (from PNanoVDB.h)
 const PNANOVDB_GRID_CLASS_FOG_VOLUME = 2;
 
-fn convertGridWithMetadata(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, picovdb_file: *picovdb.PicoVDBFileMutable, grid_index: u32, value_type: ValueType) !usize {
+fn convertGridWithMetadata(allocator: std.mem.Allocator, buffer: []const u8, offset: usize, picovdb_file: *picovdb.PicoVDBFileMutable, value_type: ValueType) !usize {
     if (buffer.len < offset + @sizeOf(NanoVDBFileMetaData)) {
         return error.BufferTooSmall;
     }
@@ -732,7 +883,7 @@ fn convertGridWithMetadata(allocator: std.mem.Allocator, buffer: []const u8, off
     std.debug.print("  Skipping metadata ({} bytes) + name ({} bytes)\n", .{ @sizeOf(NanoVDBFileMetaData), metadata_ptr.name_size });
 
     // Convert the grid using unified grid parsing - grid will determine its own size
-    return try convertGrid(allocator, buffer, grid_offset, picovdb_file, grid_index, value_type, is_fog);
+    return try convertGrid(allocator, buffer, grid_offset, picovdb_file, value_type, is_fog);
 }
 
 fn writePicoVDBFile(io: std.Io, dst_path: []const u8, picovdb_file: *picovdb.PicoVDBFileMutable) !void {
@@ -996,6 +1147,59 @@ test "read accessor integration with data files" {
             }
         }
         try std.testing.expectEqual(total_tests, matches);
+    }
+}
+
+test "multi-grid file: second grid reads identically to the first" {
+    const allocator = std.testing.allocator;
+
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+    const file = try cwd.openFile(io, "data/sphere.nvdb", .{});
+    defer file.close(io);
+
+    const file_size = (try file.stat(io)).size;
+    const nvdb_buffer = try allocator.alloc(u8, std.mem.alignForward(usize, file_size, 4));
+    defer allocator.free(nvdb_buffer);
+    _ = try file.readPositionalAll(io, nvdb_buffer, 0);
+
+    // Convert the same source twice into one file: the second grid gets a
+    // non-zero data_start, exercising the grid-relative value offsets.
+    var picovdb_file_mutable = picovdb.PicoVDBFileMutable.init();
+    defer picovdb_file_mutable.deinit(allocator);
+    try convertNanoVDBToPicoVDB(allocator, nvdb_buffer, &picovdb_file_mutable, .f32);
+    try convertNanoVDBToPicoVDB(allocator, nvdb_buffer, &picovdb_file_mutable, .f32);
+
+    const picovdb_buffer = try picovdb_file_mutable.encode(allocator);
+    defer allocator.free(picovdb_buffer);
+    const picovdb_file = try picovdb.PicoVDBFile.fromBytes(picovdb_buffer);
+
+    try std.testing.expectEqual(@as(u32, 2), picovdb_file.header.grid_count);
+    const grid0 = &picovdb_file.grids[0];
+    const grid1 = &picovdb_file.grids[1];
+    try std.testing.expectEqual(@as(u32, 0), grid0.grid_index);
+    try std.testing.expectEqual(@as(u32, 1), grid1.grid_index);
+    try std.testing.expect(grid1.data_start > 0);
+    try std.testing.expect(grid1.upper_start > grid0.upper_start);
+
+    // Identical source grids must produce identical values at every coord.
+    var acc0 = picovdb.PicoVDBReadAccessor.init(0);
+    var acc1 = picovdb.PicoVDBReadAccessor.init(1);
+    var x: i32 = -65;
+    while (x <= 65) : (x += 5) {
+        var y: i32 = -65;
+        while (y <= 65) : (y += 5) {
+            var z: i32 = -65;
+            while (z <= 65) : (z += 1) {
+                const coord = [3]i32{ x, y, z };
+                const r0 = acc0.getLevelIndex(coord, grid0, &picovdb_file);
+                const r1 = acc1.getLevelIndex(coord, grid1, &picovdb_file);
+                try std.testing.expectEqual(r0.level, r1.level);
+                const v0 = picovdb_file.getGridFloat(grid0, r0.index);
+                const v1 = picovdb_file.getGridFloat(grid1, r1.index);
+                try std.testing.expectEqual(v0, v1);
+            }
+        }
     }
 }
 

@@ -20,6 +20,7 @@ This repository includes:
 - `picovdb.wgsl` - WGSL shader library
 - `picovdb.ts` - TypeScript loader
 - `src/main.zig` - NanoVDB → PicoVDB converter
+- `src/stl.zig`, `src/mesh2ls.zig` - STL mesh → PicoVDB level set voxelizer
 
 ## How It Works
 
@@ -64,7 +65,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
 zig build
 
 # Convert NanoVDB to PicoVDB
-./zig-out/bin/picovdb input.nvdb output.pvdb
+./zig-out/bin/picovdb convert input.nvdb output.pvdb
+
+# Voxelize an STL mesh directly to a PicoVDB level set (no OpenVDB required).
+# --voxel is the voxel size in mesh units; repeatable --rotate-x|y|z flags
+# apply in command-line order (e.g. -90 about X re-orients Z-up meshes to Y-up).
+./zig-out/bin/picovdb mesh --voxel 0.05 --rotate-x -90 input.stl output.pvdb
 ```
 
 ## Related Projects

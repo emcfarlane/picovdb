@@ -193,7 +193,8 @@ pub const PicoVDBReadAccessor = extern struct {
     }
 
     // Find upper/root index for coordinate within current grid bounds.
-    // Roots are 1:1 with uppers, so the returned index works for both.
+    // Returns the grid-relative index (roots are 1:1 with uppers, so it works
+    // for both), matching the grid-relative indices cached in the accessor.
     fn findUpperIndex(ijk: [3]i32, grid: *const PicoVDBGrid, picovdb_file: *const PicoVDBFile) ?u32 {
         const coord_key = coordToKey(ijk);
 
@@ -209,7 +210,7 @@ pub const PicoVDBReadAccessor = extern struct {
         while (i < end_index) : (i += 1) {
             const root = &picovdb_file.roots[i];
             if (coord_key[0] == root.key[0] and coord_key[1] == root.key[1]) {
-                return i;
+                return i - start_index;
             }
         }
         return null; // No matching root tile found
