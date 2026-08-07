@@ -4,6 +4,7 @@
   "type": "module",
   "exports": {
     ".": "./picovdb.ts",
+    "./stl": "./stl.ts",
     "./picovdb.wgsl": "./picovdb.wgsl"
   },
   "scripts": {
