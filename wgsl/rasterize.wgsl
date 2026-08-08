@@ -1,11 +1,13 @@
 // Mesh-to-grid stage 2: exact narrow-band distances. One workgroup per
-// (leaf, triangle) pair from mesh_to_grid.wgsl binning; each thread covers
-// two of the leaf's 512 voxels, computes the squared point-to-triangle
-// distance at the voxel center, and atomicMin-updates the leaf's value slab.
+// leaf walks its contiguous run of (leaf, triangle) pairs (the pair list
+// is sorted by leaf key), each thread covering two of the 512 voxels, and
+// accumulates the minimum squared point-to-triangle distance in a
+// workgroup-memory slab written back with plain stores — the workgroup
+// owns its leaf, so no global atomics and no per-thread slot searches.
 //
 // Distances are non-negative, so the u32 bit pattern of f32 d^2 orders
 // identically to the float value and atomicMin on the bitcast is an exact
-// float min. Slabs are initialized to +inf bits by init_values.
+// float min.
 //
 // The distance function mirrors distSqPointTriangle in src/mesh_to_grid.zig
 // (Ericson closest-point-on-triangle) with an explicit summation order; the
@@ -27,21 +29,10 @@ struct RasterParams {
 @group(0) @binding(3) var<storage, read> pair_keys: array<u32>;
 @group(0) @binding(4) var<storage, read> pair_tris: array<u32>;
 @group(0) @binding(5) var<storage, read> leaf_keys: array<u32>;
-@group(0) @binding(6) var<storage, read_write> leaf_values: array<atomic<u32>>;
+@group(0) @binding(6) var<storage, read_write> leaf_values: array<u32>;
 
 const INF_BITS: u32 = 0x7f800000u;
 const DISPATCH_STRIDE: u32 = 65535u;
-
-@compute @workgroup_size(256)
-fn init_values(
-    @builtin(workgroup_id) wid: vec3<u32>,
-    @builtin(local_invocation_id) lid: vec3<u32>,
-) {
-    let i = (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
-    if (i < (params.leaf_count * 512u)) {
-        atomicStore(&leaf_values[i], INF_BITS);
-    }
-}
 
 fn dot3(a: vec3<f32>, b: vec3<f32>) -> f32 {
     return ((a.x * b.x) + (a.y * b.y)) + (a.z * b.z);
@@ -127,54 +118,62 @@ fn loadPoint(i: u32) -> vec3<f32> {
     return vec3<f32>(points_index[i * 3u], points_index[(i * 3u) + 1u], points_index[(i * 3u) + 2u]);
 }
 
-fn leafSlot(key: u32) -> u32 {
-    var lo = 0u;
-    var hi = params.leaf_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (leaf_keys[mid] < key) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    return lo;
-}
+var<workgroup> slab: array<atomic<u32>, 512>;
 
 @compute @workgroup_size(256)
 fn rasterize(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let pair = (wid.y * DISPATCH_STRIDE) + wid.x;
-    if (pair >= params.pair_count) {
+    let i = (wid.y * DISPATCH_STRIDE) + wid.x;
+    if (i >= params.leaf_count) {
         return;
     }
-    let t = pair_tris[pair];
-    let a = loadPoint(triangles[t * 3u]);
-    let b = loadPoint(triangles[(t * 3u) + 1u]);
-    let c = loadPoint(triangles[(t * 3u) + 2u]);
+    let key = leaf_keys[i];
+    let leaf = vec3<i32>(i32(key >> 20u), i32((key >> 10u) & 0x3ffu), i32(key & 0x3ffu)) + params.leaf_min;
+    let origin = leaf << vec3<u32>(3u);
+
+    atomicStore(&slab[lid.x], INF_BITS);
+    atomicStore(&slab[lid.x + 256u], INF_BITS);
+    workgroupBarrier();
+
+    // This leaf's contiguous run in the key-sorted pair list.
+    var lo = 0u;
+    var hi = params.pair_count;
+    while (lo < hi) {
+        let mid = (lo + hi) >> 1u;
+        if (pair_keys[mid] < key) {
+            lo = mid + 1u;
+        } else {
+            hi = mid;
+        }
+    }
 
     let hw = params.half_width;
     let hw2 = hw * hw;
-    let lo_v = vec3<i32>(ceil(min(a, min(b, c)) - vec3<f32>(hw)));
-    let hi_v = vec3<i32>(floor(max(a, max(b, c)) + vec3<f32>(hw)));
+    for (var p = lo; p < params.pair_count && pair_keys[p] == key; p = p + 1u) {
+        let t = pair_tris[p];
+        let a = loadPoint(triangles[t * 3u]);
+        let b = loadPoint(triangles[(t * 3u) + 1u]);
+        let c = loadPoint(triangles[(t * 3u) + 2u]);
+        let lo_v = vec3<i32>(ceil(min(a, min(b, c)) - vec3<f32>(hw)));
+        let hi_v = vec3<i32>(floor(max(a, max(b, c)) + vec3<f32>(hw)));
 
-    let key = pair_keys[pair];
-    let leaf = vec3<i32>(i32(key >> 20u), i32((key >> 10u) & 0x3ffu), i32(key & 0x3ffu)) + params.leaf_min;
-    let origin = leaf << vec3<u32>(3u);
-    let base = leafSlot(key) * 512u;
-
-    for (var n = lid.x; n < 512u; n = n + 256u) {
-        // Voxel order matches picovdb leafCoordToOffset: (x << 6) | (y << 3) | z.
-        let local = vec3<i32>(i32(n >> 6u), i32((n >> 3u) & 7u), i32(n & 7u));
-        let ijk = origin + local;
-        if (any(ijk < lo_v) || any(ijk > hi_v)) {
-            continue;
-        }
-        let d2 = distSqPointTriangle(vec3<f32>(ijk), a, b, c);
-        if (d2 <= hw2) {
-            atomicMin(&leaf_values[base + n], bitcast<u32>(d2));
+        for (var n = lid.x; n < 512u; n = n + 256u) {
+            // Voxel order matches picovdb leafCoordToOffset: (x << 6) | (y << 3) | z.
+            let local = vec3<i32>(i32(n >> 6u), i32((n >> 3u) & 7u), i32(n & 7u));
+            let ijk = origin + local;
+            if (any(ijk < lo_v) || any(ijk > hi_v)) {
+                continue;
+            }
+            let d2 = distSqPointTriangle(vec3<f32>(ijk), a, b, c);
+            if (d2 <= hw2) {
+                atomicMin(&slab[n], bitcast<u32>(d2));
+            }
         }
     }
+
+    workgroupBarrier();
+    leaf_values[(i * 512u) + lid.x] = atomicLoad(&slab[lid.x]);
+    leaf_values[(i * 512u) + lid.x + 256u] = atomicLoad(&slab[lid.x + 256u]);
 }

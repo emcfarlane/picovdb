@@ -20,7 +20,6 @@ export interface RasterizeOptions {
 export class Rasterizer {
   readonly device: GPUDevice;
   readonly layout: GPUBindGroupLayout;
-  readonly initValues: GPUComputePipeline;
   readonly rasterizePipeline: GPUComputePipeline;
 
   constructor(device: GPUDevice) {
@@ -43,7 +42,6 @@ export class Rasterizer {
     });
     const module = device.createShaderModule({ code: rasterWgsl });
     const layout = device.createPipelineLayout({ bindGroupLayouts: [this.layout] });
-    this.initValues = device.createComputePipeline({ layout, compute: { module, entryPoint: 'init_values' } });
     this.rasterizePipeline = device.createComputePipeline({ layout, compute: { module, entryPoint: 'rasterize' } });
   }
 
@@ -77,10 +75,8 @@ export class Rasterizer {
     const encoder = device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setBindGroup(0, bindGroup);
-    pass.setPipeline(this.initValues);
-    dispatch2D(pass, Math.ceil((bin.leafCount * 512) / WG_SIZE));
     pass.setPipeline(this.rasterizePipeline);
-    dispatch2D(pass, bin.pairCount);
+    dispatch2D(pass, bin.leafCount);
     pass.end();
     device.queue.submit([encoder.finish()]);
     return leafValues;
