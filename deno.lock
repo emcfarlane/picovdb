@@ -1,0 +1,21 @@
+{
+  "version": "5",
+  "specifiers": {
+    "npm:lil-gui@0.21": "0.21.0",
+    "npm:wgpu-matrix@^3.4.0": "3.4.2"
+  },
+  "npm": {
+    "lil-gui@0.21.0": {
+      "integrity": "sha512-tpvxN7v1GvE/Tv+GRopfOp0W7fVEjF4PltkuX8vOCIfim22rD1ztvfkoEMcv9lzQeuNUSeIrUmUjBwmlW/oUew=="
+    },
+    "wgpu-matrix@3.4.2": {
+      "integrity": "sha512-IfZFbG7olEYBD76VCZy2TzqM57GKy3LT++AZh37tMHPPByO6R2h61zXGBZFNPi2IzxNivNi8y5dvze5PjaczjA=="
+    }
+  },
+  "workspace": {
+    "dependencies": [
+      "npm:lil-gui@0.21",
+      "npm:wgpu-matrix@^3.4.0"
+    ]
+  }
+}

@@ -1,12 +1,12 @@
 import { vec3, mat4 } from 'wgpu-matrix';
-import DisplayShader from "./blit.wgsl";
-import ComputeShader from "./compute.wgsl";
-import PicoVDBShader from "../wgsl/picovdb.wgsl";
+import DisplayShader from "./blit.wgsl" with { type: "text" };
+import ComputeShader from "./compute.wgsl" with { type: "text" };
+import { picovdbWgsl as PicoVDBShader } from "picovdb/ts/shaders.ts";
 import { fetchPicoVDB } from '../ts/picovdb.ts';
-import { createOrbitCamera } from './lib/camera';
-import { createInputHandler } from "./lib/input";
-import { initGUI } from './lib/gui';
-import type { ModelConfig } from './lib/gui';
+import { createOrbitCamera } from './lib/camera.ts';
+import { createInputHandler } from "./lib/input.ts";
+import { initGUI } from './lib/gui.ts';
+import type { ModelConfig } from './lib/gui.ts';
 
 const MODEL_BASE = './models/';
 const models: ModelConfig[] = [
@@ -18,14 +18,14 @@ const models: ModelConfig[] = [
   //{ name: 'Skeleton', url: `${MODEL_BASE}skeleton.pvdb.gz`, translation: [0, 240, 0], scale: 120 },
 ];
 
-const modelParam = new URLSearchParams(window.location.search).get('model');
+const modelParam = new URLSearchParams(globalThis.location.search).get('model');
 const initialModel = models.find(m => m.url.endsWith('/' + modelParam)) ?? models[0];
 
 const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models, initialModel.name);
-import { createSkyState } from "./lib/hw_skymodel";
-import { computeSkyIrradianceSH } from "./lib/sky_irradiance";
-import { TimestampQueryManager } from './lib/TimestampQueryManager';
-import { Stats } from './lib/Stats';
+import { createSkyState } from "./lib/hw_skymodel.ts";
+import { computeSkyIrradianceSH } from "./lib/sky_irradiance.ts";
+import { TimestampQueryManager } from './lib/TimestampQueryManager.ts';
+import { Stats } from './lib/Stats.ts';
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 const infoTextElement = document.getElementById("info-text")!;
@@ -34,7 +34,7 @@ if (!canvas) {
   throw new Error("No canvas found.");
 }
 if (!navigator.gpu) {
-  const isInsecure = window.isSecureContext === false;
+  const isInsecure = globalThis.isSecureContext === false;
   throw new Error(
     isInsecure
       ? "WebGPU requires a secure context (HTTPS or localhost). Current origin is not secure."
@@ -43,9 +43,10 @@ if (!navigator.gpu) {
 }
 console.log("WebGPU is supported!");
 
+// featureLevel is newer than Deno's bundled WebGPU types.
 const adapter = await navigator.gpu.requestAdapter({
   featureLevel: 'compatibility',
-});
+} as unknown as GPURequestAdapterOptions);
 if (!adapter) {
   throw new Error("No appropriate GPUAdapter found.");
 }
@@ -60,9 +61,9 @@ let passBindGroup: GPUBindGroup;
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
-  const pixelRatio = controls.highDPI ? window.devicePixelRatio : 1.0;
-  canvas.width = window.innerWidth * pixelRatio;
-  canvas.height = window.innerHeight * pixelRatio;
+  const pixelRatio = controls.highDPI ? globalThis.devicePixelRatio : 1.0;
+  canvas.width = globalThis.innerWidth * pixelRatio;
+  canvas.height = globalThis.innerHeight * pixelRatio;
   width = canvas.width;
   height = canvas.height;
 
@@ -74,7 +75,7 @@ function resizeCanvas() {
 }
 
 resizeCanvas();
-window.addEventListener('resize', resizeCanvas);
+globalThis.addEventListener('resize', resizeCanvas);
 
 // Update canvas size when High DPI setting changes
 highDPIController.onChange(() => {
@@ -96,13 +97,14 @@ device.addEventListener('uncapturederror', event => {
   console.log(event.error);
 });
 
-const context = canvas.getContext("webgpu");
+// The DOM lib doesn't know the "webgpu" context id.
+const context = canvas.getContext("webgpu") as unknown as GPUCanvasContext | null;
 if (!context) {
   throw new Error("No context found.");
 }
 
-var stats = new Stats();
-var gpuPanel = stats.addPanel(new Stats.Panel('GPU', '#ff8', '#221'));
+const stats = new Stats();
+const gpuPanel = stats.addPanel(new Stats.Panel('GPU', '#ff8', '#221'));
 document.body.appendChild(stats.dom);
 
 // GPU-side timer and the CPU-side counter where we accumulate statistics:
@@ -598,7 +600,7 @@ await loadModel(initialModel);
 modelController.onChange(async (name: string) => {
   const config = models.find(m => m.name === name)!;
   const filename = config.url.split('/').pop()!;
-  const url = new URL(window.location.href);
+  const url = new URL(globalThis.location.href);
   url.searchParams.set('model', filename);
   history.replaceState(null, '', url);
   await loadModel(config);

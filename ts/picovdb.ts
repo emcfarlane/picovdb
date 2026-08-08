@@ -143,7 +143,7 @@ export class PicoVDBFile {
     }
 
     const baseOffset = PICOVDB_FILE_HEADER_SIZE + index * PICOVDB_GRID_SIZE;
-    let offset = baseOffset;
+    const offset = baseOffset;
 
     return {
       gridIndex: this.view.getUint32(offset + 0, true),
@@ -268,7 +268,7 @@ export class PicoVDBFile {
   }
 
   getVoxelCount(): number {
-    var count = 0
+    let count = 0
     for (let i = 0; i < this.header.gridCount; i++) {
       count += this.getGrid(i).dataElemCount - 2 // Minus background values
     }
