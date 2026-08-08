@@ -1,8 +1,8 @@
 import { vec3, mat4 } from 'wgpu-matrix';
 import DisplayShader from "./blit.wgsl";
 import ComputeShader from "./compute.wgsl";
-import PicoVDBShader from "./../picovdb.wgsl";
-import { fetchPicoVDB } from '../picovdb.ts';
+import PicoVDBShader from "../wgsl/picovdb.wgsl";
+import { fetchPicoVDB } from '../ts/picovdb.ts';
 import { createOrbitCamera } from './lib/camera';
 import { createInputHandler } from "./lib/input";
 import { initGUI } from './lib/gui';

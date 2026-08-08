@@ -33,40 +33,51 @@ pub const Mesh = struct {
     /// Axis-aligned bounds over all vertices as .{ min, max }.
     /// Asserts the mesh is non-empty.
     pub fn bounds(self: *const Mesh) [2][3]f32 {
-        std.debug.assert(self.vertices.len >= 3);
-        var min = [3]f32{ self.vertices[0], self.vertices[1], self.vertices[2] };
-        var max = min;
-        var i: usize = 3;
-        while (i < self.vertices.len) : (i += 3) {
-            for (0..3) |axis| {
-                min[axis] = @min(min[axis], self.vertices[i + axis]);
-                max[axis] = @max(max[axis], self.vertices[i + axis]);
-            }
-        }
-        return .{ min, max };
+        return vertexBounds(self.vertices);
     }
 
     /// Rotate all vertices about `axis` by `radians` (right-handed).
     /// E.g. rotate(.x, -pi/2) re-orients a Z-up mesh to the Y-up convention.
     pub fn rotate(self: *Mesh, axis: Axis, radians: f32) void {
-        const c = @cos(radians);
-        const s = @sin(radians);
-        // The two rotated components in cyclic order; the axis component is
-        // unchanged: x -> (y, z), y -> (z, x), z -> (x, y).
-        const u: usize, const v: usize = switch (axis) {
-            .x => .{ 1, 2 },
-            .y => .{ 2, 0 },
-            .z => .{ 0, 1 },
-        };
-        var i: usize = 0;
-        while (i < self.vertices.len) : (i += 3) {
-            const a = self.vertices[i + u];
-            const b = self.vertices[i + v];
-            self.vertices[i + u] = a * c - b * s;
-            self.vertices[i + v] = a * s + b * c;
-        }
+        rotateVertices(self.vertices, axis, radians);
     }
 };
+
+/// Axis-aligned bounds over xyz vertex triples as .{ min, max }.
+/// Asserts the slice is non-empty.
+pub fn vertexBounds(vertices: []const f32) [2][3]f32 {
+    std.debug.assert(vertices.len >= 3);
+    var min = [3]f32{ vertices[0], vertices[1], vertices[2] };
+    var max = min;
+    var i: usize = 3;
+    while (i < vertices.len) : (i += 3) {
+        for (0..3) |axis| {
+            min[axis] = @min(min[axis], vertices[i + axis]);
+            max[axis] = @max(max[axis], vertices[i + axis]);
+        }
+    }
+    return .{ min, max };
+}
+
+/// Rotate xyz vertex triples about `axis` by `radians` (right-handed).
+pub fn rotateVertices(vertices: []f32, axis: Axis, radians: f32) void {
+    const c = @cos(radians);
+    const s = @sin(radians);
+    // The two rotated components in cyclic order; the axis component is
+    // unchanged: x -> (y, z), y -> (z, x), z -> (x, y).
+    const u: usize, const v: usize = switch (axis) {
+        .x => .{ 1, 2 },
+        .y => .{ 2, 0 },
+        .z => .{ 0, 1 },
+    };
+    var i: usize = 0;
+    while (i < vertices.len) : (i += 3) {
+        const a = vertices[i + u];
+        const b = vertices[i + v];
+        vertices[i + u] = a * c - b * s;
+        vertices[i + v] = a * s + b * c;
+    }
+}
 
 /// Parse an STL file from memory. Detects binary vs ASCII automatically.
 pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) Error!Mesh {

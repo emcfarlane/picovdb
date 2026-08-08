@@ -3,11 +3,12 @@
   "version": "0.0.1",
   "type": "module",
   "exports": {
-    ".": "./picovdb.ts",
-    "./picovdb.wgsl": "./picovdb.wgsl"
+    ".": "./ts/picovdb.ts",
+    "./stl": "./ts/stl.ts",
+    "./picovdb.wgsl": "./wgsl/picovdb.wgsl"
   },
   "scripts": {
-    "build": "esbuild picovdb.ts --bundle --outfile=dist/picovdb.js --format=esm --loader:.wgsl=text",
+    "build": "esbuild ts/picovdb.ts --bundle --outfile=dist/picovdb.js --format=esm --loader:.wgsl=text",
     "build:demo": "esbuild demo/index.ts --bundle --outfile=demo/index.js --format=esm --loader:.wgsl=text",
     "watch:demo": "esbuild demo/index.ts --bundle --outfile=demo/index.js --format=esm --loader:.wgsl=text --watch=forever",
     "serve": "http-server demo -p 8000 -o -c-1",

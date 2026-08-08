@@ -1,0 +1,4 @@
+module CPicoVDB {
+    header "picovdb.h"
+    export *
+}
