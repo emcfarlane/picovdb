@@ -1,0 +1,98 @@
+// Host side of wgsl/rasterize.wgsl. Stage 2 of the GPU mesh-to-grid
+// pipeline: fill each binned leaf's 512-voxel slab with the minimum squared
+// distance to any incident triangle, in voxel units, +inf where no triangle
+// is within the narrow band.
+//
+//   const rasterizer = new Rasterizer(device);
+//   const leafValues = rasterizer.rasterize(bin, { halfWidth });
+
+import rasterWgsl from 'picovdb/wgsl/rasterize.wgsl' with { type: 'text' };
+import type { BinResult } from './mesh_to_grid.ts';
+
+const WG_SIZE = 256;
+const DISPATCH_STRIDE = 65535;
+
+export interface RasterizeOptions {
+  /** Narrow band half-width in voxels; must match the binning pass. */
+  halfWidth: number;
+}
+
+export class Rasterizer {
+  readonly device: GPUDevice;
+  readonly layout: GPUBindGroupLayout;
+  readonly initValues: GPUComputePipeline;
+  readonly rasterizePipeline: GPUComputePipeline;
+
+  constructor(device: GPUDevice) {
+    this.device = device;
+    const entry = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type },
+    });
+    this.layout = device.createBindGroupLayout({
+      entries: [
+        entry(0, 'uniform'),
+        entry(1, 'read-only-storage'),
+        entry(2, 'read-only-storage'),
+        entry(3, 'read-only-storage'),
+        entry(4, 'read-only-storage'),
+        entry(5, 'read-only-storage'),
+        entry(6, 'storage'),
+      ],
+    });
+    const module = device.createShaderModule({ code: rasterWgsl });
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [this.layout] });
+    this.initValues = device.createComputePipeline({ layout, compute: { module, entryPoint: 'init_values' } });
+    this.rasterizePipeline = device.createComputePipeline({ layout, compute: { module, entryPoint: 'rasterize' } });
+  }
+
+  /** Returns the leaf value slabs: leafCount x 512 f32 squared distances (bitcast u32). */
+  rasterize(bin: BinResult, opts: RasterizeOptions): GPUBuffer {
+    const device = this.device;
+    const valueBytes = bin.leafCount * 512 * 4;
+    if (valueBytes > device.limits.maxStorageBufferBindingSize) {
+      throw new Error(`${bin.leafCount} leaf slabs (${valueBytes} bytes) exceed the storage binding limit`);
+    }
+
+    const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(params, 0, new Uint32Array([bin.pairCount, bin.leafCount]));
+    device.queue.writeBuffer(params, 8, new Float32Array([opts.halfWidth]));
+    device.queue.writeBuffer(params, 16, new Int32Array(bin.leafMin));
+
+    const leafValues = device.createBuffer({ size: valueBytes, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+    const bindGroup = device.createBindGroup({
+      layout: this.layout,
+      entries: [
+        { binding: 0, resource: { buffer: params } },
+        { binding: 1, resource: { buffer: bin.pointsIndex } },
+        { binding: 2, resource: { buffer: bin.triangles } },
+        { binding: 3, resource: { buffer: bin.pairKeys } },
+        { binding: 4, resource: { buffer: bin.pairTris } },
+        { binding: 5, resource: { buffer: bin.leafKeys } },
+        { binding: 6, resource: { buffer: leafValues } },
+      ],
+    });
+
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setBindGroup(0, bindGroup);
+    pass.setPipeline(this.initValues);
+    dispatch2D(pass, Math.ceil((bin.leafCount * 512) / WG_SIZE));
+    pass.setPipeline(this.rasterizePipeline);
+    dispatch2D(pass, bin.pairCount);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+    return leafValues;
+  }
+}
+
+// Linearized 2D dispatch: index = wid.y * DISPATCH_STRIDE + wid.x, matching
+// the WGSL. When groups spill into y, x must be exactly the stride.
+function dispatch2D(pass: GPUComputePassEncoder, groups: number): void {
+  if (groups <= DISPATCH_STRIDE) {
+    pass.dispatchWorkgroups(groups, 1);
+  } else {
+    pass.dispatchWorkgroups(DISPATCH_STRIDE, Math.ceil(groups / DISPATCH_STRIDE));
+  }
+}

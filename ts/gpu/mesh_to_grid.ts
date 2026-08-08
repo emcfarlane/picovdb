@@ -21,6 +21,10 @@ export interface BinOptions {
 }
 
 export interface BinResult {
+  /** Index-space vertex positions (xyz triples). */
+  pointsIndex: GPUBuffer;
+  /** Vertex index triples, as uploaded. */
+  triangles: GPUBuffer;
   /** (leaf key, triangle index) pairs sorted by key. */
   pairKeys: GPUBuffer;
   pairTris: GPUBuffer;
@@ -147,7 +151,7 @@ export class Binner {
     }
     const leafCount = (await readBackU32(device, flags, pairCount + 1))[pairCount];
 
-    return { pairKeys, pairTris, pairCount, leafKeys, leafCount, leafMin };
+    return { pointsIndex, triangles: trianglesBuf, pairKeys, pairTris, pairCount, leafKeys, leafCount, leafMin };
   }
 
   private dispatch(pass: GPUComputePassEncoder, entryPoint: string, threads: number): void {

@@ -1,0 +1,210 @@
+// f32-exact reference implementations of the GPU mesh-to-grid stages, used
+// by the tests. Every operation rounds to f32 via Math.fround; for +,-,*,/
+// on f32 operands evaluated in f64 that matches the correctly rounded f32
+// result, so these mirror the WGSL bit for bit.
+
+const f = Math.fround;
+
+type V3 = [number, number, number];
+
+function sub(a: V3, b: V3): V3 {
+  return [f(a[0] - b[0]), f(a[1] - b[1]), f(a[2] - b[2])];
+}
+
+function add(a: V3, b: V3): V3 {
+  return [f(a[0] + b[0]), f(a[1] + b[1]), f(a[2] + b[2])];
+}
+
+function scale(a: V3, s: number): V3 {
+  return [f(a[0] * s), f(a[1] * s), f(a[2] * s)];
+}
+
+function dot3(a: V3, b: V3): number {
+  return f(f(f(a[0] * b[0]) + f(a[1] * b[1])) + f(a[2] * b[2]));
+}
+
+function dsq(a: V3): number {
+  return dot3(a, a);
+}
+
+function distSqPointSegment(p: V3, a: V3, b: V3): number {
+  const ab = sub(b, a);
+  const denom = dsq(ab);
+  if (denom <= 0) return dsq(sub(p, a));
+  const t = Math.min(Math.max(f(dot3(sub(p, a), ab) / denom), 0), 1);
+  return dsq(sub(p, add(a, scale(ab, t))));
+}
+
+/** Mirrors distSqPointTriangle in src/mesh_to_grid.zig and wgsl/rasterize.wgsl. */
+export function distSqPointTriangle(p: V3, a: V3, b: V3, c: V3): number {
+  const ab = sub(b, a);
+  const ac = sub(c, a);
+  const ap = sub(p, a);
+  const d1 = dot3(ab, ap);
+  const d2 = dot3(ac, ap);
+  if (d1 <= 0 && d2 <= 0) return dsq(ap); // vertex a
+
+  const bp = sub(p, b);
+  const d3 = dot3(ab, bp);
+  const d4 = dot3(ac, bp);
+  if (d3 >= 0 && d4 <= d3) return dsq(bp); // vertex b
+
+  const vc = f(f(d1 * d4) - f(d3 * d2));
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+    const denom = f(d1 - d3);
+    if (denom > 0) return dsq(sub(ap, scale(ab, f(d1 / denom)))); // edge ab
+  }
+
+  const cp = sub(p, c);
+  const d5 = dot3(ab, cp);
+  const d6 = dot3(ac, cp);
+  if (d6 >= 0 && d5 <= d6) return dsq(cp); // vertex c
+
+  const vb = f(f(d5 * d2) - f(d1 * d6));
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+    const denom = f(d2 - d6);
+    if (denom > 0) return dsq(sub(ap, scale(ac, f(d2 / denom)))); // edge ac
+  }
+
+  const va = f(f(d3 * d6) - f(d5 * d4));
+  if (va <= 0 && f(d4 - d3) >= 0 && f(d5 - d6) >= 0) {
+    const denom = f(f(d4 - d3) + f(d5 - d6));
+    if (denom > 0) return dsq(sub(bp, scale(sub(c, b), f(f(d4 - d3) / denom)))); // edge bc
+  }
+
+  const denom = f(f(va + vb) + vc);
+  if (denom <= 0) {
+    // Degenerate (collinear) triangle: fall back to edge distances.
+    return Math.min(distSqPointSegment(p, a, b), distSqPointSegment(p, a, c), distSqPointSegment(p, b, c));
+  }
+  const inv = f(1 / denom);
+  return dsq(sub(ap, add(scale(ab, f(vb * inv)), scale(ac, f(vc * inv))))); // face
+}
+
+export interface RefBin {
+  pairKeys: Uint32Array;
+  pairTris: Uint32Array;
+  leafKeys: Uint32Array;
+}
+
+/**
+ * Reference of the binning contract (rasterizeTriangle bounds in
+ * src/mesh_to_grid.zig): dilated bbox [ceil(min-hw), floor(max+hw)],
+ * leaves [lo>>3, hi>>3] per axis.
+ */
+export function refBin(
+  points: Float32Array,
+  triangles: Uint32Array,
+  voxelSize: number,
+  halfWidth: number,
+  leafMin: [number, number, number]
+): RefBin {
+  const pts = transform(points, voxelSize);
+  const pairs: Array<[number, number]> = [];
+  for (let t = 0; t < triangles.length / 3; t++) {
+    const { lo, hi } = leafRange(pts, triangles, t, halfWidth);
+    for (let x = lo[0]; x <= hi[0]; x++) {
+      for (let y = lo[1]; y <= hi[1]; y++) {
+        for (let z = lo[2]; z <= hi[2]; z++) {
+          const key = (((x - leafMin[0]) << 20) | ((y - leafMin[1]) << 10) | (z - leafMin[2])) >>> 0;
+          pairs.push([key, t]);
+        }
+      }
+    }
+  }
+  pairs.sort((a, b) => a[0] - b[0] || 0); // stable: tri order preserved per key
+  const pairKeys = new Uint32Array(pairs.map((p) => p[0]));
+  const pairTris = new Uint32Array(pairs.map((p) => p[1]));
+  const leafKeys = new Uint32Array([...new Set(pairKeys)]);
+  return { pairKeys, pairTris, leafKeys };
+}
+
+/**
+ * Reference of the distance stage: per (leaf, triangle) pair, min-update
+ * squared distances at voxel centers inside the dilated bbox and within
+ * half_width. Returns leafCount x 512 slabs, +inf where untouched.
+ */
+export function refRasterize(
+  points: Float32Array,
+  triangles: Uint32Array,
+  voxelSize: number,
+  halfWidth: number,
+  leafMin: [number, number, number]
+): { bin: RefBin; values: Float32Array } {
+  const bin = refBin(points, triangles, voxelSize, halfWidth, leafMin);
+  const pts = transform(points, voxelSize);
+  const slot = new Map<number, number>();
+  bin.leafKeys.forEach((key, i) => slot.set(key, i));
+  const values = new Float32Array(bin.leafKeys.length * 512).fill(Infinity);
+  const hw2 = f(halfWidth * halfWidth);
+
+  for (let i = 0; i < bin.pairKeys.length; i++) {
+    const t = bin.pairTris[i];
+    const a = vert(pts, triangles[t * 3]);
+    const b = vert(pts, triangles[t * 3 + 1]);
+    const c = vert(pts, triangles[t * 3 + 2]);
+    const { loV, hiV } = voxelRange(pts, triangles, t, halfWidth);
+    const key = bin.pairKeys[i];
+    const origin = [
+      (((key >>> 20) & 0x3ff) + leafMin[0]) << 3,
+      (((key >>> 10) & 0x3ff) + leafMin[1]) << 3,
+      ((key & 0x3ff) + leafMin[2]) << 3,
+    ];
+    const base = slot.get(key)! * 512;
+    for (let x = Math.max(loV[0], origin[0]); x <= Math.min(hiV[0], origin[0] + 7); x++) {
+      for (let y = Math.max(loV[1], origin[1]); y <= Math.min(hiV[1], origin[1] + 7); y++) {
+        for (let z = Math.max(loV[2], origin[2]); z <= Math.min(hiV[2], origin[2] + 7); z++) {
+          const d2 = distSqPointTriangle([x, y, z], a, b, c);
+          if (d2 <= hw2) {
+            const n = base + ((x & 7) << 6) + ((y & 7) << 3) + (z & 7);
+            if (d2 < values[n]) values[n] = d2;
+          }
+        }
+      }
+    }
+  }
+  return { bin, values };
+}
+
+function transform(points: Float32Array, voxelSize: number): Float32Array {
+  const inv = f(1 / voxelSize);
+  const pts = new Float32Array(points.length);
+  for (let i = 0; i < points.length; i++) pts[i] = f(points[i] * inv);
+  return pts;
+}
+
+function vert(pts: Float32Array, i: number): V3 {
+  return [pts[i * 3], pts[i * 3 + 1], pts[i * 3 + 2]];
+}
+
+function voxelRange(pts: Float32Array, triangles: Uint32Array, t: number, halfWidth: number) {
+  const loV = [0, 0, 0];
+  const hiV = [0, 0, 0];
+  for (let axis = 0; axis < 3; axis++) {
+    const a = pts[triangles[t * 3] * 3 + axis];
+    const b = pts[triangles[t * 3 + 1] * 3 + axis];
+    const c = pts[triangles[t * 3 + 2] * 3 + axis];
+    loV[axis] = Math.ceil(f(Math.min(a, b, c) - halfWidth));
+    hiV[axis] = Math.floor(f(Math.max(a, b, c) + halfWidth));
+  }
+  return { loV, hiV };
+}
+
+function leafRange(pts: Float32Array, triangles: Uint32Array, t: number, halfWidth: number) {
+  const { loV, hiV } = voxelRange(pts, triangles, t, halfWidth);
+  return { lo: loV.map((v) => v >> 3), hi: hiV.map((v) => v >> 3) };
+}
+
+/** Binary STL parser producing a triangle soup, for test inputs. */
+export function parseBinarySTL(bytes: Uint8Array): { points: Float32Array<ArrayBuffer>; triangles: Uint32Array<ArrayBuffer> } {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const triCount = view.getUint32(80, true);
+  const points = new Float32Array(triCount * 9);
+  const triangles = new Uint32Array(triCount * 3);
+  for (let t = 0; t < triCount; t++) {
+    const base = 84 + t * 50 + 12; // skip normal
+    for (let i = 0; i < 9; i++) points[t * 9 + i] = view.getFloat32(base + i * 4, true);
+    for (let v = 0; v < 3; v++) triangles[t * 3 + v] = t * 3 + v;
+  }
+  return { points, triangles };
+}
