@@ -83,7 +83,7 @@ export function initSTL(
   } else if (options.wasmURL) {
     modulePromise = compileFromURL(options.wasmURL);
   } else {
-    modulePromise ??= compileFromURL(new URL('./zig-out/wasm/picovdb.wasm', import.meta.url));
+    modulePromise ??= compileFromURL(new URL('../zig-out/wasm/picovdb.wasm', import.meta.url));
   }
   return modulePromise;
 }

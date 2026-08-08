@@ -17,8 +17,8 @@ Compact sparse volumetric data format optimized for WebGPU real-time rendering.
 - **Fast traversal** with hierarchical raymarching (HDDA)
 
 This repository includes:
-- `picovdb.wgsl` - WGSL shader library
-- `picovdb.ts` - TypeScript loader
+- `wgsl/picovdb.wgsl` - WGSL shader library
+- `ts/picovdb.ts` - TypeScript loader
 - `src/main.zig` - NanoVDB → PicoVDB converter
 - `src/stl.zig`, `src/mesh_to_grid.zig` - STL mesh → PicoVDB level set voxelizer
 
