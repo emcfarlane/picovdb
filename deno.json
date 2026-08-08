@@ -25,7 +25,7 @@
     "watch:demo": "deno bundle --watch --platform browser -o demo/index.js demo/index.ts",
     "serve": "deno run --allow-net --allow-read jsr:@std/http/file-server demo --port 8000",
     "dev": "mkdir -p demo/models && cp data/*.pvdb.gz demo/models/ && (deno task watch:demo & deno task serve)",
-    "test:gpu": "deno test --allow-read=data ts/gpu/"
+    "test:gpu": "deno test --allow-read=data,zig-out ts/gpu/"
   },
   "exclude": [
     "node_modules",

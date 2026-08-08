@@ -7,10 +7,10 @@
 //   const leafValues = rasterizer.rasterize(bin, { halfWidth });
 
 import rasterWgsl from 'picovdb/wgsl/rasterize.wgsl' with { type: 'text' };
+import { dispatch2D } from './device.ts';
 import type { BinResult } from './mesh_to_grid.ts';
 
 const WG_SIZE = 256;
-const DISPATCH_STRIDE = 65535;
 
 export interface RasterizeOptions {
   /** Narrow band half-width in voxels; must match the binning pass. */
@@ -84,15 +84,5 @@ export class Rasterizer {
     pass.end();
     device.queue.submit([encoder.finish()]);
     return leafValues;
-  }
-}
-
-// Linearized 2D dispatch: index = wid.y * DISPATCH_STRIDE + wid.x, matching
-// the WGSL. When groups spill into y, x must be exactly the stride.
-function dispatch2D(pass: GPUComputePassEncoder, groups: number): void {
-  if (groups <= DISPATCH_STRIDE) {
-    pass.dispatchWorkgroups(groups, 1);
-  } else {
-    pass.dispatchWorkgroups(DISPATCH_STRIDE, Math.ceil(groups / DISPATCH_STRIDE));
   }
 }

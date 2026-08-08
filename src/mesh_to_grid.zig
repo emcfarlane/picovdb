@@ -582,11 +582,15 @@ pub fn meshToGrid(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    // Transform vertices to index space (voxel units).
+    // Transform vertices to index space (voxel units). Multiply by the
+    // reciprocal rather than divide: WGSL guarantees correctly rounded
+    // multiplication but not division, so this is the transform the GPU
+    // pipeline can reproduce bit-exactly.
+    const inv_voxel_size = 1.0 / opts.voxel_size;
     const pts = try arena.alloc(f32, vertices.len);
     for (vertices, 0..) |v, i| {
         if (!std.math.isFinite(v)) return error.NonFiniteVertex;
-        pts[i] = v / opts.voxel_size;
+        pts[i] = v * inv_voxel_size;
     }
 
     var mesh_min = V3{ pts[0], pts[1], pts[2] };

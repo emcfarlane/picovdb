@@ -24,6 +24,20 @@ export function createU32Buffer(device: GPUDevice, data: Uint32Array<ArrayBuffer
   return buffer;
 }
 
+export const DISPATCH_STRIDE = 65535;
+
+/**
+ * Linearized 2D dispatch: workgroup index = wid.y * DISPATCH_STRIDE + wid.x
+ * on the WGSL side. When groups spill into y, x must be exactly the stride.
+ */
+export function dispatch2D(pass: GPUComputePassEncoder, groups: number): void {
+  if (groups <= DISPATCH_STRIDE) {
+    pass.dispatchWorkgroups(groups, 1);
+  } else {
+    pass.dispatchWorkgroups(DISPATCH_STRIDE, Math.ceil(groups / DISPATCH_STRIDE));
+  }
+}
+
 export async function readBackU32(device: GPUDevice, src: GPUBuffer, count: number): Promise<Uint32Array> {
   const staging = device.createBuffer({
     size: count * 4,

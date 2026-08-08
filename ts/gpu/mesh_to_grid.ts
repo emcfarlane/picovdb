@@ -18,6 +18,11 @@ export interface BinOptions {
   voxelSize: number;
   /** Narrow band half-width in voxels. */
   halfWidth: number;
+  /**
+   * Leaf-space bounds override, e.g. from leafBounds() over a combined
+   * mesh so several grids share one key space (required for merging).
+   */
+  bounds?: { leafMin: [number, number, number]; leafMax: [number, number, number] };
 }
 
 export interface BinResult {
@@ -34,6 +39,8 @@ export interface BinResult {
   leafCount: number;
   /** Leaf-space bias: leaf coordinate = unpacked key + leafMin; voxel origin = coordinate * 8. */
   leafMin: [number, number, number];
+  /** Maximum leaf coordinate (inclusive). */
+  leafMax: [number, number, number];
 }
 
 export class Binner {
@@ -78,7 +85,7 @@ export class Binner {
     const triangleCount = triangles.length / 3;
     if (triangleCount === 0) throw new Error('empty mesh');
     const invVoxelSize = Math.fround(1 / opts.voxelSize);
-    const leafMin = leafBoundsMin(points, invVoxelSize, opts.halfWidth);
+    const { leafMin, leafMax } = opts.bounds ?? leafBounds(points, invVoxelSize, opts.halfWidth);
 
     const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(params, 0, new Uint32Array([pointCount, triangleCount]));
@@ -151,7 +158,7 @@ export class Binner {
     }
     const leafCount = (await readBackU32(device, flags, pairCount + 1))[pairCount];
 
-    return { pointsIndex, triangles: trianglesBuf, pairKeys, pairTris, pairCount, leafKeys, leafCount, leafMin };
+    return { pointsIndex, triangles: trianglesBuf, pairKeys, pairTris, pairCount, leafKeys, leafCount, leafMin, leafMax };
   }
 
   private dispatch(pass: GPUComputePassEncoder, entryPoint: string, threads: number): void {
@@ -162,8 +169,12 @@ export class Binner {
   }
 }
 
-/** Minimum leaf coordinate over all dilated vertex bounds, f32-exact to the GPU math. */
-function leafBoundsMin(points: Float32Array, invVoxelSize: number, halfWidth: number): [number, number, number] {
+/** Leaf coordinate bounds over all dilated vertex bounds, f32-exact to the GPU math. */
+export function leafBounds(
+  points: Float32Array,
+  invVoxelSize: number,
+  halfWidth: number
+): { leafMin: [number, number, number]; leafMax: [number, number, number] } {
   const min = [Infinity, Infinity, Infinity];
   const max = [-Infinity, -Infinity, -Infinity];
   for (let i = 0; i < points.length; i += 3) {
@@ -174,6 +185,7 @@ function leafBoundsMin(points: Float32Array, invVoxelSize: number, halfWidth: nu
     }
   }
   const lo: number[] = [];
+  const hi: number[] = [];
   for (let axis = 0; axis < 3; axis++) {
     const loLeaf = Math.ceil(Math.fround(min[axis] - halfWidth)) >> 3;
     const hiLeaf = Math.floor(Math.fround(max[axis] + halfWidth)) >> 3;
@@ -181,6 +193,7 @@ function leafBoundsMin(points: Float32Array, invVoxelSize: number, halfWidth: nu
       throw new Error(`grid exceeds 1024 leaves on axis ${axis}: ${loLeaf}..${hiLeaf}`);
     }
     lo.push(loLeaf);
+    hi.push(hiLeaf);
   }
-  return lo as [number, number, number];
+  return { leafMin: lo as [number, number, number], leafMax: hi as [number, number, number] };
 }

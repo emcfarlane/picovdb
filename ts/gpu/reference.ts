@@ -166,6 +166,85 @@ export function refRasterize(
   return { bin, values };
 }
 
+/**
+ * Reference of the sign stage, mirroring ColumnGrid in src/mesh_to_grid.zig
+ * in f64 (JS numbers), the same precision as the CPU: per-column +Z
+ * crossings with the infinitesimal-shift tie-break, then odd-parity =
+ * inside. Returns leafCount x 16 u32 mask words in leaf voxel-bit order.
+ */
+export function refSign(
+  points: Float32Array,
+  triangles: Uint32Array,
+  voxelSize: number,
+  leafKeys: Uint32Array,
+  leafMin: [number, number, number]
+): Uint32Array {
+  const pts = transform(points, voxelSize);
+  const edge = (px: number, py: number, qx: number, qy: number, sx: number, sy: number): number =>
+    (qx - px) * (sy - py) - (qy - py) * (sx - px);
+  const accept = (w: number, ex: number, ey: number): boolean => {
+    if (w > 0) return true;
+    if (w < 0) return false;
+    return ey < 0 || (ey === 0 && ex > 0);
+  };
+
+  const cols = new Map<string, number[]>();
+  for (let t = 0; t < triangles.length / 3; t++) {
+    const [ax, ay, az] = vert(pts, triangles[t * 3]);
+    const [bx, by, bz] = vert(pts, triangles[t * 3 + 1]);
+    const [cx, cy, cz] = vert(pts, triangles[t * 3 + 2]);
+    const signedArea = edge(ax, ay, bx, by, cx, cy);
+    if (signedArea === 0) continue; // XY-degenerate (vertical) triangle
+    const flip = signedArea < 0 ? -1 : 1;
+    const area = flip * signedArea;
+    const x0 = Math.ceil(Math.min(ax, bx, cx));
+    const x1 = Math.floor(Math.max(ax, bx, cx));
+    const y0 = Math.ceil(Math.min(ay, by, cy));
+    const y1 = Math.floor(Math.max(ay, by, cy));
+    for (let x = x0; x <= x1; x++) {
+      for (let y = y0; y <= y1; y++) {
+        const w0 = flip * edge(bx, by, cx, cy, x, y);
+        const w1 = flip * edge(cx, cy, ax, ay, x, y);
+        const w2 = flip * edge(ax, ay, bx, by, x, y);
+        const inside =
+          accept(w0, flip * (cx - bx), flip * (cy - by)) &&
+          accept(w1, flip * (ax - cx), flip * (ay - cy)) &&
+          accept(w2, flip * (bx - ax), flip * (by - ay));
+        if (!inside) continue;
+        const z = (w0 * az + w1 * bz + w2 * cz) / area;
+        const key = `${x},${y}`;
+        let list = cols.get(key);
+        if (!list) cols.set(key, (list = []));
+        list.push(z);
+      }
+    }
+  }
+  for (const list of cols.values()) list.sort((a, b) => a - b);
+
+  const masks = new Uint32Array(leafKeys.length * 16);
+  leafKeys.forEach((key, li) => {
+    const ox = (((key >>> 20) & 0x3ff) + leafMin[0]) << 3;
+    const oy = (((key >>> 10) & 0x3ff) + leafMin[1]) << 3;
+    const oz = ((key & 0x3ff) + leafMin[2]) << 3;
+    for (let c = 0; c < 64; c++) {
+      const list = cols.get(`${ox + (c >> 3)},${oy + (c & 7)}`) ?? [];
+      let ptr = 0;
+      let count = 0;
+      let bits = 0;
+      for (let z = 0; z < 8; z++) {
+        while (ptr < list.length && list[ptr] < oz + z) {
+          ptr++;
+          count++;
+        }
+        bits |= (count & 1) << z;
+      }
+      const n0 = c * 8;
+      masks[li * 16 + (n0 >> 5)] |= (bits << (n0 & 31)) >>> 0;
+    }
+  });
+  return masks;
+}
+
 function transform(points: Float32Array, voxelSize: number): Float32Array {
   const inv = f(1 / voxelSize);
   const pts = new Float32Array(points.length);
