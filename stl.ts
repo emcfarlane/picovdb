@@ -6,7 +6,7 @@
 //     maxVoxels: 100e6, // fail fast instead of ~1 GiB+ peak memory
 //   });
 //
-// The wasm binary comes from `zig build wasm` (zig-out/wasm/picovdb_stl.wasm);
+// The wasm binary comes from `zig build wasm` (zig-out/wasm/picovdb.wasm);
 // bundler users should call initSTL({ wasmURL }) or initSTL({ wasmBinary }).
 // Voxelization is CPU-bound (roughly 1 s per ~7 M active voxels) — call from a
 // Web Worker for large inputs. Each call instantiates a fresh wasm instance so
@@ -61,11 +61,11 @@ export interface STLImportResult {
 
 interface StlWasmExports {
   memory: WebAssembly.Memory;
-  pv_abi_version(): number;
-  pv_alloc(len: number): number;
-  pv_stl_get_info(stl: number, len: number, out: number): number;
-  pv_stl_to_pvdb(stl: number, len: number, opts: number, out: number): number;
-  pv_error_string(code: number): number;
+  picovdb_abi_version(): number;
+  picovdb_alloc(len: number): number;
+  picovdb_stl_info(stl: number, len: number, out: number): number;
+  picovdb_stl_to_grid(stl: number, len: number, opts: number, out: number): number;
+  picovdb_error_string(code: number): number;
 }
 
 let modulePromise: Promise<WebAssembly.Module> | null = null;
@@ -83,7 +83,7 @@ export function initSTL(
   } else if (options.wasmURL) {
     modulePromise = compileFromURL(options.wasmURL);
   } else {
-    modulePromise ??= compileFromURL(new URL('./zig-out/wasm/picovdb_stl.wasm', import.meta.url));
+    modulePromise ??= compileFromURL(new URL('./zig-out/wasm/picovdb.wasm', import.meta.url));
   }
   return modulePromise;
 }
@@ -105,20 +105,20 @@ async function instantiate(): Promise<StlWasmExports> {
   const module = await initSTL();
   const instance = await WebAssembly.instantiate(module, {});
   const ex = instance.exports as unknown as StlWasmExports;
-  const abi = ex.pv_abi_version();
+  const abi = ex.picovdb_abi_version();
   if (abi !== 1) throw new Error(`STL importer ABI version ${abi}, expected 1`);
   return ex;
 }
 
 function stage(ex: StlWasmExports, bytes: Uint8Array): number {
-  const ptr = ex.pv_alloc(bytes.length);
+  const ptr = ex.picovdb_alloc(bytes.length);
   if (!ptr) throw new Error('wasm allocation failed');
   new Uint8Array(ex.memory.buffer).set(bytes, ptr);
   return ptr;
 }
 
-function throwPvError(ex: StlWasmExports, rc: number): never {
-  const mem = new Uint8Array(ex.memory.buffer, ex.pv_error_string(rc));
+function throwPicoVDBError(ex: StlWasmExports, rc: number): never {
+  const mem = new Uint8Array(ex.memory.buffer, ex.picovdb_error_string(rc));
   let end = 0;
   while (mem[end] !== 0) end++;
   throw new Error(`STL import failed (${rc}): ${new TextDecoder().decode(mem.subarray(0, end))}`);
@@ -140,9 +140,9 @@ function readInfo(view: DataView, ptr: number): STLInfo {
 /** Triangle count and world bounds, without voxelizing. */
 export async function stlInfo(stl: Uint8Array): Promise<STLInfo> {
   const ex = await instantiate();
-  const infoPtr = ex.pv_alloc(28);
-  const rc = ex.pv_stl_get_info(stage(ex, stl), stl.length, infoPtr);
-  if (rc !== 0) throwPvError(ex, rc);
+  const infoPtr = ex.picovdb_alloc(28);
+  const rc = ex.picovdb_stl_info(stage(ex, stl), stl.length, infoPtr);
+  if (rc !== 0) throwPicoVDBError(ex, rc);
   return readInfo(new DataView(ex.memory.buffer), infoPtr);
 }
 
@@ -156,8 +156,8 @@ export async function importSTL(stl: Uint8Array, options: STLImportOptions): Pro
   const ex = await instantiate();
   const stlPtr = stage(ex, stl);
 
-  // pv_mesh_options { max_voxels u64, voxels_per_unit, half_width, value_type, rotate_deg[3] }
-  const optsPtr = ex.pv_alloc(32);
+  // picovdb_mesh_to_grid_options { max_voxels u64, voxels_per_unit, half_width, value_type, rotate_deg[3] }
+  const optsPtr = ex.picovdb_alloc(32);
   {
     const view = new DataView(ex.memory.buffer);
     const maxVoxels = options.maxVoxels ?? 0;
@@ -168,11 +168,11 @@ export async function importSTL(stl: Uint8Array, options: STLImportOptions): Pro
     for (let axis = 0; axis < 3; axis++) view.setFloat32(optsPtr + 20 + axis * 4, rotateDeg[axis], true);
   }
 
-  const outPtr = ex.pv_alloc(88); // pv_buffer, wasm32 layout
-  const rc = ex.pv_stl_to_pvdb(stlPtr, stl.length, optsPtr, outPtr);
-  if (rc !== 0) throwPvError(ex, rc);
+  const outPtr = ex.picovdb_alloc(88); // picovdb_buffer, wasm32 layout
+  const rc = ex.picovdb_stl_to_grid(stlPtr, stl.length, optsPtr, outPtr);
+  if (rc !== 0) throwPicoVDBError(ex, rc);
 
-  // Read pv_buffer { data u32@0, len u32@4, stats@8 } and copy the result out;
+  // Read picovdb_buffer { data u32@0, len u32@4, stats@8 } and copy the result out;
   // the instance (and its grown memory) is discarded, so no frees needed.
   const view = new DataView(ex.memory.buffer);
   const dataPtr = view.getUint32(outPtr + 0, true);

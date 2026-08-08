@@ -159,7 +159,7 @@ fn meshCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []const u
     var half_width: f32 = picovdb.LEVEL_SET_HALF_WIDTH;
     var rotations: std.ArrayList(Rotation) = .empty;
     defer rotations.deinit(allocator);
-    var value_type: picovdb.mesh2ls.ValueType = .f32;
+    var value_type: picovdb.mesh_to_grid.ValueType = .f32;
     var positional: [2]?[]const u8 = .{ null, null };
     var positional_count: usize = 0;
 
@@ -271,7 +271,7 @@ fn meshCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []const u
     var picovdb_file = picovdb.PicoVDBFileMutable.init();
     defer picovdb_file.deinit(allocator);
 
-    const stats = picovdb.mesh2ls.meshToPicoVDB(allocator, &picovdb_file, mesh.vertices, mesh.triangles, .{
+    const stats = picovdb.mesh_to_grid.meshToGrid(allocator, &picovdb_file, mesh.vertices, mesh.triangles, .{
         .voxel_size = voxel_size.?,
         .half_width = half_width,
         .value_type = value_type,

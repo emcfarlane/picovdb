@@ -76,13 +76,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
 
-    // WASM STL importer (consumed by stl.ts).
+    // WASM build of the C API (consumed by stl.ts).
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
     });
     const wasm = b.addExecutable(.{
-        .name = "picovdb_stl",
+        .name = "picovdb",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/c_api.zig"),
             .target = wasm_target,
@@ -99,13 +99,13 @@ pub fn build(b: *std.Build) void {
     });
     wasm.entry = .disabled; // library, no _start
     wasm.rdynamic = true; // keep `export fn` symbols
-    const wasm_step = b.step("wasm", "Build the WASM STL importer");
+    const wasm_step = b.step("wasm", "Build the WASM C API module");
     wasm_step.dependOn(&b.addInstallArtifact(wasm, .{
         .dest_dir = .{ .override = .{ .custom = "wasm" } },
     }).step);
 
-    // Apple static libs -> PicoVDBSTL.xcframework (macOS host only).
-    const xc_out = b.getInstallPath(.prefix, "PicoVDBSTL.xcframework");
+    // Apple static libs -> PicoVDB.xcframework (macOS host only).
+    const xc_out = b.getInstallPath(.prefix, "PicoVDB.xcframework");
     const xc_rm = b.addSystemCommand(&.{ "rm", "-rf", xc_out });
     const xcodebuild = b.addSystemCommand(&.{ "xcodebuild", "-create-xcframework" });
     xcodebuild.step.dependOn(&xc_rm.step);
@@ -123,7 +123,7 @@ pub fn build(b: *std.Build) void {
         // at 8-byte offsets, so zig-made archives fail to link depending on
         // symbol-table size and member-name length.
         const obj = b.addObject(.{
-            .name = "picovdbstl",
+            .name = "picovdb",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/c_api.zig"),
                 .target = slice_target,
@@ -139,7 +139,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         const libtool = b.addSystemCommand(&.{ "libtool", "-static", "-o" });
-        const lib = libtool.addOutputFileArg("libpicovdbstl.a");
+        const lib = libtool.addOutputFileArg("libpicovdb.a");
         libtool.addFileArg(obj.getEmittedBin());
         xcodebuild.addArg("-library");
         xcodebuild.addFileArg(lib);
@@ -147,6 +147,6 @@ pub fn build(b: *std.Build) void {
         xcodebuild.addDirectoryArg(b.path("include"));
     }
     xcodebuild.addArgs(&.{ "-output", xc_out });
-    const xc_step = b.step("xcframework", "Build PicoVDBSTL.xcframework (macOS host only)");
+    const xc_step = b.step("xcframework", "Build PicoVDB.xcframework (macOS host only)");
     xc_step.dependOn(&xcodebuild.step);
 }

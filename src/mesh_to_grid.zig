@@ -565,7 +565,7 @@ fn lessThanOrigin(_: void, a: [3]i32, b: [3]i32) bool {
 /// Convert a triangle mesh (world units) into a narrow-band signed distance
 /// grid appended to `out`. Vertices are xyz triples, triangles are vertex
 /// index triples.
-pub fn meshToPicoVDB(
+pub fn meshToGrid(
     allocator: std.mem.Allocator,
     out: *picovdb.PicoVDBFileMutable,
     vertices: []const f32,
@@ -813,7 +813,7 @@ test "sphere mesh to picovdb matches analytic SDF" {
     var file_mutable = picovdb.PicoVDBFileMutable.init();
     defer file_mutable.deinit(allocator);
 
-    const stats = try meshToPicoVDB(allocator, &file_mutable, mesh.vertices, mesh.triangles, .{
+    const stats = try meshToGrid(allocator, &file_mutable, mesh.vertices, mesh.triangles, .{
         .voxel_size = voxel_size,
     });
 
@@ -888,5 +888,5 @@ test "empty mesh is rejected" {
     const allocator = std.testing.allocator;
     var file_mutable = picovdb.PicoVDBFileMutable.init();
     defer file_mutable.deinit(allocator);
-    try std.testing.expectError(error.EmptyMesh, meshToPicoVDB(allocator, &file_mutable, &.{}, &.{}, .{ .voxel_size = 1 }));
+    try std.testing.expectError(error.EmptyMesh, meshToGrid(allocator, &file_mutable, &.{}, &.{}, .{ .voxel_size = 1 }));
 }

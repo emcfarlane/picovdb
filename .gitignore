@@ -1,8 +1,10 @@
 node_modules/
+docs/
 dist/
 demo/node_modules/
 demo/index.js
 demo/models/
+zig-pkg/
 *.pvdb
 *.pvdb.gz
 *.nvdb
