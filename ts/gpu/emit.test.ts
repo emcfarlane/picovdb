@@ -9,8 +9,8 @@ import { initSTL, importSTL } from '../stl.ts';
 
 const gpu = await hasWebGPU();
 
-// The CPU oracle: the wasm converter (built by `zig build wasm`) on the same
-// mesh. Both must be present; otherwise the test skips (e.g. CI).
+// The CPU oracle is the wasm converter run on the same mesh. The test
+// skips when either file is missing.
 let stl: Uint8Array<ArrayBuffer> | null = null;
 let wasm: Uint8Array<ArrayBuffer> | null = null;
 try {
@@ -53,7 +53,7 @@ Deno.test({ name: 'GPU tree emission matches CPU converter', ignore: !gpu || !st
     }
   }
 
-  // Node buffers must be byte-identical.
+  // Node buffers must match byte for byte.
   const cpuU32 = (bytes: Uint8Array) => new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
   assertU32ArrayEqual(
     await readBackU32(device, tree.roots, tree.upperCount * 2),
@@ -64,7 +64,7 @@ Deno.test({ name: 'GPU tree emission matches CPU converter', ignore: !gpu || !st
   assertU32ArrayEqual(await readBackU32(device, tree.lowers, tree.lowerCount * 388), cpuU32(cpu.lowersBuffer), 'lowers');
   assertU32ArrayEqual(await readBackU32(device, tree.leaves, tree.leafCount * 52), cpuU32(cpu.leavesBuffer), 'leaves');
 
-  // Values within tolerance (GPU FMA), signs exact.
+  // Values match within tolerance and signs match exactly.
   const gpuData = new Float32Array((await readBackU32(device, tree.data, tree.dataElemCount)).buffer);
   const cpuData = new Float32Array(cpu.dataBuffer.buffer, cpu.dataBuffer.byteOffset, tree.dataElemCount);
   let maxAbs = 0;

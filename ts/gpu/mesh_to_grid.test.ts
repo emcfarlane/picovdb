@@ -9,7 +9,7 @@ let stl: Uint8Array | null = null;
 try {
   stl = Deno.readFileSync(new URL('../../data/bases/base_32mm.stl', import.meta.url));
 } catch {
-  // Sample data not present (e.g. CI); the STL test is skipped.
+  // Sample data not present, so the STL test skips.
 }
 
 function mulberry32(seed: number): () => number {
@@ -50,18 +50,18 @@ Deno.test({ name: 'triangle binning matches reference', ignore: !gpu }, async ()
   const binner = new Binner(device);
   const rand = mulberry32(3);
 
-  // Random triangle soup, negative coords included.
+  // Random triangle soup with negative coords included.
   const triCount = 300;
   const points = new Float32Array(triCount * 9);
   for (let i = 0; i < points.length; i++) points[i] = (rand() - 0.5) * 60;
   const triangles = new Uint32Array([...Array(triCount * 3).keys()]);
   await checkAgainstRef(binner, points, triangles, 0.25, 3, 'soup');
 
-  // Thin sliver whose dilated bbox spans no integer coordinate on some axes.
+  // Thin sliver whose dilated bounds span no integer coordinate on some axes.
   const sliver = new Float32Array([0.2, 0.21, 0.2, 0.4, 0.22, 0.2, 0.3, 0.23, 0.21]);
   await checkAgainstRef(binner, sliver, new Uint32Array([0, 1, 2]), 1, 0.1, 'sliver');
 
-  // Degenerate point-triangle on a leaf boundary.
+  // Degenerate point triangle on a leaf boundary.
   const point = new Float32Array([8, -8, 16, 8, -8, 16, 8, -8, 16]);
   await checkAgainstRef(binner, point, new Uint32Array([0, 1, 2]), 1, 3, 'point');
 });

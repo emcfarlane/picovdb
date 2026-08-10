@@ -1,9 +1,9 @@
-// Device-wide exclusive prefix scan (u32, wrapping), reduce-then-scan.
+// Exclusive prefix scan of u32 values with wrapping addition.
 //
-// scan_tile writes each 1024-element tile's exclusive scan in place and its
-// total to partials[tile]. The host scans partials recursively with the same
-// kernels, then add_offsets folds the scanned totals back in, top level first.
-// See ts/gpu/scan.ts for the dispatch plan.
+// scan_tile writes each 1024 element tile's exclusive scan in place and the
+// tile total to partials. The host scans partials recursively with the same
+// kernels and add_offsets folds the scanned totals back in. The dispatch
+// plan lives in ts/gpu/scan.ts.
 
 const WG_SIZE: u32 = 256u;
 const ITEMS: u32 = 4u;
@@ -40,7 +40,7 @@ fn scan_tile(
 
     thread_sums[tid] = sum;
     workgroupBarrier();
-    // Kogge-Stone inclusive scan over the 256 thread sums.
+    // Inclusive scan over the 256 thread sums.
     for (var offset = 1u; offset < WG_SIZE; offset = offset << 1u) {
         var s = thread_sums[tid];
         if (tid >= offset) {

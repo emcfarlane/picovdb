@@ -17,8 +17,9 @@ function mulberry32(seed: number): () => number {
 
 const pack = (x: number, y: number, z: number): number => ((x << 20) | (y << 10) | z) >>> 0;
 
-// Brute-force reference: expand every active voxel to its 6 face neighbors
-// in global voxel space, then rebuild leaves (originals kept even if empty).
+// Brute force reference. Expands every active voxel to its face neighbors
+// in global voxel space and rebuilds leaves, keeping originals even when
+// empty.
 function refDilate(keys: Uint32Array, masks: Uint32Array): { keys: Uint32Array; masks: Uint32Array } {
   const active = new Set<string>();
   keys.forEach((key, li) => {
@@ -76,18 +77,18 @@ Deno.test({ name: 'dilate matches brute-force reference', ignore: !gpu }, async 
   const dilator = new Dilator(device);
   const rand = mulberry32(6);
 
-  // Single leaf, single center voxel: dilation stays within the leaf.
+  // A single center voxel dilates within its leaf.
   const single = new Uint32Array(16);
   single[(((4 << 6) | (4 << 3) | 4) >> 5)] |= 1 << (((4 << 6) | (4 << 3) | 4) & 31);
   await checkDilate(dilator, new Uint32Array([pack(10, 10, 10)]), single, 'center');
 
-  // Full leaf: spills into all six neighbors.
+  // A full leaf spills into all six neighbors.
   await checkDilate(dilator, new Uint32Array([pack(10, 10, 10)]), new Uint32Array(16).fill(0xffffffff), 'full');
 
-  // Corner voxel of a leaf: spills across three faces (diagonal leaves must
-  // NOT be spawned by 6-neighborhood dilation).
+  // A corner voxel spills across three faces. Face dilation must not
+  // spawn diagonal leaves.
   const corner = new Uint32Array(16);
-  corner[0] |= 1; // n = 0 -> voxel (0,0,0)
+  corner[0] |= 1; // voxel zero
   await checkDilate(dilator, new Uint32Array([pack(10, 10, 10)]), corner, 'corner');
 
   // Random cluster of adjacent leaves with random masks.

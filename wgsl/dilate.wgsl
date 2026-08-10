@@ -1,16 +1,15 @@
-// Grid op: dilate an active-voxel mask set by one voxel (6-neighborhood),
-// the leaf-level word-shift approach of NanoVDB's DilateGrid on u32 words.
+// Dilates an active voxel mask set by one voxel across face neighbors,
+// the word shift approach of NanoVDB DilateGrid on u32 words.
 //
-// Input: sorted unique leaf keys + one 512-bit mask per leaf (voxel
-// n = (x<<6)|(y<<3)|z; word n>>5, bit n&31 — each u32 word covers one x and
-// four y values, one byte per (x, y) column of 8 z bits). count_spawn/
-// emit_spawn emit each leaf plus any face neighbor its boundary planes
-// spill into; after the host sorts and mark/compact dedupe the keys,
+// Input is a sorted unique leaf key table with one 512 bit mask per leaf.
+// Each u32 word covers one x and four y values, one byte per column of 8
+// z bits. count_spawn and emit_spawn emit each leaf plus any face neighbor
+// its boundary planes spill into. The host sorts and dedupes the keys and
 // dilate_masks builds each output leaf's mask from its own shifted words
 // plus the six neighbors' boundary planes.
 //
-// Keys are 10-bit packed relative coords; neighbors falling outside
-// 0..1023 are dropped (callers keep a one-leaf margin).
+// Neighbors falling outside the packed key range are dropped, so callers
+// keep a margin of one leaf.
 
 struct DilateParams {
     old_count: u32,
@@ -42,8 +41,8 @@ fn inRange(c: vec3<i32>) -> bool {
     return all(c >= vec3<i32>(0)) && all(c <= vec3<i32>(1023));
 }
 
-// Whether the leaf's boundary plane facing direction d (0..5 = -x +x -y +y
-// -z +z) has any active voxel.
+// True when the leaf's boundary plane facing direction d has any active
+// voxel. Directions order as negative then positive x, then y, then z.
 fn spills(leaf: u32, d: u32) -> bool {
     let base = leaf * 16u;
     var acc = 0u;
@@ -80,7 +79,7 @@ const DIRS = array<vec3<i32>, 6>(
     vec3<i32>(0, 0, -1), vec3<i32>(0, 0, 1),
 );
 
-// Shared by count (emit=false) and emit (emit=true); both must agree.
+// Shared by the count and emit passes, which must agree.
 fn spawn(i: u32, emit: bool, offset: u32) -> u32 {
     let c = unpack(old_keys[i]);
     var w = offset;
@@ -103,8 +102,7 @@ fn spawn(i: u32, emit: bool, offset: u32) -> u32 {
     return n;
 }
 
-// counts has old_count + 1 entries; the trailing 0 makes the exclusive
-// scan's last element the total spawn count.
+// counts has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
 fn count_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -127,8 +125,7 @@ fn emit_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// flags has spawn_count + 1 entries; the trailing 0 makes the exclusive
-// scan's last element the unique-leaf count.
+// flags has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
 fn mark_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;
@@ -154,7 +151,7 @@ fn compact_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// Zero mask for absent leaves, else the leaf's 16 words.
+// Loads the leaf's 16 words, or zeros when the leaf is absent.
 fn loadMask(key: u32, out: ptr<function, array<u32, 16>>) {
     var lo = 0u;
     var hi = params.old_count;
@@ -186,8 +183,7 @@ fn dilate_masks(
     loadMask(new_keys[i], &s);
 
     var out: array<u32, 16>;
-    // Within-leaf: identity plus single-bit shifts in y (8 bits within the
-    // word pair for one x) and z (1 bit within each byte).
+    // Within the leaf, identity plus one voxel shifts in y and z.
     for (var k = 0u; k < 8u; k = k + 1u) {
         let lo = s[2u * k];
         let hi = s[(2u * k) + 1u];

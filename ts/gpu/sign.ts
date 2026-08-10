@@ -1,9 +1,5 @@
-// Host side of wgsl/sign.wgsl. Stage 3 of the GPU mesh-to-grid pipeline:
-// inside/outside parity for every voxel of the binned leaves, as one
-// 512-bit mask per leaf (bit order matches the leaf value slabs).
-//
-//   const signer = new Signer(device);
-//   const inside = await signer.sign(bin);
+// Host side of wgsl/sign.wgsl. Computes inside parity for every voxel of
+// the binned leaves as one mask per leaf in slab bit order.
 
 import signWgsl from 'picovdb/wgsl/sign.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
@@ -14,10 +10,10 @@ import type { BinResult } from './mesh_to_grid.ts';
 const WG_SIZE = 256;
 
 export interface SignResult {
-  /** leafCount x 16 u32 words: bit n set = voxel n of that leaf is inside. */
+  /** One 512 bit mask per leaf. A set bit marks an inside voxel. */
   inside: GPUBuffer;
   crossingCount: number;
-  /** Sorted (column, z) crossings and the column grid, for parity queries downstream. */
+  /** Sorted crossings and the column grid for downstream parity queries. */
   crossCols: GPUBuffer;
   crossZ: GPUBuffer;
   colMinX: number;
@@ -64,8 +60,8 @@ export class Signer {
   async sign(bin: BinResult): Promise<SignResult> {
     const device = this.device;
     const triangleCount = bin.triangles.size / 12; // 3 u32 indices per triangle
-    // Column grid covering all candidate leaves (a superset of the mesh
-    // projection; parity per in-bounds column is bounds-independent).
+    // Column grid covering all candidate leaves. Parity per column does
+    // not depend on the grid bounds.
     const minX = bin.leafMin[0] * 8;
     const minY = bin.leafMin[1] * 8;
     const nx = (bin.leafMax[0] - bin.leafMin[0] + 1) * 8;
@@ -97,7 +93,7 @@ export class Signer {
         ],
       });
 
-    // Phase 1: count crossings per triangle, scan, read the total.
+    // Count crossings per triangle, scan, and read the total.
     const countScan = this.scanner.plan(counts, triangleCount + 1);
     {
       const encoder = device.createCommandEncoder();
@@ -111,7 +107,7 @@ export class Signer {
     }
     const crossingCount = (await readBackU32(device, counts, triangleCount + 1))[triangleCount];
 
-    // Phase 2: emit, sort by (column, z), then walk each leaf column.
+    // Emit, sort by column then height, and walk each leaf column.
     device.queue.writeBuffer(params, 4, new Uint32Array([crossingCount]));
     const crossCols = device.createBuffer({ size: Math.max(crossingCount, 1) * 4, usage: storage });
     const crossZ = device.createBuffer({ size: Math.max(crossingCount, 1) * 4, usage: storage });
@@ -123,7 +119,7 @@ export class Signer {
       pass.setPipeline(this.pipelines['emit_crossings']);
       dispatch2D(pass, Math.ceil(triangleCount / WG_SIZE));
       if (crossingCount > 0) {
-        // Stable sort by z, then stable sort by column: (column, z) order.
+        // Two stable sorts give column then height order.
         this.sorter.plan(crossZ, crossCols, crossingCount).encode(pass);
         this.sorter.plan(crossCols, crossZ, crossingCount).encode(pass);
       }

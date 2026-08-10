@@ -1,9 +1,6 @@
-// Host side of wgsl/dilate.wgsl: dilate an active-voxel mask set by one
-// voxel (face neighbors), growing the leaf table where masks spill across
-// leaf boundaries. Input and output stay on the GPU.
-//
-//   const dilator = new Dilator(device);
-//   const out = await dilator.dilate(leafKeys, masks, leafCount);
+// Host side of wgsl/dilate.wgsl. Dilates an active voxel mask set by one
+// voxel across face neighbors, growing the leaf table where masks spill
+// across leaf boundaries.
 
 import dilateWgsl from 'picovdb/wgsl/dilate.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
@@ -13,9 +10,9 @@ import { dispatch2D, readBackU32 } from './device.ts';
 const WG_SIZE = 256;
 
 export interface DilateResult {
-  /** Sorted unique leaf keys, including spawned face neighbors. */
+  /** Sorted unique leaf keys including spawned face neighbors. */
   leafKeys: GPUBuffer;
-  /** leafCount x 16 u32 mask words, dilated. */
+  /** Dilated masks with 16 words per leaf. */
   masks: GPUBuffer;
   leafCount: number;
 }
@@ -79,7 +76,7 @@ export class Dilator {
         ],
       });
 
-    // Phase 1: count spawned leaves, scan, read the total.
+    // Count spawned leaves, scan, and read the total.
     const countScan = this.scanner.plan(counts, leafCount + 1);
     {
       const encoder = device.createCommandEncoder();
@@ -93,7 +90,7 @@ export class Dilator {
     }
     const spawnCount = (await readBackU32(device, counts, leafCount + 1))[leafCount];
 
-    // Phase 2: emit, sort, dedupe.
+    // Emit, sort, and dedupe.
     device.queue.writeBuffer(params, 4, new Uint32Array([spawnCount]));
     const spawnKeys = device.createBuffer({ size: spawnCount * 4, usage: storage });
     const sortVals = device.createBuffer({ size: spawnCount * 4, usage: GPUBufferUsage.STORAGE });
@@ -120,7 +117,7 @@ export class Dilator {
     }
     const newCount = (await readBackU32(device, flags, spawnCount + 1))[spawnCount];
 
-    // Phase 3: build the dilated masks.
+    // Build the dilated masks.
     device.queue.writeBuffer(params, 8, new Uint32Array([newCount]));
     const newMasks = device.createBuffer({ size: newCount * 16 * 4, usage: storage });
     {

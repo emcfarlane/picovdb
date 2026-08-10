@@ -1,17 +1,16 @@
-// Mesh-to-grid stage 1: bin triangles into the 8^3 leaf blocks their
-// half-width-dilated bounding boxes touch.
+// Bins triangles into the 8^3 leaf blocks their dilated bounding boxes
+// touch.
 //
-// Mirrors rasterizeTriangle in src/mesh_to_grid.zig exactly: in index space,
-// a triangle's dilated bbox is [ceil(min - hw), floor(max + hw)] and it
-// touches leaves [lo >> 3, hi >> 3] inclusive per axis. count_pairs counts
-// leaves per triangle, the host runs scan.wgsl over the counts to get write
-// offsets (plus the total), emit_pairs writes (leaf key, triangle) pairs,
-// and after radix_sort.wgsl orders them by key, mark_unique/compact_unique
-// build the deduplicated leaf table.
+// The bounds match rasterizeTriangle in src/mesh_to_grid.zig. A triangle
+// covers the voxels inside its index space bounds dilated by the half
+// width and touches the leaves containing them. count_pairs counts leaves
+// per triangle, the host scans the counts into write offsets, emit_pairs
+// writes (leaf key, triangle) pairs, radix sort orders them by key, and
+// mark_unique plus compact_unique build the deduplicated leaf table.
 //
-// A leaf key packs the leaf coordinate relative to leaf_min, 10 bits per
-// axis: (x << 20) | (y << 10) | z. Grids up to 1024 leaves (8192 voxels)
-// per axis; the host validates the range.
+// A leaf key packs the leaf coordinate relative to leaf_min with 10 bits
+// per axis, so grids may span up to 1024 leaves per axis. The host
+// validates the range.
 
 struct BinParams {
     point_count: u32,
@@ -58,8 +57,7 @@ fn leafRange(t: u32) -> LeafRange {
     return LeafRange(lo >> vec3<u32>(3u), hi >> vec3<u32>(3u));
 }
 
-// counts has triangle_count + 1 entries; the trailing 0 makes the exclusive
-// scan's last element the total pair count.
+// counts has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
 fn count_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
@@ -96,8 +94,7 @@ fn emit_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// flags has pair_count + 1 entries; the trailing 0 makes the exclusive
-// scan's last element the unique-leaf count.
+// flags has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
 fn mark_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
     let i = gid.x;

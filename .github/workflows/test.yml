@@ -4,29 +4,20 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-
 permissions:
   contents: read
-
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Setup repo
-        uses: actions/checkout@v4
-
-      - name: Setup Deno
-        uses: denoland/setup-deno@v2
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-
-      - name: Lint
-        run: deno lint
-
-      - name: Type check
-        run: deno task check
-
-      # GPU tests skip themselves when no WebGPU adapter is available
-      # (CI runners have none); they still type-check and run locally.
-      - name: Test
-        run: deno task test:gpu
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: deno lint
+      - run: deno task check
+      # GPU tests skip when no WebGPU adapter is available.
+      - run: deno task test:gpu

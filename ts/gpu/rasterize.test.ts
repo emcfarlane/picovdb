@@ -9,7 +9,7 @@ let stl: Uint8Array | null = null;
 try {
   stl = Deno.readFileSync(new URL('../../data/bases/base_32mm.stl', import.meta.url));
 } catch {
-  // Sample data not present (e.g. CI); the STL test is skipped.
+  // Sample data not present, so the STL test skips.
 }
 
 function mulberry32(seed: number): () => number {
@@ -39,12 +39,11 @@ async function checkDistances(
   const expected = new Uint32Array(ref.values.buffer);
 
   if (got.length !== expected.length) throw new Error(`${label}: slab size mismatch`);
-  // Band membership must match exactly. Values may diverge slightly: GPU
-  // compilers fuse multiply-adds, which can flip closest-feature branches in
-  // the distance function; the branches are continuous so the distance error
-  // stays tiny (measured < 1e-5 voxels), but it is far beyond ulp gating.
+  // Band membership must match exactly. GPU compilers fuse multiply adds,
+  // which can flip closest feature branches in the distance function. The
+  // branches are continuous so the distance error stays tiny.
   const INF = 0x7f800000;
-  const MAX_ABS_D = 1e-3; // voxel units, on sqrt(d^2)
+  const MAX_ABS_D = 1e-3; // voxel units
   const gotF = new Float32Array(got.buffer);
   let band = 0;
   let maxAbs = 0;
@@ -84,7 +83,7 @@ Deno.test({ name: 'distance rasterization matches reference', ignore: !gpu }, as
   const soup = await checkDistances(binner, rasterizer, points, triangles, 0.5, 3, 'soup');
   if (soup.band === 0) throw new Error('no band voxels in soup');
 
-  // Degenerate (collinear) triangle exercises the segment fallback.
+  // A collinear triangle exercises the segment fallback.
   const line = new Float32Array([0, 0, 0, 4, 0, 0, 8, 0, 0]);
   await checkDistances(binner, rasterizer, line, new Uint32Array([0, 1, 2]), 1, 2, 'collinear');
 });

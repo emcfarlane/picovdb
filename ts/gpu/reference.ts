@@ -1,7 +1,7 @@
-// f32-exact reference implementations of the GPU mesh-to-grid stages, used
-// by the tests. Every operation rounds to f32 via Math.fround; for +,-,*,/
-// on f32 operands evaluated in f64 that matches the correctly rounded f32
-// result, so these mirror the WGSL bit for bit.
+// f32 exact reference implementations of the GPU stages, used by the
+// tests. Every operation rounds through Math.fround, which matches the
+// correctly rounded f32 result for f32 operands evaluated in f64, so
+// these mirror the WGSL bit for bit.
 
 const f = Math.fround;
 
@@ -74,7 +74,7 @@ export function distSqPointTriangle(p: V3, a: V3, b: V3, c: V3): number {
 
   const denom = f(f(va + vb) + vc);
   if (denom <= 0) {
-    // Degenerate (collinear) triangle: fall back to edge distances.
+    // Degenerate triangles fall back to edge distances.
     return Math.min(distSqPointSegment(p, a, b), distSqPointSegment(p, a, c), distSqPointSegment(p, b, c));
   }
   const inv = f(1 / denom);
@@ -88,9 +88,8 @@ export interface RefBin {
 }
 
 /**
- * Reference of the binning contract (rasterizeTriangle bounds in
- * src/mesh_to_grid.zig): dilated bbox [ceil(min-hw), floor(max+hw)],
- * leaves [lo>>3, hi>>3] per axis.
+ * Reference of the binning contract in rasterizeTriangle from
+ * src/mesh_to_grid.zig, with f32 arithmetic throughout.
  */
 export function refBin(
   points: Float32Array,
@@ -112,7 +111,7 @@ export function refBin(
       }
     }
   }
-  pairs.sort((a, b) => a[0] - b[0] || 0); // stable: tri order preserved per key
+  pairs.sort((a, b) => a[0] - b[0] || 0); // stable sort preserves triangle order per key
   const pairKeys = new Uint32Array(pairs.map((p) => p[0]));
   const pairTris = new Uint32Array(pairs.map((p) => p[1]));
   const leafKeys = new Uint32Array([...new Set(pairKeys)]);
@@ -120,9 +119,8 @@ export function refBin(
 }
 
 /**
- * Reference of the distance stage: per (leaf, triangle) pair, min-update
- * squared distances at voxel centers inside the dilated bbox and within
- * half_width. Returns leafCount x 512 slabs, +inf where untouched.
+ * Reference of the distance stage. Returns one slab of minimum squared
+ * distances per leaf, with infinity where untouched.
  */
 export function refRasterize(
   points: Float32Array,
@@ -167,10 +165,9 @@ export function refRasterize(
 }
 
 /**
- * Reference of the sign stage, mirroring ColumnGrid in src/mesh_to_grid.zig
- * in f64 (JS numbers), the same precision as the CPU: per-column +Z
- * crossings with the infinitesimal-shift tie-break, then odd-parity =
- * inside. Returns leafCount x 16 u32 mask words in leaf voxel-bit order.
+ * Reference of the sign stage, mirroring ColumnGrid from
+ * src/mesh_to_grid.zig in f64, the same precision as the CPU. Returns one
+ * inside mask per leaf in voxel bit order.
  */
 export function refSign(
   points: Float32Array,
@@ -194,7 +191,7 @@ export function refSign(
     const [bx, by, bz] = vert(pts, triangles[t * 3 + 1]);
     const [cx, cy, cz] = vert(pts, triangles[t * 3 + 2]);
     const signedArea = edge(ax, ay, bx, by, cx, cy);
-    if (signedArea === 0) continue; // XY-degenerate (vertical) triangle
+    if (signedArea === 0) continue; // vertical triangle
     const flip = signedArea < 0 ? -1 : 1;
     const area = flip * signedArea;
     const x0 = Math.ceil(Math.min(ax, bx, cx));
@@ -274,7 +271,64 @@ function leafRange(pts: Float32Array, triangles: Uint32Array, t: number, halfWid
   return { lo: loV.map((v) => v >> 3), hi: hiV.map((v) => v >> 3) };
 }
 
-/** Binary STL parser producing a triangle soup, for test inputs. */
+/**
+ * Reference of merge_csg in wgsl/merge.wgsl. Unions the leaf tables and
+ * takes per voxel minima, where a grid without the leaf contributes its
+ * implicit background. The band holds voxels with |v| below halfWidth.
+ */
+export function refCsgMerge(
+  aKeys: Uint32Array,
+  aValues: Float32Array,
+  bKeys: Uint32Array,
+  bValues: Float32Array,
+  halfWidth: number
+): { keys: Uint32Array; masks: Uint32Array; values: Float32Array } {
+  const implicit = (keys: Uint32Array, values: Float32Array, leaf: [number, number, number], n: number): number => {
+    const colBase = ((leaf[0] << 20) | (leaf[1] << 10)) >>> 0;
+    let lo = 0;
+    let hi = keys.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (keys[mid] < colBase) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo >= keys.length || (keys[lo] & 0xfffffc00) >>> 0 !== colBase) return halfWidth;
+    let best = lo;
+    let bestD = Math.abs((keys[lo] & 0x3ff) - leaf[2]);
+    for (let i = lo + 1; i < keys.length && ((keys[i] & 0xfffffc00) >>> 0) === colBase; i++) {
+      const d = Math.abs((keys[i] & 0x3ff) - leaf[2]);
+      if (d >= bestD) break;
+      best = i;
+      bestD = d;
+    }
+    const zloc = (keys[best] & 0x3ff) < leaf[2] ? 7 : 0;
+    const facing = (n & 0x1f8) | zloc;
+    return values[best * 512 + facing] < 0 ? -halfWidth : halfWidth;
+  };
+
+  const keys = new Uint32Array([...new Set([...aKeys, ...bKeys])].sort((x, y) => x - y));
+  const aIdx = new Map<number, number>();
+  aKeys.forEach((k, i) => aIdx.set(k, i));
+  const bIdx = new Map<number, number>();
+  bKeys.forEach((k, i) => bIdx.set(k, i));
+  const masks = new Uint32Array(keys.length * 16);
+  const values = new Float32Array(keys.length * 512);
+  keys.forEach((key, i) => {
+    const leaf: [number, number, number] = [(key >>> 20) & 0x3ff, (key >>> 10) & 0x3ff, key & 0x3ff];
+    const ai = aIdx.get(key);
+    const bi = bIdx.get(key);
+    for (let n = 0; n < 512; n++) {
+      const va = ai !== undefined ? aValues[ai * 512 + n] : implicit(aKeys, aValues, leaf, n);
+      const vb = bi !== undefined ? bValues[bi * 512 + n] : implicit(bKeys, bValues, leaf, n);
+      const v = Math.min(va, vb);
+      values[i * 512 + n] = v;
+      if (Math.abs(v) < halfWidth) masks[i * 16 + (n >> 5)] |= 1 << (n & 31);
+    }
+  });
+  return { keys, masks, values };
+}
+
+/** Binary STL parser producing a triangle soup for test inputs. */
 export function parseBinarySTL(bytes: Uint8Array): { points: Float32Array<ArrayBuffer>; triangles: Uint32Array<ArrayBuffer> } {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const triCount = view.getUint32(80, true);

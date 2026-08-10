@@ -1,13 +1,7 @@
-// Host side of wgsl/emit.wgsl. Stage 4 of the GPU mesh-to-grid pipeline:
-// turn the distance slabs and inside masks into the picovdb node buffers
-// (roots/uppers/lowers/leaves/data), GPU-resident and in the same layout
-// the renderer uploads. reEmit() runs the same emission from a grid-op
-// result (keys + band masks + signed values), closing the edit loop.
-//
-//   const emitter = new Emitter(device);
-//   const tree = await emitter.emit(bin, leafValues, sign, { halfWidth });
-//   const grid = await emitter.classifyOnly(bin, leafValues, sign, { halfWidth });
-//   const tree2 = await emitter.reEmit(editedGrid, { halfWidth });
+// Host side of wgsl/emit.wgsl. Turns distance slabs and inside masks into
+// the picovdb node buffers in the layout the renderer uploads. reEmit runs
+// the same emission from an edited grid of keys, band masks, and signed
+// values.
 
 import emitWgsl from 'picovdb/wgsl/emit.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
@@ -22,11 +16,11 @@ const LOWER_U32 = 388;
 const UPPER_U32 = 3076;
 
 export interface EmitOptions {
-  /** Narrow band half-width in voxels; must match the earlier stages. */
+  /** Narrow band half width in voxels. Must match the earlier stages. */
   halfWidth: number;
 }
 
-/** A grid at the op layer: sorted leaf keys, band masks, signed value slabs. */
+/** A grid at the op layer with sorted leaf keys, band masks, and signed value slabs. */
 export interface OpGrid {
   leafKeys: GPUBuffer;
   masks: GPUBuffer;
@@ -36,11 +30,11 @@ export interface OpGrid {
 }
 
 export interface EmitResult {
-  roots: GPUBuffer; // upperCount x 2 u32 keys (unpadded)
+  roots: GPUBuffer; // two u32 key words per upper, unpadded
   uppers: GPUBuffer;
   lowers: GPUBuffer;
   leaves: GPUBuffer;
-  data: GPUBuffer; // f32 values; [0]=+hw [1]=-hw, then per-voxel, zero-padded to 16B
+  data: GPUBuffer; // f32 values, two implicit background slots then per voxel values
   leafCount: number;
   lowerCount: number;
   upperCount: number;
@@ -100,8 +94,9 @@ export class Emitter {
   }
 
   /**
-   * Run only the classification pass, turning converter outputs into an
-   * op-layer grid: leafValues become signed in place, masks mark the band.
+   * Runs only the classification pass, turning converter outputs into an
+   * op layer grid. leafValues become signed in place and masks mark the
+   * band.
    */
   async classifyOnly(bin: BinResult, leafValues: GPUBuffer, sign: SignResult, opts: EmitOptions): Promise<OpGrid> {
     const prep = this.prepare(bin.leafKeys, leafValues, bin.leafCount, bin.leafMin, opts, null);
@@ -116,7 +111,7 @@ export class Emitter {
     return { leafKeys: bin.leafKeys, masks: prep.bandMasks, values: leafValues, leafCount: bin.leafCount, leafMin: bin.leafMin };
   }
 
-  /** Emission from an op-layer grid (e.g. after dilate/prune/merge). */
+  /** Emission from an op layer grid, such as a grid op result. */
   async reEmit(grid: OpGrid, opts: EmitOptions): Promise<EmitResult> {
     const prep = this.prepare(grid.leafKeys, grid.values, grid.leafCount, grid.leafMin, opts, grid.masks);
     {
@@ -171,8 +166,8 @@ export class Emitter {
     const finalCount = (await readBackU32(device, flags, cand + 1))[cand];
     if (finalCount === 0) throw new Error('no active voxels');
 
-    // Compact band leaves, re-sort into the CPU's depth-first emission order
-    // via the two-word hierarchical key, then value offsets and lowers.
+    // Compact band leaves, sort into the CPU's depth first emission order
+    // by the hierarchical key, then derive value offsets and lowers.
     device.queue.writeBuffer(params, 4, new Uint32Array([finalCount]));
     const tmpKeys = device.createBuffer({ size: finalCount * 4, usage: storage });
     const tmpCand = device.createBuffer({ size: finalCount * 4, usage: storage });
@@ -220,7 +215,7 @@ export class Emitter {
     }
     const upperCount = (await readBackU32(device, flags, lowerCount + 1))[lowerCount];
 
-    // Surface masks + all node/value outputs.
+    // Surface masks and all node and value outputs.
     device.queue.writeBuffer(params, 12, new Uint32Array([upperCount]));
     const upperKeys = device.createBuffer({ size: upperCount * 4, usage: storage });
     const upperFirst = device.createBuffer({ size: upperCount * 4, usage: storage });

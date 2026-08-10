@@ -1,14 +1,12 @@
-// Mesh-to-grid stage 4: tree emission, mirroring Builder in
-// src/mesh_to_grid.zig. Combines the distance slabs (rasterize.wgsl) and
-// inside masks (sign.wgsl) into signed narrow-band values, drops empty
-// leaves, derives the lower/upper/root tables by key truncation over the
-// sorted leaf list, and writes picovdb node buffers in the GPU-upload
-// layout (node order matches the CPU's depth-first emission because every
-// level is emitted in sorted-key order).
+// Emits the picovdb tree, mirroring Builder in src/mesh_to_grid.zig. Combines the distance slabs and inside masks into
+// signed narrow band values, drops empty leaves, derives the lower and
+// upper and root tables by key truncation over the sorted leaf list, and
+// writes the node buffers in the layout the renderer uploads. Node order
+// matches the CPU because every level is emitted in sorted key order.
 //
-// Each entry point uses only a subset of the bindings; pipelines are
-// created with auto layouts so per-kernel storage-buffer counts stay under
-// the WebGPU limit.
+// Each entry point uses a subset of the bindings. Pipelines use auto
+// layouts so per kernel storage buffer counts stay under the WebGPU
+// limit.
 
 struct EmitParams {
     cand_count: u32,
@@ -29,7 +27,7 @@ struct EmitParams {
 
 @group(0) @binding(0) var<uniform> params: EmitParams;
 @group(0) @binding(1) var<storage, read> cand_keys: array<u32>;
-@group(0) @binding(2) var<storage, read_write> values: array<u32>; // f32 bits: d^2 in, signed d out
+@group(0) @binding(2) var<storage, read_write> values: array<u32>; // f32 bits, squared distances in and signed distances out
 @group(0) @binding(3) var<storage, read> inside_masks: array<u32>;
 @group(0) @binding(4) var<storage, read_write> band_masks: array<u32>;
 @group(0) @binding(5) var<storage, read_write> band_counts: array<u32>;
@@ -72,8 +70,9 @@ fn pack(c: vec3<i32>) -> u32 {
     return (u32(c.x) << 20u) | (u32(c.y) << 10u) | u32(c.z);
 }
 
-// Re-emission entry: the inputs are already signed values + band masks
-// (from grid ops); just count band voxels and collect bounds.
+// Entry for emitting an edited grid. The inputs already hold signed
+// values and band masks, so this pass only counts band voxels and
+// collects bounds.
 @compute @workgroup_size(256)
 fn classify_re(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
@@ -105,7 +104,8 @@ fn classify_re(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     }
 }
 
-// Signed value slab + band mask per candidate leaf; global active bounds.
+// Writes the signed value slab and band mask per candidate leaf and
+// collects the global active bounds.
 @compute @workgroup_size(256)
 fn classify(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
@@ -113,7 +113,7 @@ fn classify(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
         return;
     }
     if (i == params.cand_count) {
-        band_counts[i] = 0u; // trailing 0 so the scan's last element is the total
+        band_counts[i] = 0u; // extra entry so the scanned total lands in the last slot
         return;
     }
     let origin = (unpack(cand_keys[i]) + params.leaf_min) << vec3<u32>(3u);
@@ -146,7 +146,7 @@ fn classify(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id)
     }
 }
 
-// flags over candidates: keep leaves with band voxels.
+// Flags candidate leaves that have band voxels.
 @compute @workgroup_size(256)
 fn mark_band(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
@@ -170,10 +170,11 @@ fn compact_band(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     tmp_cand[flags[i]] = i;
 }
 
-// The CPU emits leaves depth-first: uppers in coordinate order, then child
-// slots per level. Flat leaf-key order interleaves parents, so re-sort by
-// the hierarchical key (upper coords; lower-local; leaf-local) — a 57-bit
-// key split into two u32 words sorted in two stable passes.
+// The CPU emits leaves depth first, uppers in coordinate order and child
+// slots per level. Flat leaf key order interleaves parents, so the final
+// leaves sort by a hierarchical key of upper coordinate then lower local
+// slot then leaf local slot, split across two u32 words and sorted in two
+// stable passes.
 fn hierLoOf(key: u32) -> u32 {
     let a = unpack(key) + params.leaf_min;
     let low = (a >> vec3<u32>(4u)) & vec3<i32>(31);
@@ -287,12 +288,11 @@ fn compact_upper(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocatio
     }
 }
 
-// Sign of the empty space at a voxel, derived from the leaves themselves:
-// every surface crossing lives inside a band leaf, so sign is constant
-// across leafless space — the nearest final leaf in this voxel's (x, y)
-// column shares its facing-voxel sign, and a column with no leaves never
-// meets the surface, so it is outside. This replaces the CPU's column
-// parity with something that also works for re-emitted (edited) grids.
+// Sign of the empty space at a voxel, derived from the leaves. Every
+// surface crossing lives inside a band leaf, so sign is constant across
+// leafless space. The nearest final leaf in the voxel's column shares its
+// facing voxel sign and a column with no leaves is outside. This matches
+// the CPU's column parity and also works for edited grids.
 fn leafInside(ijk: vec3<i32>) -> bool {
     let rel = (ijk >> vec3<u32>(3u)) - params.leaf_min;
     if (rel.x < 0 || rel.x > 1023 || rel.y < 0 || rel.y > 1023) {
@@ -312,7 +312,7 @@ fn leafInside(ijk: vec3<i32>) -> bool {
     if (lo >= params.final_count || (tmp_keys[lo] & 0xfffffc00u) != col_base) {
         return false; // no leaves in this column
     }
-    // The run is sorted by z: walk it while distance decreases.
+    // The run sorts by z. Walk while the distance decreases.
     var best = lo;
     var best_d = abs(i32(tmp_keys[lo] & 0x3ffu) - rel.z);
     var i = lo + 1u;
@@ -347,8 +347,9 @@ fn findCand(key: u32) -> u32 {
     return 0xffffffffu;
 }
 
-// Signed value at any voxel: stored slab value for candidate leaves, else
-// the implicit +-hw by column parity (mirrors Builder.valueAt).
+// Signed value at any voxel. Candidate leaves supply their stored slab
+// value and everything else takes the implicit background, mirroring
+// Builder.valueAt.
 fn valueAt(ijk: vec3<i32>) -> f32 {
     let leaf = ijk >> vec3<u32>(3u);
     let rel = leaf - params.leaf_min;
@@ -368,8 +369,8 @@ const NEIGHBORS = array<vec3<i32>, 7>(
     vec3<i32>(1, 1, 1),
 );
 
-// Surface bit per active voxel: sign change toward any +1 neighbor
-// (mirrors Builder.emitLeaf).
+// Surface bit per active voxel. A voxel is surface when the sign changes
+// toward any positive neighbor, mirroring Builder.emitLeaf.
 @compute @workgroup_size(256)
 fn surface(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let j = globalIndex(wid, lid);
@@ -416,8 +417,8 @@ fn surface(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) 
     surf_counts[j] = total;
 }
 
-// Leaf nodes: 52 u32s each. surf_counts and value_counts hold their
-// exclusive scans by now.
+// Writes leaf nodes. surf_counts and value_counts hold their exclusive
+// scans by now.
 @compute @workgroup_size(256)
 fn write_leaves(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let j = globalIndex(wid, lid);
@@ -426,7 +427,7 @@ fn write_leaves(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     }
     let c = final_cand[j];
     let base = j * LEAF_U32;
-    leaves_out[base] = surf_counts[j]; // running surface count (u64 lo)
+    leaves_out[base] = surf_counts[j]; // running surface count
     leaves_out[base + 1u] = 0u;
     leaves_out[base + 2u] = 2u + value_counts[j];
     leaves_out[base + 3u] = 0u;
@@ -435,8 +436,8 @@ fn write_leaves(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     for (var w = 0u; w < 16u; w = w + 1u) {
         let band = band_masks[(c * 16u) + w];
         let surf = surf_masks[(j * 16u) + w];
-        // Inactive voxels are inside-implicit when their fill is negative
-        // (the classify pass signs fills, so this equals the parity bit).
+        // Inactive voxels read as inside when their fill is negative, which
+        // equals the parity bit because classify signs the fills.
         var inside = 0u;
         for (var b = 0u; b < 32u; b = b + 1u) {
             if (bitcast<f32>(values[(c * 512u) + (w * 32u) + b]) < 0.0) {
@@ -452,7 +453,8 @@ fn write_leaves(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     }
 }
 
-// Active values in leaf/bit order; slots 0/1 hold the implicit +-hw.
+// Writes active values in leaf and bit order. The first two slots hold
+// the implicit background values.
 @compute @workgroup_size(256)
 fn write_data(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let j = globalIndex(wid, lid);
@@ -473,7 +475,7 @@ fn write_data(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_i
     }
 }
 
-// tmp_keys stays flat-sorted after compaction; use it for existence tests.
+// tmp_keys stays flat sorted after compaction and serves existence tests.
 fn hasFinalLeaf(key: u32) -> bool {
     var lo = 0u;
     var hi = params.final_count;
@@ -488,7 +490,7 @@ fn hasFinalLeaf(key: u32) -> bool {
     return lo < params.final_count && tmp_keys[lo] == key;
 }
 
-// flat_lower is the flat-sorted copy of the (hierarchically ordered) lowers.
+// flat_lower is the flat sorted copy of the lower keys.
 fn hasLower(key: u32) -> bool {
     var lo = 0u;
     var hi = params.lower_count;
@@ -503,7 +505,7 @@ fn hasLower(key: u32) -> bool {
     return lo < params.lower_count && flat_lower[lo] == key;
 }
 
-// Lower nodes: 388 u32s each. Child slot n covers leaf (n>>8, n>>4, n) & 15.
+// Writes lower nodes in the CPU's child slot order.
 @compute @workgroup_size(256)
 fn write_lowers(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let l = globalIndex(wid, lid);
@@ -538,7 +540,7 @@ fn write_lowers(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     }
 }
 
-// Upper nodes: 3076 u32s each. Child slot n covers lower (n>>10, n>>5, n) & 31.
+// Writes upper nodes in the CPU's child slot order.
 @compute @workgroup_size(256)
 fn write_uppers(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let u = globalIndex(wid, lid);

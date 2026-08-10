@@ -1,11 +1,10 @@
-// Stable LSD radix sort of u32 keys with u32 payloads: 4-bit digits, 8
-// passes, ping-ponging between two key/payload buffer pairs.
+// Stable LSD radix sort of u32 keys with u32 payloads. Eight passes of 4
+// bit digits ping pong between two key and payload buffer pairs.
 //
-// Per pass: histogram counts each tile's digit occurrences into hist laid out
-// digit-major (hist[digit * num_tiles + tile]), the host runs the scan.wgsl
-// exclusive scan over hist (turning counts into global scatter bases), and
-// scatter re-reads the tile, ranks items stably in workgroup memory, and
-// writes them to keys_out/vals_out. See ts/gpu/radix_sort.ts.
+// Each pass runs histogram, then the scan.wgsl exclusive scan over hist
+// (digit major layout, so scanned counts become global scatter bases),
+// then scatter, which ranks each tile's items stably in workgroup memory
+// and writes them out. The host side lives in ts/gpu/radix_sort.ts.
 
 const WG_SIZE: u32 = 256u;
 const ITEMS: u32 = 4u;
@@ -60,9 +59,8 @@ fn scatter(
     let tid = lid.x;
     let base = (wid.x * TILE) + (tid * ITEMS);
 
-    // Items are assigned to threads in tile order (thread t owns elements
-    // [t*ITEMS, t*ITEMS+ITEMS)) so thread order x item order is the stable
-    // within-tile order.
+    // Thread t owns ITEMS consecutive elements, so thread order then item
+    // order is the stable order within a tile.
     var k: array<u32, ITEMS>;
     var v: array<u32, ITEMS>;
     var d: array<u32, ITEMS>;
@@ -81,8 +79,8 @@ fn scatter(
         }
     }
 
-    // Per digit, exclusive scan of per-thread counts across the workgroup:
-    // thread_base[b] = items with digit b in lower-numbered threads.
+    // For each digit an exclusive scan across the workgroup gives each
+    // thread the count of matching items in earlier threads.
     var thread_base: array<u32, RADIX>;
     for (var b = 0u; b < RADIX; b = b + 1u) {
         scan_buf[tid] = cnt[b];
@@ -100,8 +98,8 @@ fn scatter(
         workgroupBarrier();
     }
 
-    // hist now holds globally scanned bases; cnt is reused as the count of
-    // this thread's items already placed per digit.
+    // hist now holds globally scanned bases. cnt is reused to count this
+    // thread's items already placed per digit.
     for (var b = 0u; b < RADIX; b = b + 1u) {
         cnt[b] = 0u;
     }

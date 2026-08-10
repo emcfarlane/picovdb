@@ -9,7 +9,7 @@ let stl: Uint8Array | null = null;
 try {
   stl = Deno.readFileSync(new URL('../../data/bases/base_32mm.stl', import.meta.url));
 } catch {
-  // Sample data not present (e.g. CI); the STL test is skipped.
+  // Sample data not present, so the STL test skips.
 }
 
 function mulberry32(seed: number): () => number {
@@ -37,10 +37,9 @@ async function checkSigns(
   const got = await readBackU32(binner.device, sign.inside, bin.leafCount * 16);
   const leafKeys = await readBackU32(binner.device, bin.leafKeys, bin.leafCount);
   const expected = refSign(points, triangles, voxelSize, leafKeys, bin.leafMin);
-  // The GPU computes crossings in f32, the CPU (and this reference) in f64;
-  // parity may flip only for voxels whose column crossing lies within f32
-  // noise of their center plane — those are on the surface, so their
-  // narrow-band distance must be ~0.
+  // The GPU computes crossings in f32 and the reference in f64. Parity may
+  // flip only for voxels whose column crossing sits within f32 noise of
+  // their center plane, and those lie on the surface.
   const ref = refRasterize(points, triangles, voxelSize, halfWidth, bin.leafMin);
   const ON_SURFACE = 1e-2; // voxel units
   let inside = 0;
@@ -77,15 +76,15 @@ Deno.test({ name: 'parity signing matches f64 reference', ignore: !gpu }, async 
   const binner = new Binner(device);
   const signer = new Signer(device);
 
-  // A closed cube (12 triangles, watertight) with interior voxels.
+  // A closed cube with interior voxels.
   // deno-fmt-ignore
   const cubePts = new Float32Array([
-    -6, -6, -6,  6, -6, -6,  6, 6, -6,  -6, 6, -6, // z = -6 face corners
-    -6, -6, 6,   6, -6, 6,   6, 6, 6,   -6, 6, 6,  // z = +6 face corners
+    -6, -6, -6,  6, -6, -6,  6, 6, -6,  -6, 6, -6, // corners of the low z face
+    -6, -6, 6,   6, -6, 6,   6, 6, 6,   -6, 6, 6,  // corners of the high z face
   ]);
   const quads = [
-    [0, 1, 2, 3], // bottom (z-)
-    [4, 6, 5, 7], // top (z+) — winding irrelevant for parity
+    [0, 1, 2, 3], // low z face
+    [4, 6, 5, 7], // high z face, winding does not matter for parity
     [0, 4, 1, 5],
     [1, 5, 2, 6],
     [2, 6, 3, 7],
@@ -96,8 +95,8 @@ Deno.test({ name: 'parity signing matches f64 reference', ignore: !gpu }, async 
   const cube = await checkSigns(binner, signer, cubePts, new Uint32Array(cubeTris), 1, 3, 'cube');
   if (cube.inside === 0) throw new Error('cube has no inside voxels');
 
-  // Random soup: not watertight, parity is arbitrary but must be
-  // deterministic and match the reference.
+  // Random soup parity is arbitrary but deterministic and must match the
+  // reference.
   const rand = mulberry32(5);
   const triCount = 100;
   const points = new Float32Array(triCount * 9);

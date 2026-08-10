@@ -1,16 +1,12 @@
-// Host side of wgsl/scan.wgsl: device-wide exclusive prefix scan (u32),
-// in place over a storage buffer.
-//
-//   const scanner = new Scanner(device);
-//   const plan = scanner.plan(buffer, n); // reusable for a fixed buffer/n
-//   plan.encode(pass);                    // inside a compute pass
+// Host side of wgsl/scan.wgsl. Plans an exclusive prefix scan of u32
+// values in place over a storage buffer.
 
 import scanWgsl from 'picovdb/wgsl/scan.wgsl' with { type: 'text' };
 
 const TILE = 1024;
 
 interface ScanLevel {
-  count: number; // workgroups = tiles at this level
+  count: number; // tiles at this level
   partials: GPUBuffer;
   bindGroup: GPUBindGroup;
 }
@@ -36,7 +32,7 @@ export class Scanner {
     this.addOffsets = device.createComputePipeline({ layout, compute: { module, entryPoint: 'add_offsets' } });
   }
 
-  /** Plan an exclusive scan of the first `n` u32 elements of `buffer`. */
+  /** Plans an exclusive scan of the first n u32 elements of buffer. */
   plan(buffer: GPUBuffer, n: number): ScanPlan {
     return new ScanPlan(this, buffer, n);
   }

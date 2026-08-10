@@ -1,10 +1,5 @@
-// Host side of wgsl/radix_sort.wgsl: stable sort of u32 keys with u32
-// payloads. 8 passes of 4-bit digits, ping-ponging through scratch buffers;
-// the result lands back in the caller's buffers.
-//
-//   const sorter = new Sorter(device);
-//   const plan = sorter.plan(keys, vals, n);
-//   plan.encode(pass);
+// Host side of wgsl/radix_sort.wgsl. Plans a stable sort of u32 keys with
+// u32 payloads. The result lands back in the caller's buffers.
 
 import sortWgsl from 'picovdb/wgsl/radix_sort.wgsl' with { type: 'text' };
 import { Scanner, ScanPlan } from './scan.ts';
@@ -39,7 +34,7 @@ export class Sorter {
     this.scatter = device.createComputePipeline({ layout, compute: { module, entryPoint: 'scatter' } });
   }
 
-  /** Plan a sort of the first `n` (key, value) pairs; sorts in place. */
+  /** Plans an in place sort of the first n key and value pairs. */
   plan(keys: GPUBuffer, vals: GPUBuffer, n: number): SortPlan {
     return new SortPlan(this, keys, vals, n);
   }

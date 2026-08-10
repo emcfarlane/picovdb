@@ -1,18 +1,18 @@
-// Mesh-to-grid stage 2: exact narrow-band distances. One workgroup per
-// leaf walks its contiguous run of (leaf, triangle) pairs (the pair list
-// is sorted by leaf key), each thread covering two of the 512 voxels, and
-// accumulates the minimum squared point-to-triangle distance in a
-// workgroup-memory slab written back with plain stores — the workgroup
-// owns its leaf, so no global atomics and no per-thread slot searches.
+// Computes the narrow band squared distances for binned leaves.
 //
-// Distances are non-negative, so the u32 bit pattern of f32 d^2 orders
-// identically to the float value and atomicMin on the bitcast is an exact
-// float min.
+// One workgroup per leaf walks its contiguous run of the key sorted pair
+// list, each thread covers two of the 512 voxels, and minima accumulate in
+// a workgroup memory slab written back with plain stores. The workgroup
+// owns its leaf, so there are no global atomics and no slot searches.
+//
+// Distances are nonnegative, so the u32 bit pattern of an f32 orders the
+// same as the float value and atomicMin on the bitcast is an exact float
+// min.
 //
 // The distance function mirrors distSqPointTriangle in src/mesh_to_grid.zig
-// (Ericson closest-point-on-triangle) with an explicit summation order; the
-// per-voxel gate is the CPU's exact pair: inside the triangle's dilated
-// bbox AND d^2 <= half_width^2.
+// with an explicit summation order. A voxel updates only when it lies in
+// the triangle's dilated bounds and its squared distance is within the
+// squared half width, the same gate the CPU uses.
 
 struct RasterParams {
     pair_count: u32,
@@ -102,7 +102,7 @@ fn distSqPointTriangle(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, c: vec3<f32>) -
 
     let denom = (va + vb) + vc;
     if (denom <= 0.0) {
-        // Degenerate (collinear) triangle: fall back to edge distances.
+        // Degenerate triangles fall back to edge distances.
         let e0 = distSqPointSegment(p, a, b);
         let e1 = distSqPointSegment(p, a, c);
         let e2 = distSqPointSegment(p, b, c);
@@ -137,7 +137,7 @@ fn rasterize(
     atomicStore(&slab[lid.x + 256u], INF_BITS);
     workgroupBarrier();
 
-    // This leaf's contiguous run in the key-sorted pair list.
+    // Find this leaf's run in the key sorted pair list.
     var lo = 0u;
     var hi = params.pair_count;
     while (lo < hi) {
@@ -160,7 +160,7 @@ fn rasterize(
         let hi_v = vec3<i32>(floor(max(a, max(b, c)) + vec3<f32>(hw)));
 
         for (var n = lid.x; n < 512u; n = n + 256u) {
-            // Voxel order matches picovdb leafCoordToOffset: (x << 6) | (y << 3) | z.
+            // Voxel order matches picovdb leafCoordToOffset.
             let local = vec3<i32>(i32(n >> 6u), i32((n >> 3u) & 7u), i32(n & 7u));
             let ijk = origin + local;
             if (any(ijk < lo_v) || any(ijk > hi_v)) {

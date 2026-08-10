@@ -1,19 +1,19 @@
-// Mesh-to-grid stage 3: inside/outside parity per voxel via +Z ray
+// Computes inside or outside parity per voxel from vertical ray
 // crossings, mirroring ColumnGrid in src/mesh_to_grid.zig.
 //
-// Per triangle, every lattice column (x, y) covered by its XY projection
-// (with the same infinitesimal-shift tie-break as the CPU, so shared edges
-// count exactly once and XY-degenerate triangles contribute nothing)
-// records the surface crossing height z. count_crossings/emit_crossings are
-// the usual count -> scan -> emit; the host then sorts pairs by (column,
-// z) with two stable radix passes, and sign_leaves walks each candidate
-// leaf column, counting crossings below each voxel center: odd = inside.
+// Each triangle records a surface crossing height for every lattice column
+// its XY projection covers. The tie break matches the CPU, so an edge
+// shared by two triangles counts exactly once and vertical triangles
+// contribute nothing. The host scans the counts, sorts the crossings by
+// column then height with two stable radix passes, and sign_leaves walks
+// each candidate leaf column counting crossings below each voxel center.
+// An odd count means inside.
 //
-// The CPU computes crossings in f64; WGSL has no f64, so this runs in f32.
-// The tie-break stays consistent (all triangles evaluate identical
-// expressions), which preserves parity; only voxels whose column crossing
-// lies within f32 noise of their center plane can flip sign vs the CPU,
-// and those are on-surface band voxels.
+// The CPU computes crossings in f64. WGSL has no f64, so this runs in f32.
+// All triangles evaluate identical expressions, which keeps the parity
+// consistent. Only voxels whose column crossing sits within f32 noise of
+// their center plane can differ from the CPU, and those lie on the
+// surface.
 
 struct SignParams {
     triangle_count: u32,
@@ -57,7 +57,7 @@ fn accept(w: f32, ex: f32, ey: f32) -> bool {
     return ey < 0.0 || (ey == 0.0 && ex > 0.0);
 }
 
-// Monotone f32 -> u32 transform so crossing order survives the u32 sort.
+// Monotone f32 to u32 transform so crossing order survives the u32 sort.
 fn sortableFromF32(v: f32) -> u32 {
     let b = bitcast<u32>(v);
     if ((b >> 31u) == 1u) {
@@ -66,7 +66,7 @@ fn sortableFromF32(v: f32) -> u32 {
     return b | 0x80000000u;
 }
 
-// Shared by count (emit=false) and emit (emit=true); both must agree.
+// Shared by the count and emit passes, which must agree.
 fn binTriangle(t: u32, emit: bool, offset: u32) -> u32 {
     let a = loadPoint(triangles[t * 3u]);
     let b = loadPoint(triangles[(t * 3u) + 1u]);
@@ -74,7 +74,7 @@ fn binTriangle(t: u32, emit: bool, offset: u32) -> u32 {
 
     let signed_area = edgeFn(a.x, a.y, b.x, b.y, c.x, c.y);
     if (signed_area == 0.0) {
-        return 0u; // XY-degenerate (vertical) triangle
+        return 0u; // vertical triangle
     }
     var flip = 1.0;
     if (signed_area < 0.0) {
@@ -122,8 +122,7 @@ fn binTriangle(t: u32, emit: bool, offset: u32) -> u32 {
     return n;
 }
 
-// counts has triangle_count + 1 entries; the trailing 0 makes the exclusive
-// scan's last element the total crossing count.
+// counts has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
 fn count_crossings(@builtin(global_invocation_id) gid: vec3<u32>) {
     let t = gid.x;
@@ -146,9 +145,9 @@ fn emit_crossings(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 }
 
-// One workgroup per candidate leaf, one thread per (x, y) column; crossings
-// are sorted by (column, z). inside starts zeroed; each thread ORs the
-// parity bits of its column's 8 voxels.
+// One workgroup per candidate leaf and one thread per column. Crossings
+// arrive sorted by column then height. Each thread ORs the parity bits of
+// its column's 8 voxels into the zero initialized mask.
 @compute @workgroup_size(64)
 fn sign_leaves(
     @builtin(workgroup_id) wid: vec3<u32>,
@@ -189,8 +188,7 @@ fn sign_leaves(
         }
         bits = bits | ((count & 1u) << z);
     }
-    // Voxel offset n = (x<<6)|(y<<3)|z; this column's 8 voxels are the byte
-    // at n0 = lid.x * 8 within the leaf's 512-bit mask.
+    // This column's 8 voxels form one byte of the leaf mask.
     let n0 = lid.x << 3u;
     atomicOr(&inside[(leaf_i * 16u) + (n0 >> 5u)], bits << (n0 & 31u));
 }

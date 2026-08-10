@@ -1,5 +1,6 @@
 import { hasWebGPU, requestDevice, createU32Buffer, readBackU32 } from './device.ts';
 import { assertU32ArrayEqual } from './compare.ts';
+import { refCsgMerge } from './reference.ts';
 import { Pruner } from './prune.ts';
 import { Merger } from './merge.ts';
 
@@ -50,7 +51,7 @@ Deno.test({ name: 'prune matches reference', ignore: !gpu }, async () => {
     keys.length
   );
 
-  // Reference: AND, drop empty.
+  // The reference ANDs and drops empty leaves.
   const refKeys: number[] = [];
   const refMasks: number[] = [];
   for (let i = 0; i < keys.length; i++) {
@@ -71,10 +72,43 @@ Deno.test({ name: 'prune matches reference', ignore: !gpu }, async () => {
   assertU32ArrayEqual(await readBackU32(device, result.masks, result.leafCount * 16), new Uint32Array(refMasks), 'prune masks');
 });
 
-Deno.test({ name: 'merge matches reference', ignore: !gpu }, async () => {
+Deno.test({ name: 'topology merge matches reference', ignore: !gpu }, async () => {
   const device = await requestDevice();
   const merger = new Merger(device);
   const rand = mulberry32(8);
+  const a = randomGrid(rand, 30, false);
+  const b = randomGrid(rand, 30, false); // overlapping coordinate range
+
+  const result = await merger.merge(
+    { leafKeys: createU32Buffer(device, a.keys), masks: createU32Buffer(device, a.masks), leafCount: a.keys.length },
+    { leafKeys: createU32Buffer(device, b.keys), masks: createU32Buffer(device, b.masks), leafCount: b.keys.length }
+  );
+
+  // The reference is the sorted key union with OR masks.
+  const union = new Uint32Array([...new Set([...a.keys, ...b.keys])].sort((x, y) => x - y));
+  if (result.leafCount !== union.length) throw new Error(`count ${result.leafCount} != ${union.length}`);
+  assertU32ArrayEqual(await readBackU32(device, result.leafKeys, result.leafCount), union, 'merge keys');
+
+  const aIdx = new Map<number, number>();
+  a.keys.forEach((k, i) => aIdx.set(k, i));
+  const bIdx = new Map<number, number>();
+  b.keys.forEach((k, i) => bIdx.set(k, i));
+  const refMasks = new Uint32Array(union.length * 16);
+  union.forEach((key, i) => {
+    const ai = aIdx.get(key);
+    const bi = bIdx.get(key);
+    for (let w = 0; w < 16; w++) {
+      refMasks[i * 16 + w] = ((ai !== undefined ? a.masks[ai * 16 + w] : 0) | (bi !== undefined ? b.masks[bi * 16 + w] : 0)) >>> 0;
+    }
+  });
+  assertU32ArrayEqual(await readBackU32(device, result.masks, result.leafCount * 16), refMasks, 'merge masks');
+});
+
+Deno.test({ name: 'CSG merge matches reference', ignore: !gpu }, async () => {
+  const device = await requestDevice();
+  const merger = new Merger(device);
+  const rand = mulberry32(9);
+  const halfWidth = 3;
   const a = randomGrid(rand, 30, true);
   const b = randomGrid(rand, 30, true); // overlapping coordinate range
 
@@ -90,40 +124,17 @@ Deno.test({ name: 'merge matches reference', ignore: !gpu }, async () => {
       masks: createU32Buffer(device, b.masks),
       values: createU32Buffer(device, new Uint32Array(b.values!.buffer)),
       leafCount: b.keys.length,
-    }
+    },
+    { halfWidth }
   );
 
-  // Reference: sorted union of keys; OR masks; min values.
-  const union = new Uint32Array([...new Set([...a.keys, ...b.keys])].sort((x, y) => x - y));
-  if (result.leafCount !== union.length) throw new Error(`count ${result.leafCount} != ${union.length}`);
-  assertU32ArrayEqual(await readBackU32(device, result.leafKeys, result.leafCount), union, 'merge keys');
-
-  const aIdx = new Map<number, number>();
-  a.keys.forEach((k, i) => aIdx.set(k, i));
-  const bIdx = new Map<number, number>();
-  b.keys.forEach((k, i) => bIdx.set(k, i));
-  const refMasks = new Uint32Array(union.length * 16);
-  const refValues = new Float32Array(union.length * 512);
-  union.forEach((key, i) => {
-    const ai = aIdx.get(key);
-    const bi = bIdx.get(key);
-    for (let w = 0; w < 16; w++) {
-      refMasks[i * 16 + w] = ((ai !== undefined ? a.masks[ai * 16 + w] : 0) | (bi !== undefined ? b.masks[bi * 16 + w] : 0)) >>> 0;
-    }
-    for (let n = 0; n < 512; n++) {
-      if (ai !== undefined && bi !== undefined) {
-        refValues[i * 512 + n] = Math.min(a.values![ai * 512 + n], b.values![bi * 512 + n]);
-      } else if (ai !== undefined) {
-        refValues[i * 512 + n] = a.values![ai * 512 + n];
-      } else {
-        refValues[i * 512 + n] = b.values![bi! * 512 + n];
-      }
-    }
-  });
-  assertU32ArrayEqual(await readBackU32(device, result.masks, result.leafCount * 16), refMasks, 'merge masks');
+  const ref = refCsgMerge(a.keys, a.values!, b.keys, b.values!, halfWidth);
+  if (result.leafCount !== ref.keys.length) throw new Error(`count ${result.leafCount} != ${ref.keys.length}`);
+  assertU32ArrayEqual(await readBackU32(device, result.leafKeys, result.leafCount), ref.keys, 'csg keys');
+  assertU32ArrayEqual(await readBackU32(device, result.masks, result.leafCount * 16), ref.masks, 'csg masks');
   assertU32ArrayEqual(
     await readBackU32(device, result.values!, result.leafCount * 512),
-    new Uint32Array(refValues.buffer),
-    'merge values'
+    new Uint32Array(ref.values.buffer),
+    'csg values'
   );
 });

@@ -1,6 +1,6 @@
-// Grid op: prune. AND each leaf's mask with a retain mask and drop leaves
-// left empty, compacting the leaf table (the topology half of NanoVDB's
-// PruneGrid). The host scans flags between mark and compact.
+// ANDs each leaf's mask with a retain mask and drops leaves left empty,
+// compacting the leaf table. The host scans flags between mark and
+// compact.
 
 struct PruneParams {
     count: u32,
@@ -28,8 +28,7 @@ fn survives(i: u32) -> bool {
     return any != 0u;
 }
 
-// flags has count + 1 entries; the trailing 0 makes the exclusive scan's
-// last element the surviving-leaf count.
+// flags has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
 fn mark(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);

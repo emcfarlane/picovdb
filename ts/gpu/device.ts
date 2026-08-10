@@ -27,8 +27,9 @@ export function createU32Buffer(device: GPUDevice, data: Uint32Array<ArrayBuffer
 export const DISPATCH_STRIDE = 65535;
 
 /**
- * Linearized 2D dispatch: workgroup index = wid.y * DISPATCH_STRIDE + wid.x
- * on the WGSL side. When groups spill into y, x must be exactly the stride.
+ * Linearized 2D dispatch. The WGSL side derives the workgroup index from
+ * the stride, so when groups spill into y the x count must equal the
+ * stride.
  */
 export function dispatch2D(pass: GPUComputePassEncoder, groups: number): void {
   if (groups <= DISPATCH_STRIDE) {

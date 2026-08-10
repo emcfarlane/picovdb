@@ -1,9 +1,6 @@
-// Host side of wgsl/merge.wgsl: union two grids' leaf tables, OR their
-// masks, and (when value slabs are provided) min-combine values — the SDF
-// union.
-//
-//   const merger = new Merger(device);
-//   const out = await merger.merge(a, b);
+// Host side of wgsl/merge.wgsl. Unions two grids' leaf tables. Without
+// values the masks OR together. With value slabs this is the SDF union,
+// which handles overlapping solids.
 
 import mergeWgsl from 'picovdb/wgsl/merge.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
@@ -16,7 +13,7 @@ export interface MergeInput {
   leafKeys: GPUBuffer;
   masks: GPUBuffer;
   leafCount: number;
-  /** Optional leafCount x 512 f32 value slabs. */
+  /** Optional value slabs with 512 f32 values per leaf. */
   values?: GPUBuffer;
 }
 
@@ -38,16 +35,19 @@ export class Merger {
     this.scanner = new Scanner(device);
     this.sorter = new Sorter(device);
     const module = device.createShaderModule({ code: mergeWgsl });
-    for (const entryPoint of ['mark_unique', 'compact_unique', 'merge_masks', 'merge_values']) {
+    for (const entryPoint of ['mark_unique', 'compact_unique', 'merge_masks', 'merge_csg']) {
       this.pipelines[entryPoint] = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } });
     }
   }
 
-  async merge(a: MergeInput, b: MergeInput): Promise<MergeResult> {
+  async merge(a: MergeInput, b: MergeInput, opts: { halfWidth?: number } = {}): Promise<MergeResult> {
     const device = this.device;
+    const csg = !!(a.values && b.values);
+    if (csg && !opts.halfWidth) throw new Error('halfWidth is required to merge value-carrying grids');
     const concatCount = a.leafCount + b.leafCount;
-    const params = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(params, 0, new Uint32Array([a.leafCount, b.leafCount, concatCount]));
+    device.queue.writeBuffer(params, 16, new Float32Array([opts.halfWidth ?? 0]));
 
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     const concatKeys = device.createBuffer({ size: concatCount * 4, usage: storage });
@@ -84,19 +84,18 @@ export class Merger {
     device.queue.writeBuffer(params, 12, new Uint32Array([outCount]));
     const outKeys = device.createBuffer({ size: outCount * 4, usage: storage });
     const outMasks = device.createBuffer({ size: outCount * 16 * 4, usage: storage });
-    const outValues = a.values && b.values
-      ? device.createBuffer({ size: outCount * 512 * 4, usage: storage })
-      : undefined;
+    const outValues = csg ? device.createBuffer({ size: outCount * 512 * 4, usage: storage }) : undefined;
     {
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();
       run(pass, 'compact_unique', concatCount, { 1: concatKeys, 2: flags, 3: outKeys });
-      run(pass, 'merge_masks', outCount, {
-        3: outKeys, 4: a.leafKeys, 5: a.masks, 6: b.leafKeys, 7: b.masks, 8: outMasks,
-      });
       if (outValues) {
-        run(pass, 'merge_values', outCount, {
-          3: outKeys, 4: a.leafKeys, 5: a.values!, 6: b.leafKeys, 7: b.values!, 8: outValues,
+        run(pass, 'merge_csg', outCount, {
+          3: outKeys, 4: a.leafKeys, 5: a.values!, 6: b.leafKeys, 7: b.values!, 8: outValues, 9: outMasks,
+        });
+      } else {
+        run(pass, 'merge_masks', outCount, {
+          3: outKeys, 4: a.leafKeys, 5: a.masks, 6: b.leafKeys, 7: b.masks, 8: outMasks,
         });
       }
       pass.end();

@@ -48,7 +48,7 @@ Deno.test({ name: 'radix sort matches stable JS sort', ignore: !gpu }, async () 
     { n: 1030, keyBits: 32 },
     { n: 65536, keyBits: 32 },
     { n: 1 << 20, keyBits: 32 },
-    // Few distinct keys: long equal runs exercise stability.
+    // Few distinct keys exercise stability with long equal runs.
     { n: 100000, keyBits: 4 },
   ];
   for (const { n, keyBits } of cases) {

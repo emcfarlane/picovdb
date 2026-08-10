@@ -1,10 +1,6 @@
-// Host side of wgsl/mesh_to_grid.wgsl. Stage 1 of the GPU mesh-to-grid
-// pipeline: bin triangles into the 8^3 leaf blocks their half-width-dilated
-// bounds touch, producing the sorted (leaf key, triangle) pair list and the
-// deduplicated leaf table, all left on the GPU.
-//
-//   const binner = new Binner(device);
-//   const result = await binner.bin(points, triangles, { voxelSize, halfWidth });
+// Host side of wgsl/mesh_to_grid.wgsl. Bins triangles into the leaf
+// blocks their dilated bounds touch, producing the sorted pair list and
+// the deduplicated leaf table, all kept on the GPU.
 
 import binWgsl from 'picovdb/wgsl/mesh_to_grid.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
@@ -16,30 +12,30 @@ const WG_SIZE = 256;
 export interface BinOptions {
   /** World units per voxel. */
   voxelSize: number;
-  /** Narrow band half-width in voxels. */
+  /** Narrow band half width in voxels. */
   halfWidth: number;
   /**
-   * Leaf-space bounds override, e.g. from leafBounds() over a combined
-   * mesh so several grids share one key space (required for merging).
+   * Leaf space bounds override so several grids share one key space, as
+   * merging requires. Compute with leafBounds over a combined mesh.
    */
   bounds?: { leafMin: [number, number, number]; leafMax: [number, number, number] };
 }
 
 export interface BinResult {
-  /** Index-space vertex positions (xyz triples). */
+  /** Index space vertex positions as xyz triples. */
   pointsIndex: GPUBuffer;
-  /** Vertex index triples, as uploaded. */
+  /** Vertex index triples as uploaded. */
   triangles: GPUBuffer;
   /** (leaf key, triangle index) pairs sorted by key. */
   pairKeys: GPUBuffer;
   pairTris: GPUBuffer;
   pairCount: number;
-  /** Deduplicated leaf keys, sorted. */
+  /** Sorted deduplicated leaf keys. */
   leafKeys: GPUBuffer;
   leafCount: number;
-  /** Leaf-space bias: leaf coordinate = unpacked key + leafMin; voxel origin = coordinate * 8. */
+  /** Leaf space bias. A leaf coordinate is the unpacked key plus leafMin. */
   leafMin: [number, number, number];
-  /** Maximum leaf coordinate (inclusive). */
+  /** Maximum leaf coordinate inclusive. */
   leafMax: [number, number, number];
 }
 
@@ -117,7 +113,7 @@ export class Binner {
         ],
       });
 
-    // Phase 1: transform + count + scan, then read the total pair count.
+    // Transform, count, and scan, then read the total pair count.
     const countGroup = bindGroup(placeholder, placeholder, placeholder, placeholder);
     const countScan = this.scanner.plan(counts, triangleCount + 1);
     {
@@ -133,7 +129,7 @@ export class Binner {
     const pairCount = (await readBackU32(device, counts, triangleCount + 1))[triangleCount];
     if (pairCount === 0) throw new Error('no leaves touched (degenerate mesh?)');
 
-    // Phase 2: emit, sort by key, mark/compact unique leaves.
+    // Emit, sort by key, then mark and compact unique leaves.
     device.queue.writeBuffer(params, 28, new Uint32Array([pairCount]));
     const pairKeys = device.createBuffer({ size: pairCount * 4, usage: storage });
     const pairTris = device.createBuffer({ size: pairCount * 4, usage: storage });
@@ -169,7 +165,7 @@ export class Binner {
   }
 }
 
-/** Leaf coordinate bounds over all dilated vertex bounds, f32-exact to the GPU math. */
+/** Leaf coordinate bounds over all dilated vertices, f32 exact to the GPU math. */
 export function leafBounds(
   points: Float32Array,
   invVoxelSize: number,

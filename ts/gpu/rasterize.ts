@@ -1,19 +1,13 @@
-// Host side of wgsl/rasterize.wgsl. Stage 2 of the GPU mesh-to-grid
-// pipeline: fill each binned leaf's 512-voxel slab with the minimum squared
-// distance to any incident triangle, in voxel units, +inf where no triangle
-// is within the narrow band.
-//
-//   const rasterizer = new Rasterizer(device);
-//   const leafValues = rasterizer.rasterize(bin, { halfWidth });
+// Host side of wgsl/rasterize.wgsl. Fills each binned leaf's slab with
+// the minimum squared distance to any incident triangle in voxel units,
+// with infinity where no triangle is within the band.
 
 import rasterWgsl from 'picovdb/wgsl/rasterize.wgsl' with { type: 'text' };
 import { dispatch2D } from './device.ts';
 import type { BinResult } from './mesh_to_grid.ts';
 
-const WG_SIZE = 256;
-
 export interface RasterizeOptions {
-  /** Narrow band half-width in voxels; must match the binning pass. */
+  /** Narrow band half width in voxels. Must match the binning pass. */
   halfWidth: number;
 }
 
@@ -45,7 +39,7 @@ export class Rasterizer {
     this.rasterizePipeline = device.createComputePipeline({ layout, compute: { module, entryPoint: 'rasterize' } });
   }
 
-  /** Returns the leaf value slabs: leafCount x 512 f32 squared distances (bitcast u32). */
+  /** Returns one slab of 512 squared distances per leaf as f32 bits. */
   rasterize(bin: BinResult, opts: RasterizeOptions): GPUBuffer {
     const device = this.device;
     const valueBytes = bin.leafCount * 512 * 4;

@@ -1,8 +1,5 @@
-// Host side of wgsl/prune.wgsl: AND leaf masks with a retain set and drop
-// leaves left empty.
-//
-//   const pruner = new Pruner(device);
-//   const out = await pruner.prune(leafKeys, masks, retain, leafCount);
+// Host side of wgsl/prune.wgsl. ANDs leaf masks with a retain set and
+// drops leaves left empty.
 
 import pruneWgsl from 'picovdb/wgsl/prune.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
