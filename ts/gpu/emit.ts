@@ -78,7 +78,7 @@ export class Emitter {
   }
 
   /** Full emission from the converter stages. */
-  async emit(bin: BinResult, leafValues: GPUBuffer, sign: SignResult, opts: EmitOptions): Promise<EmitResult> {
+  emit(bin: BinResult, leafValues: GPUBuffer, sign: SignResult, opts: EmitOptions): Promise<EmitResult> {
     const prep = this.prepare(bin.leafKeys, leafValues, bin.leafCount, bin.leafMin, opts, null);
     {
       const encoder = this.device.createCommandEncoder();
@@ -112,7 +112,7 @@ export class Emitter {
   }
 
   /** Emission from an op layer grid, such as a grid op result. */
-  async reEmit(grid: OpGrid, opts: EmitOptions): Promise<EmitResult> {
+  reEmit(grid: OpGrid, opts: EmitOptions): Promise<EmitResult> {
     const prep = this.prepare(grid.leafKeys, grid.values, grid.leafCount, grid.leafMin, opts, grid.masks);
     {
       const encoder = this.device.createCommandEncoder();

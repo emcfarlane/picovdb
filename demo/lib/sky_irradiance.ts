@@ -6,7 +6,7 @@
 // Environment Maps"). The shader then evaluates per-pixel irradiance with
 // 9 fused multiply-adds instead of sampling the sky model per pixel.
 
-import { skyStateRadiance, Channel } from './hw_skymodel.ts';
+import { skyStateRadiance, type Channel } from './hw_skymodel.ts';
 
 const SOLAR_RADIUS_RADIANS = 0.004450589; // must match hw_skymodel.ts
 

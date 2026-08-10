@@ -2,7 +2,7 @@
 // u32 payloads. The result lands back in the caller's buffers.
 
 import sortWgsl from 'picovdb/wgsl/radix_sort.wgsl' with { type: 'text' };
-import { Scanner, ScanPlan } from './scan.ts';
+import { Scanner, type ScanPlan } from './scan.ts';
 
 const TILE = 1024;
 const RADIX = 16;
