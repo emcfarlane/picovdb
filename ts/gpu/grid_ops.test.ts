@@ -1,21 +1,11 @@
 import { hasWebGPU, requestDevice, createU32Buffer, readBackU32 } from './device.ts';
+import { mulberry32 } from './test_util.ts';
 import { assertU32ArrayEqual } from './compare.ts';
 import { refCsgMerge } from './reference.ts';
 import { Pruner } from './prune.ts';
 import { Merger } from './merge.ts';
 
 const gpu = await hasWebGPU();
-
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return () => {
-    a = (a + 0x6d2b79f5) >>> 0;
-    let t = a;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
 
 const pack = (x: number, y: number, z: number): number => ((x << 20) | (y << 10) | z) >>> 0;
 

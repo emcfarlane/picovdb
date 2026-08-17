@@ -4,16 +4,17 @@
 // values.
 
 import emitWgsl from 'picovdb/wgsl/emit.wgsl' with { type: 'text' };
+import { PICOVDB_LEAF_SIZE, PICOVDB_LOWER_SIZE, PICOVDB_UPPER_SIZE } from '../picovdb.ts';
 import { Scanner } from './scan.ts';
 import { Sorter } from './radix_sort.ts';
-import { dispatch2D, readBackU32 } from './device.ts';
+import { dispatch2D, readBackTotals, readBackU32 } from './device.ts';
 import type { BinResult } from './mesh_to_grid.ts';
 import type { SignResult } from './sign.ts';
 
 const WG_SIZE = 256;
-const LEAF_U32 = 52;
-const LOWER_U32 = 388;
-const UPPER_U32 = 3076;
+export const LEAF_U32 = PICOVDB_LEAF_SIZE / 4;
+export const LOWER_U32 = PICOVDB_LOWER_SIZE / 4;
+export const UPPER_U32 = PICOVDB_UPPER_SIZE / 4;
 
 export interface EmitOptions {
   /** Narrow band half width in voxels. Must match the earlier stages. */
@@ -27,6 +28,8 @@ export interface OpGrid {
   values: GPUBuffer;
   leafCount: number;
   leafMin: [number, number, number];
+  /** Maximum leaf coordinate inclusive. */
+  leafMax: [number, number, number];
 }
 
 export interface EmitResult {
@@ -63,10 +66,17 @@ export class Emitter {
   readonly sorter: Sorter;
   private readonly pipelines: Record<string, GPUComputePipeline> = {};
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
     this.device = device;
-    this.scanner = new Scanner(device);
-    this.sorter = new Sorter(device);
+    this.scanner = scanner;
+    this.sorter = sorter;
+    // The shader hardcodes the node strides. Fail construction on drift
+    // from the picovdb sizes.
+    for (const [name, value] of [['LEAF_U32', LEAF_U32], ['LOWER_U32', LOWER_U32], ['UPPER_U32', UPPER_U32]] as const) {
+      if (!emitWgsl.includes(`${name}: u32 = ${value}u`)) {
+        throw new Error(`wgsl/emit.wgsl ${name} does not match the picovdb node size`);
+      }
+    }
     const module = device.createShaderModule({ code: emitWgsl });
     for (const entryPoint of [
       'classify', 'classify_re', 'mark_band', 'compact_band', 'hier_lo', 'hier_hi', 'reorder_final',
@@ -107,8 +117,14 @@ export class Emitter {
     }, prep.params);
     pass.end();
     this.device.queue.submit([encoder.finish()]);
-    await this.device.queue.onSubmittedWorkDone();
-    return { leafKeys: bin.leafKeys, masks: prep.bandMasks, values: leafValues, leafCount: bin.leafCount, leafMin: bin.leafMin };
+    return {
+      leafKeys: bin.leafKeys,
+      masks: prep.bandMasks,
+      values: leafValues,
+      leafCount: bin.leafCount,
+      leafMin: bin.leafMin,
+      leafMax: bin.leafMax,
+    };
   }
 
   /** Emission from an op layer grid, such as a grid op result. */
@@ -163,7 +179,7 @@ export class Emitter {
     const device = this.device;
     const { params, candKeys, values, bandMasks, bandCounts, bounds, flags, cand } = prep;
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-    const finalCount = (await readBackU32(device, flags, cand + 1))[cand];
+    const [finalCount] = await readBackTotals(device, [{ buffer: flags, index: cand }]);
     if (finalCount === 0) throw new Error('no active voxels');
 
     // Compact band leaves, sort into the CPU's depth first emission order
@@ -192,8 +208,10 @@ export class Emitter {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const dataValues = (await readBackU32(device, valueCounts, finalCount + 1))[finalCount];
-    const lowerCount = (await readBackU32(device, flags, finalCount + 1))[finalCount];
+    const [dataValues, lowerCount] = await readBackTotals(device, [
+      { buffer: valueCounts, index: finalCount },
+      { buffer: flags, index: finalCount },
+    ]);
 
     device.queue.writeBuffer(params, 8, new Uint32Array([lowerCount]));
     const lowerKeys = device.createBuffer({ size: lowerCount * 4, usage: storage });
@@ -213,7 +231,7 @@ export class Emitter {
       passB.end();
       device.queue.submit([encoder.finish()]);
     }
-    const upperCount = (await readBackU32(device, flags, lowerCount + 1))[lowerCount];
+    const [upperCount] = await readBackTotals(device, [{ buffer: flags, index: lowerCount }]);
 
     // Surface masks and all node and value outputs.
     device.queue.writeBuffer(params, 12, new Uint32Array([upperCount]));
@@ -249,7 +267,7 @@ export class Emitter {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const surfaceVoxels = (await readBackU32(device, surfCounts, finalCount + 1))[finalCount];
+    const [surfaceVoxels] = await readBackTotals(device, [{ buffer: surfCounts, index: finalCount }]);
     const boundsOut = new Int32Array((await readBackU32(device, bounds, 6)).buffer);
 
     return {

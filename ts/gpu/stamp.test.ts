@@ -6,7 +6,7 @@ const gpu = await hasWebGPU();
 
 function emptyGrid(device: GPUDevice): OpGrid {
   const placeholder = () => device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE });
-  return { leafKeys: placeholder(), masks: placeholder(), values: placeholder(), leafCount: 0, leafMin: [0, 0, 0] };
+  return { leafKeys: placeholder(), masks: placeholder(), values: placeholder(), leafCount: 0, leafMin: [0, 0, 0], leafMax: [1023, 1023, 1023] };
 }
 
 // Every stored voxel of the stamped grid must match the expected SDF

@@ -19,9 +19,9 @@ export class Pruner {
   readonly mark: GPUComputePipeline;
   readonly compact: GPUComputePipeline;
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device)) {
     this.device = device;
-    this.scanner = new Scanner(device);
+    this.scanner = scanner;
     const module = device.createShaderModule({ code: pruneWgsl });
     this.mark = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'mark' } });
     this.compact = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'compact' } });

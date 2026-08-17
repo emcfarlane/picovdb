@@ -34,6 +34,7 @@ struct StampParams {
 @group(0) @binding(5) var<storage, read_write> new_keys: array<u32>;
 @group(0) @binding(6) var<storage, read_write> out_values: array<u32>;
 @group(0) @binding(7) var<storage, read_write> out_masks: array<u32>;
+@group(0) @binding(8) var<storage, read> old_masks: array<u32>;
 
 const DISPATCH_STRIDE: u32 = 65535u;
 const NOT_FOUND: u32 = 0xffffffffu;
@@ -142,6 +143,17 @@ fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) li
     let leaf = vec3<i32>(i32(key >> 20u), i32((key >> 10u) & 0x3ffu), i32(key & 0x3ffu));
     let origin = leaf << vec3<u32>(3u);
     let old = findOld(key);
+    // Leaves outside the candidate box cannot change. Copy them verbatim.
+    let box_hi = params.box_lo + params.box_dims - vec3<i32>(1);
+    if (any(leaf < params.box_lo) || any(leaf > box_hi)) {
+        for (var n = 0u; n < 512u; n = n + 1u) {
+            out_values[(i * 512u) + n] = old_values[(old * 512u) + n];
+        }
+        for (var w = 0u; w < 16u; w = w + 1u) {
+            out_masks[(i * 16u) + w] = old_masks[(old * 16u) + w];
+        }
+        return;
+    }
     let hw = params.half_width;
     var mask = 0u;
     for (var n = 0u; n < 512u; n = n + 1u) {

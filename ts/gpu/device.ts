@@ -39,6 +39,31 @@ export function dispatch2D(pass: GPUComputePassEncoder, groups: number): void {
   }
 }
 
+/** Reads one u32 per request in a single copy and map. */
+export async function readBackTotals(
+  device: GPUDevice,
+  reads: Array<{ buffer: GPUBuffer; index: number }>
+): Promise<number[]> {
+  const staging = device.createBuffer({
+    size: reads.length * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+  const encoder = device.createCommandEncoder();
+  reads.forEach((r, i) => encoder.copyBufferToBuffer(r.buffer, r.index * 4, staging, i * 4, 4));
+  device.queue.submit([encoder.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const out = [...new Uint32Array(staging.getMappedRange().slice(0))];
+  staging.destroy();
+  return out;
+}
+
+/** Throws when a storage binding would exceed the device limit. */
+export function checkBindingSize(device: GPUDevice, bytes: number, label: string): void {
+  if (bytes > device.limits.maxStorageBufferBindingSize) {
+    throw new Error(`${label} needs ${bytes} bytes, over the ${device.limits.maxStorageBufferBindingSize} byte storage binding limit`);
+  }
+}
+
 export async function readBackU32(device: GPUDevice, src: GPUBuffer, count: number): Promise<Uint32Array> {
   const staging = device.createBuffer({
     size: count * 4,

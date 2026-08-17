@@ -5,7 +5,7 @@
 import dilateWgsl from 'picovdb/wgsl/dilate.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
 import { Sorter } from './radix_sort.ts';
-import { dispatch2D, readBackU32 } from './device.ts';
+import { dispatch2D, readBackTotals } from './device.ts';
 
 const WG_SIZE = 256;
 
@@ -24,10 +24,10 @@ export class Dilator {
   readonly layout: GPUBindGroupLayout;
   private readonly pipelines: Record<string, GPUComputePipeline> = {};
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
     this.device = device;
-    this.scanner = new Scanner(device);
-    this.sorter = new Sorter(device);
+    this.scanner = scanner;
+    this.sorter = sorter;
     const entry = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({
       binding,
       visibility: GPUShaderStage.COMPUTE,
@@ -43,6 +43,7 @@ export class Dilator {
         entry(5, 'storage'),
         entry(6, 'storage'),
         entry(7, 'storage'),
+        entry(8, 'storage'),
       ],
     });
     const module = device.createShaderModule({ code: dilateWgsl });
@@ -54,11 +55,15 @@ export class Dilator {
 
   async dilate(leafKeys: GPUBuffer, masks: GPUBuffer, leafCount: number): Promise<DilateResult> {
     const device = this.device;
+    if (leafCount === 0) {
+      return { leafKeys, masks, leafCount: 0 };
+    }
     const params = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(params, 0, new Uint32Array([leafCount]));
 
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     const counts = device.createBuffer({ size: (leafCount + 1) * 4, usage: storage });
+    const clipped = device.createBuffer({ size: 4, usage: storage });
     const placeholder = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE });
 
     const bindGroup = (spawnKeys: GPUBuffer, flags: GPUBuffer, newKeys: GPUBuffer, newMasks: GPUBuffer) =>
@@ -73,6 +78,7 @@ export class Dilator {
           { binding: 5, resource: { buffer: flags } },
           { binding: 6, resource: { buffer: newKeys } },
           { binding: 7, resource: { buffer: newMasks } },
+          { binding: 8, resource: { buffer: clipped } },
         ],
       });
 
@@ -88,7 +94,13 @@ export class Dilator {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const spawnCount = (await readBackU32(device, counts, leafCount + 1))[leafCount];
+    const [spawnCount, clippedCount] = await readBackTotals(device, [
+      { buffer: counts, index: leafCount },
+      { buffer: clipped, index: 0 },
+    ]);
+    if (clippedCount > 0) {
+      throw new Error(`dilation spills past the leaf key space boundary at ${clippedCount} faces`);
+    }
 
     // Emit, sort, and dedupe.
     device.queue.writeBuffer(params, 4, new Uint32Array([spawnCount]));
@@ -115,7 +127,7 @@ export class Dilator {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const newCount = (await readBackU32(device, flags, spawnCount + 1))[spawnCount];
+    const [newCount] = await readBackTotals(device, [{ buffer: flags, index: spawnCount }]);
 
     // Build the dilated masks.
     device.queue.writeBuffer(params, 8, new Uint32Array([newCount]));

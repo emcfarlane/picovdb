@@ -5,6 +5,7 @@
 
 import { hasWebGPU, requestDevice, readBackU32 } from './device.ts';
 import { assertU32ArrayEqual } from './compare.ts';
+import { compareTreeToCpu } from './test_util.ts';
 import { parseBinarySTL, refCsgMerge } from './reference.ts';
 import { Binner, leafBounds } from './mesh_to_grid.ts';
 import { Rasterizer } from './rasterize.ts';
@@ -83,44 +84,12 @@ Deno.test({ name: 'full pipeline: convert x2, merge, re-emit matches CPU', ignor
   const merged = await new Merger(device).merge(gridA, gridB, { halfWidth });
   if (!merged.values) throw new Error('merge dropped values');
   const tree = await emitter.reEmit(
-    { leafKeys: merged.leafKeys, masks: merged.masks, values: merged.values, leafCount: merged.leafCount, leafMin: bounds.leafMin },
+    { leafKeys: merged.leafKeys, masks: merged.masks, values: merged.values, leafCount: merged.leafCount, leafMin: bounds.leafMin, leafMax: bounds.leafMax },
     { halfWidth }
   );
 
   // Compare against the CPU tree.
-  const h = cpu.header;
-  if (tree.leafCount !== h.leafCount || tree.lowerCount !== h.lowerCount || tree.upperCount !== h.upperCount) {
-    throw new Error(
-      `counts: gpu ${tree.leafCount}/${tree.lowerCount}/${tree.upperCount} != cpu ${h.leafCount}/${h.lowerCount}/${h.upperCount}`
-    );
-  }
-  const grid = cpu.getGrid(0);
-  if (tree.dataElemCount !== grid.dataElemCount) {
-    throw new Error(`dataElemCount: gpu ${tree.dataElemCount} != cpu ${grid.dataElemCount}`);
-  }
-  for (let a = 0; a < 3; a++) {
-    if (tree.indexBoundsMin[a] !== grid.indexBoundsMin[a] || tree.indexBoundsMax[a] !== grid.indexBoundsMax[a]) {
-      throw new Error(`index bounds mismatch on axis ${a}`);
-    }
-  }
-  const cpuU32 = (bytes: Uint8Array) => new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
-  assertU32ArrayEqual(
-    await readBackU32(device, tree.roots, tree.upperCount * 2),
-    cpuU32(cpu.rootsBuffer).slice(0, tree.upperCount * 2),
-    'roots'
-  );
-  assertU32ArrayEqual(await readBackU32(device, tree.uppers, tree.upperCount * 3076), cpuU32(cpu.uppersBuffer), 'uppers');
-  assertU32ArrayEqual(await readBackU32(device, tree.lowers, tree.lowerCount * 388), cpuU32(cpu.lowersBuffer), 'lowers');
-  assertU32ArrayEqual(await readBackU32(device, tree.leaves, tree.leafCount * 52), cpuU32(cpu.leavesBuffer), 'leaves');
-
-  const gpuData = new Float32Array((await readBackU32(device, tree.data, tree.dataElemCount)).buffer);
-  const cpuData = new Float32Array(cpu.dataBuffer.buffer, cpu.dataBuffer.byteOffset, tree.dataElemCount);
-  let maxAbs = 0;
-  for (let i = 0; i < tree.dataElemCount; i++) {
-    if ((gpuData[i] < 0) !== (cpuData[i] < 0)) throw new Error(`value sign mismatch at ${i}`);
-    maxAbs = Math.max(maxAbs, Math.abs(gpuData[i] - cpuData[i]));
-  }
-  if (maxAbs > 1e-3) throw new Error(`value divergence ${maxAbs}`);
+  const maxAbs = await compareTreeToCpu(device, tree, cpu);
   console.log(
     `  pipeline: ${tree.leafCount} leaves / ${tree.lowerCount} lowers / ${tree.upperCount} uppers, ` +
     `${tree.activeVoxels} active, max |Δv| ${maxAbs.toExponential(2)}`
@@ -189,7 +158,7 @@ Deno.test({ name: 'overlapping solids: CSG merge deactivates swallowed band', ig
 
   // The edited grid emits into a tree.
   const tree = await emitter.reEmit(
-    { leafKeys: merged.leafKeys, masks: merged.masks, values: merged.values!, leafCount: merged.leafCount, leafMin: bounds.leafMin },
+    { leafKeys: merged.leafKeys, masks: merged.masks, values: merged.values!, leafCount: merged.leafCount, leafMin: bounds.leafMin, leafMax: bounds.leafMax },
     { halfWidth }
   );
   if (tree.activeVoxels !== activeUnion) throw new Error(`tree active ${tree.activeVoxels} != ${activeUnion}`);

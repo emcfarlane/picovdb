@@ -39,6 +39,10 @@ struct SignParams {
 
 const DISPATCH_STRIDE: u32 = 65535u;
 
+fn globalIndex(wid: vec3<u32>, lid: vec3<u32>) -> u32 {
+    return (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
+}
+
 fn loadPoint(i: u32) -> vec3<f32> {
     return vec3<f32>(points_index[i * 3u], points_index[(i * 3u) + 1u], points_index[(i * 3u) + 2u]);
 }
@@ -58,8 +62,13 @@ fn accept(w: f32, ex: f32, ey: f32) -> bool {
 }
 
 // Monotone f32 to u32 transform so crossing order survives the u32 sort.
+// Negative zero maps to the positive zero key, matching the CPU float
+// compare where the two are equal.
 fn sortableFromF32(v: f32) -> u32 {
     let b = bitcast<u32>(v);
+    if (b == 0x80000000u) {
+        return 0x80000000u;
+    }
     if ((b >> 31u) == 1u) {
         return ~b;
     }
@@ -124,8 +133,8 @@ fn binTriangle(t: u32, emit: bool, offset: u32) -> u32 {
 
 // counts has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
-fn count_crossings(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+fn count_crossings(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = globalIndex(wid, lid);
     if (t > params.triangle_count) {
         return;
     }
@@ -138,8 +147,8 @@ fn count_crossings(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // counts now holds the scanned write offsets.
 @compute @workgroup_size(256)
-fn emit_crossings(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+fn emit_crossings(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = globalIndex(wid, lid);
     if (t < params.triangle_count) {
         let unused = binTriangle(t, true, counts[t]);
     }

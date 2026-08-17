@@ -31,10 +31,17 @@ struct BinParams {
 @group(0) @binding(7) var<storage, read_write> flags: array<u32>;
 @group(0) @binding(8) var<storage, read_write> unique_keys: array<u32>;
 
+const DISPATCH_STRIDE: u32 = 65535u;
+
+fn globalIndex(wid: vec3<u32>, lid: vec3<u32>) -> u32 {
+    return (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
+}
+
 @compute @workgroup_size(256)
-fn transform_points(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x < (params.point_count * 3u)) {
-        points_index[gid.x] = points_world[gid.x] * params.inv_voxel_size;
+fn transform_points(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
+    if (i < (params.point_count * 3u)) {
+        points_index[i] = points_world[i] * params.inv_voxel_size;
     }
 }
 
@@ -59,8 +66,8 @@ fn leafRange(t: u32) -> LeafRange {
 
 // counts has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
-fn count_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+fn count_pairs(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = globalIndex(wid, lid);
     if (t > params.triangle_count) {
         return;
     }
@@ -75,8 +82,8 @@ fn count_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // counts now holds the scanned write offsets.
 @compute @workgroup_size(256)
-fn emit_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let t = gid.x;
+fn emit_pairs(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let t = globalIndex(wid, lid);
     if (t >= params.triangle_count) {
         return;
     }
@@ -96,8 +103,8 @@ fn emit_pairs(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // flags has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
-fn mark_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn mark_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
     if (i > params.pair_count) {
         return;
     }
@@ -110,8 +117,8 @@ fn mark_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // flags now holds the scanned unique positions.
 @compute @workgroup_size(256)
-fn compact_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn compact_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
     if (i >= params.pair_count) {
         return;
     }

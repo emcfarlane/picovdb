@@ -5,7 +5,7 @@
 import mergeWgsl from 'picovdb/wgsl/merge.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
 import { Sorter } from './radix_sort.ts';
-import { dispatch2D, readBackU32 } from './device.ts';
+import { checkBindingSize, dispatch2D, readBackTotals } from './device.ts';
 
 const WG_SIZE = 256;
 
@@ -30,10 +30,10 @@ export class Merger {
   readonly sorter: Sorter;
   private readonly pipelines: Record<string, GPUComputePipeline> = {};
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
     this.device = device;
-    this.scanner = new Scanner(device);
-    this.sorter = new Sorter(device);
+    this.scanner = scanner;
+    this.sorter = sorter;
     const module = device.createShaderModule({ code: mergeWgsl });
     for (const entryPoint of ['mark_unique', 'compact_unique', 'merge_masks', 'merge_csg']) {
       this.pipelines[entryPoint] = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } });
@@ -79,11 +79,12 @@ export class Merger {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const outCount = (await readBackU32(device, flags, concatCount + 1))[concatCount];
+    const [outCount] = await readBackTotals(device, [{ buffer: flags, index: concatCount }]);
 
     device.queue.writeBuffer(params, 12, new Uint32Array([outCount]));
     const outKeys = device.createBuffer({ size: outCount * 4, usage: storage });
     const outMasks = device.createBuffer({ size: outCount * 16 * 4, usage: storage });
+    if (csg) checkBindingSize(device, outCount * 512 * 4, 'merged value slabs');
     const outValues = csg ? device.createBuffer({ size: outCount * 512 * 4, usage: storage }) : undefined;
     {
       const encoder = device.createCommandEncoder();

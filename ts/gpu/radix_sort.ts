@@ -15,9 +15,9 @@ export class Sorter {
   readonly histogram: GPUComputePipeline;
   readonly scatter: GPUComputePipeline;
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device)) {
     this.device = device;
-    this.scanner = new Scanner(device);
+    this.scanner = scanner;
     this.layout = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },

@@ -5,7 +5,7 @@
 import binWgsl from 'picovdb/wgsl/mesh_to_grid.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
 import { Sorter } from './radix_sort.ts';
-import { readBackU32 } from './device.ts';
+import { dispatch2D, readBackTotals } from './device.ts';
 
 const WG_SIZE = 256;
 
@@ -46,10 +46,10 @@ export class Binner {
   readonly layout: GPUBindGroupLayout;
   private readonly pipelines: Record<string, GPUComputePipeline> = {};
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
     this.device = device;
-    this.scanner = new Scanner(device);
-    this.sorter = new Sorter(device);
+    this.scanner = scanner;
+    this.sorter = sorter;
     const storage = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({
       binding,
       visibility: GPUShaderStage.COMPUTE,
@@ -126,7 +126,7 @@ export class Binner {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const pairCount = (await readBackU32(device, counts, triangleCount + 1))[triangleCount];
+    const [pairCount] = await readBackTotals(device, [{ buffer: counts, index: triangleCount }]);
     if (pairCount === 0) throw new Error('no leaves touched (degenerate mesh?)');
 
     // Emit, sort by key, then mark and compact unique leaves.
@@ -152,16 +152,14 @@ export class Binner {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const leafCount = (await readBackU32(device, flags, pairCount + 1))[pairCount];
+    const [leafCount] = await readBackTotals(device, [{ buffer: flags, index: pairCount }]);
 
     return { pointsIndex, triangles: trianglesBuf, pairKeys, pairTris, pairCount, leafKeys, leafCount, leafMin, leafMax };
   }
 
   private dispatch(pass: GPUComputePassEncoder, entryPoint: string, threads: number): void {
-    const groups = Math.ceil(threads / WG_SIZE);
-    if (groups > 65535) throw new Error(`dispatch of ${threads} threads exceeds one dimension`);
     pass.setPipeline(this.pipelines[entryPoint]);
-    pass.dispatchWorkgroups(groups);
+    dispatch2D(pass, Math.ceil(threads / WG_SIZE));
   }
 }
 

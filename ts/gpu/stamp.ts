@@ -5,7 +5,7 @@
 import stampWgsl from 'picovdb/wgsl/stamp.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
 import { Sorter } from './radix_sort.ts';
-import { dispatch2D, readBackU32 } from './device.ts';
+import { checkBindingSize, dispatch2D, readBackTotals } from './device.ts';
 import type { OpGrid } from './emit.ts';
 
 const WG_SIZE = 256;
@@ -25,10 +25,10 @@ export class Stamper {
   readonly sorter: Sorter;
   private readonly pipelines: Record<string, GPUComputePipeline> = {};
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
     this.device = device;
-    this.scanner = new Scanner(device);
-    this.sorter = new Sorter(device);
+    this.scanner = scanner;
+    this.sorter = sorter;
     const module = device.createShaderModule({ code: stampWgsl });
     for (const entryPoint of ['generate_candidates', 'mark_unique', 'compact_unique', 'apply']) {
       this.pipelines[entryPoint] = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint } });
@@ -38,11 +38,14 @@ export class Stamper {
   async stamp(grid: OpGrid, opts: StampOptions): Promise<OpGrid> {
     const device = this.device;
     const hw = opts.halfWidth;
-    // Candidate box of leaves the dilated stamp can touch, clamped to the
-    // key range. Callers keep a margin, as with dilate.
+    // Candidate box of leaves the dilated stamp can touch. A stamp that
+    // reaches the packed key range fails so nothing truncates silently.
     const rel = opts.center.map((c, a) => c - grid.leafMin[a] * 8);
-    const lo = rel.map((c) => Math.max(0, Math.min(1023, Math.floor((c - opts.radius - hw) / 8))));
-    const hi = rel.map((c) => Math.max(0, Math.min(1023, Math.floor((c + opts.radius + hw) / 8))));
+    const lo = rel.map((c) => Math.floor((c - opts.radius - hw) / 8));
+    const hi = rel.map((c) => Math.floor((c + opts.radius + hw) / 8));
+    if (lo.some((v) => v < 0) || hi.some((v) => v > 1023)) {
+      throw new Error('stamp reaches the leaf key space boundary');
+    }
     const dims = [hi[0] - lo[0] + 1, hi[1] - lo[1] + 1, hi[2] - lo[2] + 1];
     const boxVol = dims[0] * dims[1] * dims[2];
     const concatCount = grid.leafCount + boxVol;
@@ -86,9 +89,10 @@ export class Stamper {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const newCount = (await readBackU32(device, flags, concatCount + 1))[concatCount];
+    const [newCount] = await readBackTotals(device, [{ buffer: flags, index: concatCount }]);
 
     device.queue.writeBuffer(params, 8, new Uint32Array([newCount]));
+    checkBindingSize(device, newCount * 512 * 4, 'stamped value slabs');
     const newKeys = device.createBuffer({ size: newCount * 4, usage: storage });
     const outValues = device.createBuffer({ size: newCount * 512 * 4, usage: storage });
     const outMasks = device.createBuffer({ size: newCount * 16 * 4, usage: storage });
@@ -97,11 +101,11 @@ export class Stamper {
       const pass = encoder.beginComputePass();
       run(pass, 'compact_unique', concatCount, { 3: concatKeys, 4: flags, 5: newKeys });
       run(pass, 'apply', newCount, {
-        1: grid.leafKeys, 2: grid.values, 5: newKeys, 6: outValues, 7: outMasks,
+        1: grid.leafKeys, 2: grid.values, 5: newKeys, 6: outValues, 7: outMasks, 8: grid.masks,
       });
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    return { leafKeys: newKeys, masks: outMasks, values: outValues, leafCount: newCount, leafMin: grid.leafMin };
+    return { leafKeys: newKeys, masks: outMasks, values: outValues, leafCount: newCount, leafMin: grid.leafMin, leafMax: grid.leafMax };
   }
 }

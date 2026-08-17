@@ -8,8 +8,8 @@
 // dilate_masks builds each output leaf's mask from its own shifted words
 // plus the six neighbors' boundary planes.
 //
-// Neighbors falling outside the packed key range are dropped, so callers
-// keep a margin of one leaf.
+// A spawn falling outside the packed key range increments clipped and the
+// host fails the op, so callers keep a margin of one leaf.
 
 struct DilateParams {
     old_count: u32,
@@ -26,8 +26,13 @@ struct DilateParams {
 @group(0) @binding(5) var<storage, read_write> flags: array<u32>;
 @group(0) @binding(6) var<storage, read_write> new_keys: array<u32>;
 @group(0) @binding(7) var<storage, read_write> new_masks: array<u32>;
+@group(0) @binding(8) var<storage, read_write> clipped: atomic<u32>;
 
 const DISPATCH_STRIDE: u32 = 65535u;
+
+fn globalIndex(wid: vec3<u32>, lid: vec3<u32>) -> u32 {
+    return (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
+}
 
 fn unpack(key: u32) -> vec3<i32> {
     return vec3<i32>(i32(key >> 20u), i32((key >> 10u) & 0x3ffu), i32(key & 0x3ffu));
@@ -90,7 +95,13 @@ fn spawn(i: u32, emit: bool, offset: u32) -> u32 {
     var n = 1u;
     for (var d = 0u; d < 6u; d = d + 1u) {
         let nc = c + DIRS[d];
-        if (!inRange(nc) || !spills(i, d)) {
+        if (!spills(i, d)) {
+            continue;
+        }
+        if (!inRange(nc)) {
+            if (!emit) {
+                atomicAdd(&clipped, 1u);
+            }
             continue;
         }
         if (emit) {
@@ -104,8 +115,8 @@ fn spawn(i: u32, emit: bool, offset: u32) -> u32 {
 
 // counts has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
-fn count_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn count_spawn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
     if (i > params.old_count) {
         return;
     }
@@ -118,8 +129,8 @@ fn count_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // counts now holds the scanned write offsets.
 @compute @workgroup_size(256)
-fn emit_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn emit_spawn(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
     if (i < params.old_count) {
         let unused = spawn(i, true, counts[i]);
     }
@@ -127,8 +138,8 @@ fn emit_spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // flags has one extra entry so the scanned total lands in the last slot.
 @compute @workgroup_size(256)
-fn mark_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn mark_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
     if (i > params.spawn_count) {
         return;
     }
@@ -141,8 +152,8 @@ fn mark_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 // flags now holds the scanned unique positions.
 @compute @workgroup_size(256)
-fn compact_unique(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn compact_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
     if (i >= params.spawn_count) {
         return;
     }
@@ -174,7 +185,7 @@ fn dilate_masks(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
 ) {
-    let i = (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
+    let i = globalIndex(wid, lid);
     if (i >= params.new_count) {
         return;
     }

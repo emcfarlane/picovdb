@@ -4,7 +4,7 @@
 import signWgsl from 'picovdb/wgsl/sign.wgsl' with { type: 'text' };
 import { Scanner } from './scan.ts';
 import { Sorter } from './radix_sort.ts';
-import { dispatch2D, readBackU32 } from './device.ts';
+import { dispatch2D, readBackTotals } from './device.ts';
 import type { BinResult } from './mesh_to_grid.ts';
 
 const WG_SIZE = 256;
@@ -13,13 +13,6 @@ export interface SignResult {
   /** One 512 bit mask per leaf. A set bit marks an inside voxel. */
   inside: GPUBuffer;
   crossingCount: number;
-  /** Sorted crossings and the column grid for downstream parity queries. */
-  crossCols: GPUBuffer;
-  crossZ: GPUBuffer;
-  colMinX: number;
-  colMinY: number;
-  colNx: number;
-  colNy: number;
 }
 
 export class Signer {
@@ -29,10 +22,10 @@ export class Signer {
   readonly layout: GPUBindGroupLayout;
   private readonly pipelines: Record<string, GPUComputePipeline> = {};
 
-  constructor(device: GPUDevice) {
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
     this.device = device;
-    this.scanner = new Scanner(device);
-    this.sorter = new Sorter(device);
+    this.scanner = scanner;
+    this.sorter = sorter;
     const entry = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({
       binding,
       visibility: GPUShaderStage.COMPUTE,
@@ -105,7 +98,7 @@ export class Signer {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    const crossingCount = (await readBackU32(device, counts, triangleCount + 1))[triangleCount];
+    const [crossingCount] = await readBackTotals(device, [{ buffer: counts, index: triangleCount }]);
 
     // Emit, sort by column then height, and walk each leaf column.
     device.queue.writeBuffer(params, 4, new Uint32Array([crossingCount]));
@@ -129,6 +122,6 @@ export class Signer {
       pass.end();
       device.queue.submit([encoder.finish()]);
     }
-    return { inside, crossingCount, crossCols, crossZ, colMinX: minX, colMinY: minY, colNx: nx, colNy: ny };
+    return { inside, crossingCount };
   }
 }
