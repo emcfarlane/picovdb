@@ -108,7 +108,7 @@ export class Emitter {
    * op layer grid. leafValues become signed in place and masks mark the
    * band.
    */
-  async classifyOnly(bin: BinResult, leafValues: GPUBuffer, sign: SignResult, opts: EmitOptions): Promise<OpGrid> {
+  classifyOnly(bin: BinResult, leafValues: GPUBuffer, sign: SignResult, opts: EmitOptions): OpGrid {
     const prep = this.prepare(bin.leafKeys, leafValues, bin.leafCount, bin.leafMin, opts, null);
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginComputePass();
