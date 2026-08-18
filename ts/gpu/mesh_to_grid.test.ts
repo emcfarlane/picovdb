@@ -1,6 +1,5 @@
 import { hasWebGPU, requestDevice, readBackU32 } from './device.ts';
-import { mulberry32 } from './test_util.ts';
-import { assertU32ArrayEqual } from './compare.ts';
+import { mulberry32, assertU32ArrayEqual } from './test_util.ts';
 import { refBin, parseBinarySTL } from './reference.ts';
 import { Binner, type BinResult } from './mesh_to_grid.ts';
 

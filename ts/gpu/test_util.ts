@@ -1,9 +1,19 @@
 // Shared helpers for the GPU tests.
 
+import assert from 'node:assert/strict';
 import { readBackU32 } from './device.ts';
-import { assertU32ArrayEqual } from './compare.ts';
 import { LEAF_U32, LOWER_U32, UPPER_U32, type EmitResult } from './emit.ts';
 import type { PicoVDBFile } from '../picovdb.ts';
+
+/** Fast equality for large typed arrays. assert.deepEqual takes minutes at this size. */
+export function assertU32ArrayEqual(got: Uint32Array, expected: Uint32Array, label: string): void {
+  assert.equal(got.length, expected.length, `${label}: length`);
+  for (let i = 0; i < got.length; i++) {
+    if (got[i] !== expected[i]) {
+      assert.fail(`${label}: first mismatch at [${i}]: got ${got[i]}, expected ${expected[i]}`);
+    }
+  }
+}
 
 /** Deterministic PRNG so failures reproduce. */
 export function mulberry32(seed: number): () => number {

@@ -4,8 +4,7 @@
 // disjoint, so the CPU oracle applies.
 
 import { hasWebGPU, requestDevice, readBackU32 } from './device.ts';
-import { assertU32ArrayEqual } from './compare.ts';
-import { compareTreeToCpu } from './test_util.ts';
+import { assertU32ArrayEqual, compareTreeToCpu } from './test_util.ts';
 import { parseBinarySTL, refCsgMerge } from './reference.ts';
 import { Binner, leafBounds } from './mesh_to_grid.ts';
 import { Rasterizer } from './rasterize.ts';

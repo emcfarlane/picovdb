@@ -1,12 +1,11 @@
-// Emits the picovdb tree, mirroring Builder in src/mesh_to_grid.zig. Combines the distance slabs and inside masks into
-// signed narrow band values, drops empty leaves, derives the lower and
-// upper and root tables by key truncation over the sorted leaf list, and
-// writes the node buffers in the layout the renderer uploads. Node order
-// matches the CPU because every level is emitted in sorted key order.
+// Emits the picovdb tree Combines the distance slabs and inside masks into
+// signed narrow band values, drops empty leaves, derives the lower and upper
+// and root tables by key truncation over the sorted leaf list, and writes the
+// node buffers in the layout the renderer uploads. Node order matches the CPU
+// because every level is emitted in sorted key order.
 //
-// Each entry point uses a subset of the bindings. Pipelines use auto
-// layouts so per kernel storage buffer counts stay under the WebGPU
-// limit.
+// Each entry point uses a subset of the bindings. Pipelines use auto layouts
+// so per kernel storage buffer counts stay under the WebGPU limit.
 
 struct EmitParams {
     cand_count: u32,

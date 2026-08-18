@@ -1,6 +1,5 @@
 import { hasWebGPU, requestDevice, createU32Buffer, readBackU32 } from './device.ts';
-import { mulberry32 } from './test_util.ts';
-import { assertU32ArrayEqual } from './compare.ts';
+import { mulberry32, assertU32ArrayEqual } from './test_util.ts';
 import { refCsgMerge } from './reference.ts';
 import { Pruner } from './prune.ts';
 import { Merger } from './merge.ts';
