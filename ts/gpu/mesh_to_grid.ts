@@ -77,11 +77,28 @@ export class Binner {
 
   async bin(points: Float32Array<ArrayBuffer>, triangles: Uint32Array<ArrayBuffer>, opts: BinOptions): Promise<BinResult> {
     const device = this.device;
-    const pointCount = points.length / 3;
-    const triangleCount = triangles.length / 3;
+    const invVoxelSize = Math.fround(1 / opts.voxelSize);
+    const bounds = opts.bounds ?? leafBounds(points, invVoxelSize, opts.halfWidth);
+    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const pointsWorld = device.createBuffer({ size: points.byteLength, usage: storage });
+    device.queue.writeBuffer(pointsWorld, 0, points);
+    const trianglesBuf = device.createBuffer({ size: triangles.byteLength, usage: storage });
+    device.queue.writeBuffer(trianglesBuf, 0, triangles);
+    return this.binBuffers(pointsWorld, points.length / 3, trianglesBuf, triangles.length / 3, { ...opts, bounds });
+  }
+
+  /** Bins a mesh already on the GPU. Bounds are required since the points are not readable. */
+  async binBuffers(
+    pointsWorld: GPUBuffer,
+    pointCount: number,
+    trianglesBuf: GPUBuffer,
+    triangleCount: number,
+    opts: BinOptions & { bounds: NonNullable<BinOptions['bounds']> }
+  ): Promise<BinResult> {
+    const device = this.device;
     if (triangleCount === 0) throw new Error('empty mesh');
     const invVoxelSize = Math.fround(1 / opts.voxelSize);
-    const { leafMin, leafMax } = opts.bounds ?? leafBounds(points, invVoxelSize, opts.halfWidth);
+    const { leafMin, leafMax } = opts.bounds;
 
     const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     device.queue.writeBuffer(params, 0, new Uint32Array([pointCount, triangleCount]));
@@ -89,13 +106,10 @@ export class Binner {
     device.queue.writeBuffer(params, 16, new Int32Array(leafMin));
 
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
-    const pointsWorld = device.createBuffer({ size: points.byteLength, usage: storage });
-    device.queue.writeBuffer(pointsWorld, 0, points);
-    const pointsIndex = device.createBuffer({ size: points.byteLength, usage: GPUBufferUsage.STORAGE });
-    const trianglesBuf = device.createBuffer({ size: triangles.byteLength, usage: storage });
-    device.queue.writeBuffer(trianglesBuf, 0, triangles);
+    const pointsIndex = device.createBuffer({ size: pointCount * 12, usage: GPUBufferUsage.STORAGE });
     const counts = device.createBuffer({ size: (triangleCount + 1) * 4, usage: storage });
-    const placeholder = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE });
+    // Distinct placeholders: writable bindings may not alias one buffer.
+    const placeholders = [0, 1, 2, 3].map(() => device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE }));
 
     const bindGroup = (pairKeys: GPUBuffer, pairTris: GPUBuffer, flags: GPUBuffer, uniqueKeys: GPUBuffer) =>
       device.createBindGroup({
@@ -114,7 +128,7 @@ export class Binner {
       });
 
     // Transform, count, and scan, then read the total pair count.
-    const countGroup = bindGroup(placeholder, placeholder, placeholder, placeholder);
+    const countGroup = bindGroup(placeholders[0], placeholders[1], placeholders[2], placeholders[3]);
     const countScan = this.scanner.plan(counts, triangleCount + 1);
     {
       const encoder = device.createCommandEncoder();

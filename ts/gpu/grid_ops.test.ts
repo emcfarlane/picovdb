@@ -1,5 +1,5 @@
 import { hasWebGPU, requestDevice, createU32Buffer, readBackU32 } from './device.ts';
-import { mulberry32, assertU32ArrayEqual } from './test_util.ts';
+import { mulberry32, assertU32ArrayEqual, packGrid, unpackGrid } from './test_util.ts';
 import { refCsgMerge } from './reference.ts';
 import { Pruner } from './prune.ts';
 import { Merger } from './merge.ts';
@@ -100,30 +100,16 @@ Deno.test({ name: 'CSG merge matches reference', ignore: !gpu }, async () => {
   const halfWidth = 3;
   const a = randomGrid(rand, 30, true);
   const b = randomGrid(rand, 30, true); // overlapping coordinate range
+  const ga = packGrid(device, a.keys, a.values!, halfWidth);
+  const gb = packGrid(device, b.keys, b.values!, halfWidth);
 
-  const result = await merger.merge(
-    {
-      leafKeys: createU32Buffer(device, a.keys),
-      masks: createU32Buffer(device, a.masks),
-      values: createU32Buffer(device, new Uint32Array(a.values!.buffer)),
-      leafCount: a.keys.length,
-    },
-    {
-      leafKeys: createU32Buffer(device, b.keys),
-      masks: createU32Buffer(device, b.masks),
-      values: createU32Buffer(device, new Uint32Array(b.values!.buffer)),
-      leafCount: b.keys.length,
-    },
-    { halfWidth }
-  );
-
-  const ref = refCsgMerge(a.keys, a.values!, b.keys, b.values!, halfWidth);
-  if (result.leafCount !== ref.keys.length) throw new Error(`count ${result.leafCount} != ${ref.keys.length}`);
-  assertU32ArrayEqual(await readBackU32(device, result.leafKeys, result.leafCount), ref.keys, 'csg keys');
-  assertU32ArrayEqual(await readBackU32(device, result.masks, result.leafCount * 16), ref.masks, 'csg masks');
-  assertU32ArrayEqual(
-    await readBackU32(device, result.values!, result.leafCount * 512),
-    new Uint32Array(ref.values.buffer),
-    'csg values'
-  );
+  for (const op of ['union', 'intersect', 'subtract'] as const) {
+    const result = await merger.mergeCsg(ga, gb, { halfWidth, op });
+    const got = await unpackGrid(device, result, halfWidth);
+    const ref = refCsgMerge(a.keys, a.values!, b.keys, b.values!, halfWidth, op);
+    if (result.leafCount !== ref.keys.length) throw new Error(`${op} count ${result.leafCount} != ${ref.keys.length}`);
+    assertU32ArrayEqual(got.keys, ref.keys, `${op} keys`);
+    assertU32ArrayEqual(got.masks, ref.masks, `${op} masks`);
+    assertU32ArrayEqual(new Uint32Array(got.values.buffer), new Uint32Array(ref.values.buffer), `${op} values`);
+  }
 });

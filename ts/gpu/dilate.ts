@@ -64,7 +64,8 @@ export class Dilator {
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     const counts = device.createBuffer({ size: (leafCount + 1) * 4, usage: storage });
     const clipped = device.createBuffer({ size: 4, usage: storage });
-    const placeholder = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE });
+    // Distinct placeholders: writable bindings may not alias one buffer.
+    const placeholders = [0, 1, 2, 3].map(() => device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE }));
 
     const bindGroup = (spawnKeys: GPUBuffer, flags: GPUBuffer, newKeys: GPUBuffer, newMasks: GPUBuffer) =>
       device.createBindGroup({
@@ -87,7 +88,7 @@ export class Dilator {
     {
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();
-      pass.setBindGroup(0, bindGroup(placeholder, placeholder, placeholder, placeholder));
+      pass.setBindGroup(0, bindGroup(placeholders[0], placeholders[1], placeholders[2], placeholders[3]));
       pass.setPipeline(this.pipelines['count_spawn']);
       dispatch2D(pass, Math.ceil((leafCount + 1) / WG_SIZE));
       countScan.encode(pass);
@@ -109,7 +110,7 @@ export class Dilator {
     const flags = device.createBuffer({ size: (spawnCount + 1) * 4, usage: storage });
     const newKeys = device.createBuffer({ size: spawnCount * 4, usage: storage });
     const flagScan = this.scanner.plan(flags, spawnCount + 1);
-    const group = bindGroup(spawnKeys, flags, newKeys, placeholder);
+    const group = bindGroup(spawnKeys, flags, newKeys, placeholders[3]);
     {
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();

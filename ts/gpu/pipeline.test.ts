@@ -3,8 +3,8 @@
 // mesh. The copies sit far enough apart that bands and leaf sets stay
 // disjoint, so the CPU oracle applies.
 
-import { hasWebGPU, requestDevice, readBackU32 } from './device.ts';
-import { assertU32ArrayEqual, compareTreeToCpu } from './test_util.ts';
+import { hasWebGPU, requestDevice } from './device.ts';
+import { assertU32ArrayEqual, compareTreeToCpu, unpackGrid } from './test_util.ts';
 import { parseBinarySTL, refCsgMerge } from './reference.ts';
 import { Binner, leafBounds } from './mesh_to_grid.ts';
 import { Rasterizer } from './rasterize.ts';
@@ -80,12 +80,8 @@ Deno.test({ name: 'full pipeline: convert x2, merge, re-emit matches CPU', ignor
   const gridA = await convert(meshA.points, meshA.triangles);
   const gridB = await convert(pointsB, meshA.triangles);
 
-  const merged = await new Merger(device).merge(gridA, gridB, { halfWidth });
-  if (!merged.values) throw new Error('merge dropped values');
-  const tree = await emitter.reEmit(
-    { leafKeys: merged.leafKeys, masks: merged.masks, values: merged.values, leafCount: merged.leafCount, leafMin: bounds.leafMin, leafMax: bounds.leafMax },
-    { halfWidth }
-  );
+  const merged = await new Merger(device).mergeCsg(gridA, gridB, { halfWidth });
+  const tree = await emitter.reEmit(merged, { halfWidth });
 
   // Compare against the CPU tree.
   const maxAbs = await compareTreeToCpu(device, tree, cpu);
@@ -123,23 +119,18 @@ Deno.test({ name: 'overlapping solids: CSG merge deactivates swallowed band', ig
   };
   const gridA = await convert(meshA.points, meshA.triangles);
   const gridB = await convert(pointsB, meshA.triangles);
-  const merged = await new Merger(device).merge(gridA, gridB, { halfWidth });
+  const merged = await new Merger(device).mergeCsg(gridA, gridB, { halfWidth });
 
   // The GPU CSG merge must match the JS reference built from the two
   // source grids.
-  const aKeys = await readBackU32(device, gridA.leafKeys, gridA.leafCount);
-  const aVals = new Float32Array((await readBackU32(device, gridA.values, gridA.leafCount * 512)).buffer);
-  const bKeys = await readBackU32(device, gridB.leafKeys, gridB.leafCount);
-  const bVals = new Float32Array((await readBackU32(device, gridB.values, gridB.leafCount * 512)).buffer);
-  const ref = refCsgMerge(aKeys, aVals, bKeys, bVals, halfWidth);
+  const a = await unpackGrid(device, gridA, halfWidth);
+  const b = await unpackGrid(device, gridB, halfWidth);
+  const ref = refCsgMerge(a.keys, a.values, b.keys, b.values, halfWidth);
+  const got = await unpackGrid(device, merged, halfWidth);
   if (merged.leafCount !== ref.keys.length) throw new Error(`count ${merged.leafCount} != ${ref.keys.length}`);
-  assertU32ArrayEqual(await readBackU32(device, merged.leafKeys, merged.leafCount), ref.keys, 'overlap keys');
-  assertU32ArrayEqual(await readBackU32(device, merged.masks, merged.leafCount * 16), ref.masks, 'overlap masks');
-  assertU32ArrayEqual(
-    await readBackU32(device, merged.values!, merged.leafCount * 512),
-    new Uint32Array(ref.values.buffer),
-    'overlap values'
-  );
+  assertU32ArrayEqual(got.keys, ref.keys, 'overlap keys');
+  assertU32ArrayEqual(got.masks, ref.masks, 'overlap masks');
+  assertU32ArrayEqual(new Uint32Array(got.values.buffer), new Uint32Array(ref.values.buffer), 'overlap values');
 
   // The swallowed band must deactivate. The union band is smaller than the
   // two bands combined and at least one solid's worth.
@@ -149,17 +140,14 @@ Deno.test({ name: 'overlapping solids: CSG merge deactivates swallowed band', ig
     return (((v + (v >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
   };
   const sumBits = (words: Uint32Array) => words.reduce((s, w) => s + popcount(w), 0);
-  const activeA = sumBits(await readBackU32(device, gridA.masks, gridA.leafCount * 16));
-  const activeB = sumBits(await readBackU32(device, gridB.masks, gridB.leafCount * 16));
+  const activeA = sumBits(a.masks);
+  const activeB = sumBits(b.masks);
   const activeUnion = sumBits(ref.masks);
   if (activeUnion >= activeA + activeB) throw new Error(`no deactivation: ${activeUnion} >= ${activeA} + ${activeB}`);
   if (activeUnion < activeA) throw new Error(`union band implausibly small: ${activeUnion} < ${activeA}`);
 
   // The edited grid emits into a tree.
-  const tree = await emitter.reEmit(
-    { leafKeys: merged.leafKeys, masks: merged.masks, values: merged.values!, leafCount: merged.leafCount, leafMin: bounds.leafMin, leafMax: bounds.leafMax },
-    { halfWidth }
-  );
+  const tree = await emitter.reEmit(merged, { halfWidth });
   if (tree.activeVoxels !== activeUnion) throw new Error(`tree active ${tree.activeVoxels} != ${activeUnion}`);
   console.log(
     `  overlap: A=${activeA} B=${activeB} union=${activeUnion} active; ` +

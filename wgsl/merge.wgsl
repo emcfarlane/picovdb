@@ -1,10 +1,10 @@
-// Merges two grids. The output leaf table is the union of both sorted
-// leaf tables. merge_masks ORs masks for a topology merge. merge_csg is
-// the SDF union for value carrying grids and handles overlapping solids.
-// Each voxel takes the min of the two values, where a grid without the
-// leaf contributes its implicit background, and the band becomes the
-// voxels with |v| below the half width, so band voxels swallowed by the
-// other solid's interior deactivate.
+// Merges two grids over the union of their leaf tables.
+//
+// merge_masks ORs 16 word masks, for topology. csg_mark and csg_apply
+// combine two op layer grids, bound as a_* and b_*: per voxel min for a
+// union, max for an intersection, max(a, -b) for a subtraction. A grid
+// without the leaf contributes its implicit background, so band voxels
+// inside the other solid deactivate.
 
 struct MergeParams {
     a_count: u32,
@@ -12,7 +12,7 @@ struct MergeParams {
     concat_count: u32,
     out_count: u32,
     half_width: f32,
-    pad0: u32,
+    op: u32, // 0 union, 1 intersect, 2 subtract
     pad1: u32,
     pad2: u32,
 }
@@ -22,20 +22,16 @@ struct MergeParams {
 @group(0) @binding(2) var<storage, read_write> flags: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_keys: array<u32>;
 @group(0) @binding(4) var<storage, read> a_keys: array<u32>;
-@group(0) @binding(5) var<storage, read> a_data: array<u32>;
+@group(0) @binding(5) var<storage, read> a_masks: array<u32>;
 @group(0) @binding(6) var<storage, read> b_keys: array<u32>;
-@group(0) @binding(7) var<storage, read> b_data: array<u32>;
-@group(0) @binding(8) var<storage, read_write> out_data: array<u32>;
-@group(0) @binding(9) var<storage, read_write> out_csg_masks: array<u32>;
+@group(0) @binding(7) var<storage, read> b_masks: array<u32>;
+@group(0) @binding(8) var<storage, read_write> out_masks: array<u32>;
+@group(0) @binding(10) var<storage, read> a_leaves: array<u32>;
+@group(0) @binding(11) var<storage, read> a_data: array<u32>;
+@group(0) @binding(12) var<storage, read> b_leaves: array<u32>;
+@group(0) @binding(13) var<storage, read> b_data: array<u32>;
 
-const DISPATCH_STRIDE: u32 = 65535u;
-const NOT_FOUND: u32 = 0xffffffffu;
-
-fn globalIndex(wid: vec3<u32>, lid: vec3<u32>) -> u32 {
-    return (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
-}
-
-// flags has one extra entry so the scanned total lands in the last slot.
+// flags has one extra entry for the scan total.
 @compute @workgroup_size(256)
 fn mark_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
@@ -60,165 +56,89 @@ fn compact_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
     }
 }
 
-fn findA(key: u32) -> u32 {
-    var lo = 0u;
-    var hi = params.a_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (a_keys[mid] < key) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    if (lo < params.a_count && a_keys[lo] == key) {
-        return lo;
-    }
-    return NOT_FOUND;
-}
-
-fn findB(key: u32) -> u32 {
-    var lo = 0u;
-    var hi = params.b_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (b_keys[mid] < key) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    if (lo < params.b_count && b_keys[lo] == key) {
-        return lo;
-    }
-    return NOT_FOUND;
-}
-
-// The data bindings hold 16 word masks. The output is the union.
+// Topology merge: ORs the 16 mask words per leaf.
 @compute @workgroup_size(256)
 fn merge_masks(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
     if (i >= params.out_count) {
         return;
     }
-    let a = findA(out_keys[i]);
-    let b = findB(out_keys[i]);
+    let a = a_find(out_keys[i]);
+    let b = b_find(out_keys[i]);
     for (var w = 0u; w < 16u; w = w + 1u) {
         var m = 0u;
         if (a != NOT_FOUND) {
-            m = m | a_data[(a * 16u) + w];
+            m = m | a_masks[(a * 16u) + w];
         }
         if (b != NOT_FOUND) {
-            m = m | b_data[(b * 16u) + w];
+            m = m | b_masks[(b * 16u) + w];
         }
-        out_masks_write(i, w, m);
+        out_masks[(i * 16u) + w] = m;
     }
 }
 
-fn out_masks_write(i: u32, w: u32, m: u32) {
-    out_data[(i * 16u) + w] = m;
+// Boolean of voxel n of leaf `leaf`. a and b are the leaf's indices in
+// the two grids, or NOT_FOUND.
+fn csgValue(leaf: vec3<i32>, a: u32, b: u32, n: u32) -> f32 {
+    let p = (leaf << vec3<u32>(3u)) + voxelLocal(n);
+    var va: f32;
+    if (a != NOT_FOUND) {
+        va = a_leafValue(a, n);
+    } else {
+        va = a_valueAt(p);
+    }
+    var vb: f32;
+    if (b != NOT_FOUND) {
+        vb = b_leafValue(b, n);
+    } else {
+        vb = b_valueAt(p);
+    }
+    if (params.op == 0u) {
+        return min(va, vb);
+    }
+    if (params.op == 1u) {
+        return max(va, vb);
+    }
+    return max(va, -vb);
 }
 
-// Implicit background of grid A at a voxel. Takes the facing voxel sign
-// of the nearest leaf in the column and reads as outside when the column
-// is empty.
-fn implicitA(leaf: vec3<i32>, n: u32) -> f32 {
-    let col_base = (u32(leaf.x) << 20u) | (u32(leaf.y) << 10u);
-    var lo = 0u;
-    var hi = params.a_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (a_keys[mid] < col_base) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    if (lo >= params.a_count || (a_keys[lo] & 0xfffffc00u) != col_base) {
-        return params.half_width;
-    }
-    var best = lo;
-    var best_d = abs(i32(a_keys[lo] & 0x3ffu) - leaf.z);
-    var i = lo + 1u;
-    while (i < params.a_count && (a_keys[i] & 0xfffffc00u) == col_base) {
-        let d = abs(i32(a_keys[i] & 0x3ffu) - leaf.z);
-        if (d >= best_d) {
-            break;
-        }
-        best = i;
-        best_d = d;
-        i = i + 1u;
-    }
-    let zloc = select(0u, 7u, i32(a_keys[best] & 0x3ffu) < leaf.z);
-    let facing = (n & 0x1f8u) | zloc; // keeps local x and y, swaps z
-    return select(params.half_width, -params.half_width, bitcast<f32>(a_data[(best * 512u) + facing]) < 0.0);
-}
-
-fn implicitB(leaf: vec3<i32>, n: u32) -> f32 {
-    let col_base = (u32(leaf.x) << 20u) | (u32(leaf.y) << 10u);
-    var lo = 0u;
-    var hi = params.b_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (b_keys[mid] < col_base) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
-    }
-    if (lo >= params.b_count || (b_keys[lo] & 0xfffffc00u) != col_base) {
-        return params.half_width;
-    }
-    var best = lo;
-    var best_d = abs(i32(b_keys[lo] & 0x3ffu) - leaf.z);
-    var i = lo + 1u;
-    while (i < params.b_count && (b_keys[i] & 0xfffffc00u) == col_base) {
-        let d = abs(i32(b_keys[i] & 0x3ffu) - leaf.z);
-        if (d >= best_d) {
-            break;
-        }
-        best = i;
-        best_d = d;
-        i = i + 1u;
-    }
-    let zloc = select(0u, 7u, i32(b_keys[best] & 0x3ffu) < leaf.z);
-    let facing = (n & 0x1f8u) | zloc;
-    return select(params.half_width, -params.half_width, bitcast<f32>(b_data[(best * 512u) + facing]) < 0.0);
-}
-
-// SDF union over 512 value f32 slabs. out_csg_masks receives the band.
 @compute @workgroup_size(256)
-fn merge_csg(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+fn csg_mark(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
-    if (i >= params.out_count) {
+    if (markSentinel(i, params.out_count)) {
         return;
     }
     let key = out_keys[i];
-    let leaf = vec3<i32>(i32(key >> 20u), i32((key >> 10u) & 0x3ffu), i32(key & 0x3ffu));
-    let a = findA(key);
-    let b = findB(key);
-    var mask = 0u;
+    let leaf = unpack(key);
+    let a = a_find(key);
+    let b = b_find(key);
+    var acc: LeafAcc;
     for (var n = 0u; n < 512u; n = n + 1u) {
-        var va: f32;
-        if (a != NOT_FOUND) {
-            va = bitcast<f32>(a_data[(a * 512u) + n]);
-        } else {
-            va = implicitA(leaf, n);
-        }
-        var vb: f32;
-        if (b != NOT_FOUND) {
-            vb = bitcast<f32>(b_data[(b * 512u) + n]);
-        } else {
-            vb = implicitB(leaf, n);
-        }
-        let v = min(va, vb);
-        out_data[(i * 512u) + n] = bitcast<u32>(v);
-        if (abs(v) < params.half_width) {
-            mask = mask | (1u << (n & 31u));
-        }
-        if ((n & 31u) == 31u) {
-            out_csg_masks[(i * 16u) + (n >> 5u)] = mask;
-            mask = 0u;
+        accPush(&acc, i, n, csgValue(leaf, a, b, n));
+    }
+    accFinish(&acc, i);
+}
+
+@compute @workgroup_size(256)
+fn csg_apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let j = globalIndex(wid, lid);
+    if (j >= arrayLength(&w_keys)) {
+        return;
+    }
+    let key = w_keys[j];
+    let leaf = unpack(key);
+    let a = a_find(key);
+    let b = b_find(key);
+    let base = w_leaves[(j * LEAF_U32) + 2u];
+    var k = 0u;
+    for (var w = 0u; w < 16u; w = w + 1u) {
+        let band = bandWord(j, w);
+        for (var b_ = 0u; b_ < 32u; b_ = b_ + 1u) {
+            if (((band >> b_) & 1u) == 0u) {
+                continue;
+            }
+            w_data[base + k] = bitcast<u32>(csgValue(leaf, a, b, (w * 32u) + b_));
+            k = k + 1u;
         }
     }
 }

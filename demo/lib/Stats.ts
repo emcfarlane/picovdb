@@ -129,10 +129,7 @@ export class Stats {
 		this.frames++;
 
 		const time = (performance || Date).now();
-		const frameTime = time - this.beginTime;
-
 		if (time >= this.prevTime + 1000) {
-			console.log(frameTime);
 			this.fpsPanel.update((this.frames * 1000) / (time - this.prevTime), 100);
 
 			this.prevTime = time;

@@ -1,49 +1,40 @@
-// Brush stamp. Composes an analytic sphere SDF into a grid. A clamped min
-// adds material and a clamped max against the negated brush carves.
+// Stamps an analytic shape into a grid: a sphere, rounded box, capsule,
+// or capped cylinder. Add takes the min with the shape's distance. Carve
+// takes the max with its negation. Stamping an empty grid makes the shape.
 //
-// generate_candidates emits every leaf in the stamp's dilated bounding
-// box. The host concatenates them with the existing leaf table, sorts,
-// and dedupes. apply writes each output leaf's values from the existing
-// slab where the leaf existed and from the grid's implicit background
-// elsewhere, so carving through a solid's leafless interior forms a
-// correct new band. The band mask holds the voxels with |v| below the
-// half width. Stamping an empty grid builds a sphere from nothing.
+// The old grid binds as old_keys, old_leaves, old_data. The candidates
+// are the old leaves plus the leaves the shape's shell crosses, deduped
+// here. Voxels read the old leaf where one exists and the implicit
+// background elsewhere, so a carve through a leafless interior forms a
+// correct band.
 
 struct StampParams {
     old_count: u32,
     concat_count: u32,
     new_count: u32,
     mode: u32, // 0 adds material and 1 carves
-    center: vec3<f32>, // relative voxel space
+    p0: vec3<f32>, // relative voxel space: center, or segment start
     radius: f32,
+    p1: vec3<f32>, // box half extents, or segment end
     half_width: f32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
     box_lo: vec3<i32>, // candidate box, relative leaf coords
-    pad3: u32,
+    shape: u32, // 0 sphere, 1 box, 2 capsule, 3 cylinder
     box_dims: vec3<i32>,
-    pad4: u32,
+    pad0: u32,
 }
 
 @group(0) @binding(0) var<uniform> params: StampParams;
 @group(0) @binding(1) var<storage, read> old_keys: array<u32>;
-@group(0) @binding(2) var<storage, read> old_values: array<u32>;
+@group(0) @binding(2) var<storage, read> old_leaves: array<u32>;
 @group(0) @binding(3) var<storage, read_write> concat_keys: array<u32>;
 @group(0) @binding(4) var<storage, read_write> flags: array<u32>;
 @group(0) @binding(5) var<storage, read_write> new_keys: array<u32>;
-@group(0) @binding(6) var<storage, read_write> out_values: array<u32>;
-@group(0) @binding(7) var<storage, read_write> out_masks: array<u32>;
-@group(0) @binding(8) var<storage, read> old_masks: array<u32>;
+@group(0) @binding(6) var<storage, read> old_data: array<u32>;
 
-const DISPATCH_STRIDE: u32 = 65535u;
-const NOT_FOUND: u32 = 0xffffffffu;
-
-fn globalIndex(wid: vec3<u32>, lid: vec3<u32>) -> u32 {
-    return (((wid.y * DISPATCH_STRIDE) + wid.x) * 256u) + lid.x;
-}
-
-// Candidate leaves are appended after the old keys in concat_keys.
+// Candidate leaves go after the old keys in concat_keys. Only leaves the
+// shell crosses can gain band voxels. A leaf fully inside or outside the
+// shape keeps its old band, and old leaves are candidates already. The
+// rest repeat the box corner key, which the dedupe drops.
 @compute @workgroup_size(256)
 fn generate_candidates(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
@@ -54,10 +45,15 @@ fn generate_candidates(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_inv
     let dy = u32(params.box_dims.y);
     let dz = u32(params.box_dims.z);
     let c = params.box_lo + vec3<i32>(i32(i / (dy * dz)), i32((i / dz) % dy), i32(i % dz));
-    concat_keys[params.old_count + i] = (u32(c.x) << 20u) | (u32(c.y) << 10u) | u32(c.z);
+    let center = vec3<f32>(c << vec3<u32>(3u)) + vec3<f32>(3.5);
+    var key = pack(params.box_lo);
+    if (abs(brushDistance(center)) < params.half_width + 6.1) { // 3.5 * sqrt(3) to any voxel of the leaf
+        key = pack(c);
+    }
+    concat_keys[params.old_count + i] = key;
 }
 
-// flags has one extra entry so the scanned total lands in the last slot.
+// flags has one extra entry for the scan total.
 @compute @workgroup_size(256)
 fn mark_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
     let i = globalIndex(wid, lid);
@@ -83,102 +79,96 @@ fn compact_unique(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocati
     }
 }
 
-fn findOld(key: u32) -> u32 {
-    var lo = 0u;
-    var hi = params.old_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (old_keys[mid] < key) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
+fn brushDistance(p: vec3<f32>) -> f32 {
+    if (params.shape == 0u) {
+        return length(p - params.p0) - params.radius;
     }
-    if (lo < params.old_count && old_keys[lo] == key) {
-        return lo;
+    if (params.shape == 1u) {
+        // Box with half extents p1, edges rounded by radius.
+        let q = abs(p - params.p0) - params.p1;
+        return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0) - params.radius;
     }
-    return NOT_FOUND;
+    let ba = params.p1 - params.p0;
+    let pa = p - params.p0;
+    let baba = dot(ba, ba);
+    let paba = dot(pa, ba);
+    if (params.shape == 2u) {
+        let h = clamp(paba / baba, 0.0, 1.0);
+        return length(pa - (ba * h)) - params.radius;
+    }
+    // Capped cylinder between p0 and p1.
+    let x = length((pa * baba) - (ba * paba)) - (params.radius * baba);
+    let y = abs(paba - (baba * 0.5)) - (baba * 0.5);
+    let x2 = x * x;
+    let y2 = y * y * baba;
+    var d: f32;
+    if (max(x, y) < 0.0) {
+        d = -min(x2, y2);
+    } else {
+        d = select(0.0, x2, x > 0.0) + select(0.0, y2, y > 0.0);
+    }
+    return sign(d) * sqrt(abs(d)) / baba;
 }
 
-// Implicit background of the old grid at a voxel, as in merge.wgsl.
-fn implicitOld(leaf: vec3<i32>, n: u32) -> f32 {
-    let col_base = (u32(leaf.x) << 20u) | (u32(leaf.y) << 10u);
-    var lo = 0u;
-    var hi = params.old_count;
-    while (lo < hi) {
-        let mid = (lo + hi) >> 1u;
-        if (old_keys[mid] < col_base) {
-            lo = mid + 1u;
-        } else {
-            hi = mid;
-        }
+// New value of voxel n of leaf `leaf`. old is the leaf's index in the old
+// grid, or NOT_FOUND.
+fn newValue(leaf: vec3<i32>, old: u32, n: u32) -> f32 {
+    let p = (leaf << vec3<u32>(3u)) + voxelLocal(n);
+    var v: f32;
+    if (old != NOT_FOUND) {
+        v = old_leafValue(old, n);
+    } else {
+        v = old_valueAt(p);
     }
-    if (lo >= params.old_count || (old_keys[lo] & 0xfffffc00u) != col_base) {
-        return params.half_width;
+    // Leaves outside the candidate box cannot change.
+    let box_hi = params.box_lo + params.box_dims - vec3<i32>(1);
+    if (any(leaf < params.box_lo) || any(leaf > box_hi)) {
+        return v;
     }
-    var best = lo;
-    var best_d = abs(i32(old_keys[lo] & 0x3ffu) - leaf.z);
-    var i = lo + 1u;
-    while (i < params.old_count && (old_keys[i] & 0xfffffc00u) == col_base) {
-        let d = abs(i32(old_keys[i] & 0x3ffu) - leaf.z);
-        if (d >= best_d) {
-            break;
-        }
-        best = i;
-        best_d = d;
-        i = i + 1u;
+    let brush = brushDistance(vec3<f32>(p));
+    if (params.mode == 0u) {
+        v = min(v, brush);
+    } else {
+        v = max(v, -brush);
     }
-    let zloc = select(0u, 7u, i32(old_keys[best] & 0x3ffu) < leaf.z);
-    let facing = (n & 0x1f8u) | zloc;
-    return select(params.half_width, -params.half_width, bitcast<f32>(old_values[(best * 512u) + facing]) < 0.0);
+    return clamp(v, -params.half_width, params.half_width);
+}
+
+@compute @workgroup_size(256)
+fn mark(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let i = globalIndex(wid, lid);
+    if (markSentinel(i, params.new_count)) {
+        return;
+    }
+    let key = new_keys[i];
+    let leaf = unpack(key);
+    let old = old_find(key);
+    var acc: LeafAcc;
+    for (var n = 0u; n < 512u; n = n + 1u) {
+        accPush(&acc, i, n, newValue(leaf, old, n));
+    }
+    accFinish(&acc, i);
 }
 
 @compute @workgroup_size(256)
 fn apply(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let i = globalIndex(wid, lid);
-    if (i >= params.new_count) {
+    let j = globalIndex(wid, lid);
+    if (j >= arrayLength(&w_keys)) {
         return;
     }
-    let key = new_keys[i];
-    let leaf = vec3<i32>(i32(key >> 20u), i32((key >> 10u) & 0x3ffu), i32(key & 0x3ffu));
-    let origin = leaf << vec3<u32>(3u);
-    let old = findOld(key);
-    // Leaves outside the candidate box cannot change. Copy them verbatim.
-    let box_hi = params.box_lo + params.box_dims - vec3<i32>(1);
-    if (any(leaf < params.box_lo) || any(leaf > box_hi)) {
-        for (var n = 0u; n < 512u; n = n + 1u) {
-            out_values[(i * 512u) + n] = old_values[(old * 512u) + n];
-        }
-        for (var w = 0u; w < 16u; w = w + 1u) {
-            out_masks[(i * 16u) + w] = old_masks[(old * 16u) + w];
-        }
-        return;
-    }
-    let hw = params.half_width;
-    var mask = 0u;
-    for (var n = 0u; n < 512u; n = n + 1u) {
-        var v: f32;
-        if (old != NOT_FOUND) {
-            v = bitcast<f32>(old_values[(old * 512u) + n]);
-        } else {
-            v = implicitOld(leaf, n);
-        }
-        let local = vec3<i32>(i32(n >> 6u), i32((n >> 3u) & 7u), i32(n & 7u));
-        let p = vec3<f32>(origin + local);
-        let brush = length(p - params.center) - params.radius;
-        if (params.mode == 0u) {
-            v = min(v, brush);
-        } else {
-            v = max(v, -brush);
-        }
-        v = clamp(v, -hw, hw);
-        out_values[(i * 512u) + n] = bitcast<u32>(v);
-        if (abs(v) < hw) {
-            mask = mask | (1u << (n & 31u));
-        }
-        if ((n & 31u) == 31u) {
-            out_masks[(i * 16u) + (n >> 5u)] = mask;
-            mask = 0u;
+    let key = w_keys[j];
+    let leaf = unpack(key);
+    let old = old_find(key);
+    let base = w_leaves[(j * LEAF_U32) + 2u];
+    var k = 0u;
+    for (var w = 0u; w < 16u; w = w + 1u) {
+        let band = bandWord(j, w);
+        for (var b = 0u; b < 32u; b = b + 1u) {
+            if (((band >> b) & 1u) == 0u) {
+                continue;
+            }
+            w_data[base + k] = bitcast<u32>(newValue(leaf, old, (w * 32u) + b));
+            k = k + 1u;
         }
     }
 }

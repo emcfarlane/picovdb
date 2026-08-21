@@ -272,16 +272,18 @@ function leafRange(pts: Float32Array, triangles: Uint32Array, t: number, halfWid
 }
 
 /**
- * Reference of merge_csg in wgsl/merge.wgsl. Unions the leaf tables and
- * takes per voxel minima, where a grid without the leaf contributes its
- * implicit background. The band holds voxels with |v| below halfWidth.
+ * Reference of the csg passes in wgsl/merge.wgsl. Unions the leaf tables
+ * and takes per voxel minima, where a grid without the leaf contributes
+ * its implicit background. The band holds voxels with |v| below
+ * halfWidth; leaves without band voxels are dropped.
  */
 export function refCsgMerge(
   aKeys: Uint32Array,
   aValues: Float32Array,
   bKeys: Uint32Array,
   bValues: Float32Array,
-  halfWidth: number
+  halfWidth: number,
+  op: 'union' | 'intersect' | 'subtract' = 'union'
 ): { keys: Uint32Array; masks: Uint32Array; values: Float32Array } {
   const implicit = (keys: Uint32Array, values: Float32Array, leaf: [number, number, number], n: number): number => {
     const colBase = ((leaf[0] << 20) | (leaf[1] << 10)) >>> 0;
@@ -306,26 +308,31 @@ export function refCsgMerge(
     return values[best * 512 + facing] < 0 ? -halfWidth : halfWidth;
   };
 
-  const keys = new Uint32Array([...new Set([...aKeys, ...bKeys])].sort((x, y) => x - y));
+  const union = new Uint32Array([...new Set([...aKeys, ...bKeys])].sort((x, y) => x - y));
   const aIdx = new Map<number, number>();
   aKeys.forEach((k, i) => aIdx.set(k, i));
   const bIdx = new Map<number, number>();
   bKeys.forEach((k, i) => bIdx.set(k, i));
-  const masks = new Uint32Array(keys.length * 16);
-  const values = new Float32Array(keys.length * 512);
-  keys.forEach((key, i) => {
+  const masks = new Uint32Array(union.length * 16);
+  const values = new Float32Array(union.length * 512);
+  union.forEach((key, i) => {
     const leaf: [number, number, number] = [(key >>> 20) & 0x3ff, (key >>> 10) & 0x3ff, key & 0x3ff];
     const ai = aIdx.get(key);
     const bi = bIdx.get(key);
     for (let n = 0; n < 512; n++) {
       const va = ai !== undefined ? aValues[ai * 512 + n] : implicit(aKeys, aValues, leaf, n);
       const vb = bi !== undefined ? bValues[bi * 512 + n] : implicit(bKeys, bValues, leaf, n);
-      const v = Math.min(va, vb);
+      const v = op === 'union' ? Math.min(va, vb) : op === 'intersect' ? Math.max(va, vb) : Math.max(va, -vb);
       values[i * 512 + n] = v;
       if (Math.abs(v) < halfWidth) masks[i * 16 + (n >> 5)] |= 1 << (n & 31);
     }
   });
-  return { keys, masks, values };
+  const kept = [...union.keys()].filter((i) => masks.subarray(i * 16, i * 16 + 16).some((m) => m !== 0));
+  return {
+    keys: Uint32Array.from(kept, (i) => union[i]),
+    masks: Uint32Array.from(kept.flatMap((i) => [...masks.subarray(i * 16, i * 16 + 16)])),
+    values: Float32Array.from(kept.flatMap((i) => [...values.subarray(i * 512, i * 512 + 512)])),
+  };
 }
 
 /** Binary STL parser producing a triangle soup for test inputs. */

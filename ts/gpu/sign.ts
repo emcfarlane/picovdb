@@ -68,7 +68,8 @@ export class Signer {
 
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     const counts = device.createBuffer({ size: (triangleCount + 1) * 4, usage: storage });
-    const placeholder = device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE });
+    // Distinct placeholders: writable bindings may not alias one buffer.
+    const placeholders = [0, 1].map(() => device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE }));
     const inside = device.createBuffer({ size: bin.leafCount * 16 * 4, usage: storage });
 
     const bindGroup = (crossCols: GPUBuffer, crossZ: GPUBuffer) =>
@@ -91,7 +92,7 @@ export class Signer {
     {
       const encoder = device.createCommandEncoder();
       const pass = encoder.beginComputePass();
-      pass.setBindGroup(0, bindGroup(placeholder, placeholder));
+      pass.setBindGroup(0, bindGroup(placeholders[0], placeholders[1]));
       pass.setPipeline(this.pipelines['count_crossings']);
       dispatch2D(pass, Math.ceil((triangleCount + 1) / WG_SIZE));
       countScan.encode(pass);

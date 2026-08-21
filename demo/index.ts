@@ -2,7 +2,9 @@ import { vec3, mat4 } from 'wgpu-matrix';
 import DisplayShader from "./blit.wgsl" with { type: "text" };
 import ComputeShader from "./compute.wgsl" with { type: "text" };
 import { picovdbWgsl as PicoVDBShader } from "picovdb/ts/shaders.ts";
-import { fetchPicoVDB } from '../ts/picovdb.ts';
+import { fetchPicoVDB, type PicoVDBFile, GRID_TYPE_SDF_FLOAT, PICOVDB_GRID_SIZE } from '../ts/picovdb.ts';
+import { gridLimits } from '../ts/gpu/device.ts';
+import { Space, Op, type Solid, type PicoVDBTree } from '../ts/model.ts';
 import { createOrbitCamera } from './lib/camera.ts';
 import { createInputHandler } from "./lib/input.ts";
 import { initGUI } from './lib/gui.ts';
@@ -92,7 +94,7 @@ const supportsTimestampQueries = adapter?.features.has(timestampQueryFeature);
 const requiredFeatures: GPUFeatureName[] = [];
 if (supportsTimestampQueries) { requiredFeatures.push(timestampQueryFeature); }
 
-const device = await adapter.requestDevice({ requiredFeatures: requiredFeatures });
+const device = await adapter.requestDevice({ requiredFeatures: requiredFeatures, requiredLimits: gridLimits(adapter) });
 device.addEventListener('uncapturederror', event => {
   console.log(event.error);
 });
@@ -156,6 +158,7 @@ let lowersBuffer: GPUBuffer;
 let leavesBuffer: GPUBuffer;
 let dataBuffer: GPUBuffer;
 let currentModelConfig: ModelConfig = models[0];
+let currentFile: PicoVDBFile | null = null;
 
 // Create size-dependent GPU resources
 function createGPUResources() {
@@ -247,6 +250,64 @@ const displayPipeline = device.createRenderPipeline({
 
 const inputHandler = createInputHandler(window, canvas);
 
+function uploadBytes(label: string, bytes: Uint8Array<ArrayBuffer>): GPUBuffer {
+  const buffer = device.createBuffer({ label, size: bytes.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(buffer, 0, bytes);
+  return buffer;
+}
+
+// Swaps in a set of picovdb node buffers and rebuilds the data bind group.
+function setGridBuffers(b: { grids: GPUBuffer; roots: GPUBuffer; uppers: GPUBuffer; lowers: GPUBuffer; leaves: GPUBuffer; data: GPUBuffer }) {
+  if (gridsBuffer) {
+    gridsBuffer.destroy();
+    rootsBuffer.destroy();
+    uppersBuffer.destroy();
+    lowersBuffer.destroy();
+    leavesBuffer.destroy();
+    dataBuffer.destroy();
+  }
+  gridsBuffer = b.grids;
+  rootsBuffer = b.roots;
+  uppersBuffer = b.uppers;
+  lowersBuffer = b.lowers;
+  leavesBuffer = b.leaves;
+  dataBuffer = b.data;
+  dataBindGroup = device.createBindGroup({
+    label: 'Data bind group',
+    layout: dataBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: gridsBuffer } },
+      { binding: 1, resource: { buffer: rootsBuffer } },
+      { binding: 2, resource: { buffer: uppersBuffer } },
+      { binding: 3, resource: { buffer: lowersBuffer } },
+      { binding: 4, resource: { buffer: leavesBuffer } },
+      { binding: 5, resource: { buffer: dataBuffer } },
+    ]
+  });
+}
+
+// Renders an emitted tree in place of the loaded model, keeping its transform.
+function showTree(tree: PicoVDBTree, name: string) {
+  const grid = new ArrayBuffer(PICOVDB_GRID_SIZE);
+  new Uint32Array(grid, 0, 8).set([0, 0, 0, 0, 0, tree.dataElemCount, GRID_TYPE_SDF_FLOAT, 0]);
+  new Int32Array(grid, 32, 3).set(tree.indexBoundsMin);
+  new Int32Array(grid, 48, 3).set(tree.indexBoundsMax);
+  setGridBuffers({
+    grids: uploadBytes('PicoVDB Grids', new Uint8Array(grid)),
+    roots: tree.roots,
+    uppers: tree.uppers,
+    lowers: tree.lowers,
+    leaves: tree.leaves,
+    data: tree.data,
+  });
+  updateObjects();
+  const size = tree.indexBoundsMax.map((v, a) => v - tree.indexBoundsMin[a]);
+  infoTextElement.textContent = `PicoVDB
+${name}
+Grid: ${size[0]} × ${size[1]} × ${size[2]} units
+Voxels: ${tree.activeVoxels}`;
+}
+
 // Load a PicoVDB model and create GPU buffers
 async function loadModel(config: ModelConfig) {
   infoTextElement.textContent = `Loading ${config.name}...`;
@@ -266,74 +327,18 @@ async function loadModel(config: ModelConfig) {
     throw new Error('PicoVDB file contains no grids');
   }
 
-  // Destroy old GPU buffers
-  if (gridsBuffer) {
-    gridsBuffer.destroy();
-    rootsBuffer.destroy();
-    uppersBuffer.destroy();
-    lowersBuffer.destroy();
-    leavesBuffer.destroy();
-    dataBuffer.destroy();
-  }
-
-  // Create new GPU buffers
-  gridsBuffer = device.createBuffer({
-    label: 'PicoVDB Grids',
-    size: picoVDBFile.gridsBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  setGridBuffers({
+    grids: uploadBytes('PicoVDB Grids', picoVDBFile.gridsBuffer),
+    roots: uploadBytes('PicoVDB Roots', picoVDBFile.rootsBuffer),
+    uppers: uploadBytes('PicoVDB Uppers', picoVDBFile.uppersBuffer),
+    lowers: uploadBytes('PicoVDB Lowers', picoVDBFile.lowersBuffer),
+    leaves: uploadBytes('PicoVDB Leaves', picoVDBFile.leavesBuffer),
+    data: uploadBytes('PicoVDB Data', picoVDBFile.dataBuffer),
   });
-  device.queue.writeBuffer(gridsBuffer, 0, picoVDBFile.gridsBuffer);
-
-  rootsBuffer = device.createBuffer({
-    label: 'PicoVDB Roots',
-    size: picoVDBFile.rootsBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(rootsBuffer, 0, picoVDBFile.rootsBuffer);
-
-  uppersBuffer = device.createBuffer({
-    label: 'PicoVDB Uppers',
-    size: picoVDBFile.uppersBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uppersBuffer, 0, picoVDBFile.uppersBuffer);
-
-  lowersBuffer = device.createBuffer({
-    label: 'PicoVDB Lowers',
-    size: picoVDBFile.lowersBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(lowersBuffer, 0, picoVDBFile.lowersBuffer);
-
-  leavesBuffer = device.createBuffer({
-    label: 'PicoVDB Leaves',
-    size: picoVDBFile.leavesBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(leavesBuffer, 0, picoVDBFile.leavesBuffer);
-
-  dataBuffer = device.createBuffer({
-    label: 'PicoVDB Data',
-    size: picoVDBFile.dataBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
-
   currentModelConfig = config;
-
-  // Recreate data bind group with new buffers
-  dataBindGroup = device.createBindGroup({
-    label: 'Data bind group',
-    layout: dataBindGroupLayout,
-    entries: [
-      { binding: 0, resource: { buffer: gridsBuffer } },
-      { binding: 1, resource: { buffer: rootsBuffer } },
-      { binding: 2, resource: { buffer: uppersBuffer } },
-      { binding: 3, resource: { buffer: lowersBuffer } },
-      { binding: 4, resource: { buffer: leavesBuffer } },
-      { binding: 5, resource: { buffer: dataBuffer } },
-    ]
-  });
+  currentFile = picoVDBFile;
+  sceneSolid?.destroy();
+  sceneSolid = null;
 
   // Update transform for new model
   updateObjects();
@@ -595,6 +600,34 @@ createGPUResources();
 
 // Load initial model (from URL param or first in list)
 await loadModel(initialModel);
+
+// Modelling console. Try in devtools:
+//   scene.solid = scene.solid.offset(2).subtract(scene.solid);
+globalThis.space = new Space(device);
+let sceneSolid: Solid | null = null;
+globalThis.scene = {
+  /** The rendered model as a solid, loaded from the current file on first read. */
+  get solid(): Solid {
+    if (!currentFile) throw new Error('no model loaded');
+    return sceneSolid ??= space.fromPvdb(currentFile);
+  },
+  /** Renders a solid, or the result of an op, in place of the loaded model. */
+  set solid(value: Solid | Op) {
+    (async () => {
+      const t0 = performance.now();
+      const solid = await value;
+      const tree = await solid.toTree();
+      showTree(tree, value instanceof Op ? 'op' : 'solid');
+      if (sceneSolid && sceneSolid !== solid) sceneSolid.destroy();
+      sceneSolid = solid;
+      console.log(`scene: ${tree.leafCount} leaves, ${tree.activeVoxels} active, ${tree.surfaceVoxels} surface in ${(performance.now() - t0).toFixed(0)} ms`);
+    })().catch(console.error);
+  },
+};
+declare global {
+  var space: Space;
+  var scene: { solid: Solid | Op };
+}
 
 // Wire up model switching — update URL and load
 modelController.onChange(async (name: string) => {

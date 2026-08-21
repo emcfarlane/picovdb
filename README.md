@@ -19,6 +19,7 @@ Compact sparse volumetric data format optimized for WebGPU real-time rendering.
 This repository includes:
 - `wgsl/picovdb.wgsl` - WGSL shader library
 - `ts/picovdb.ts` - TypeScript loader
+- `ts/model.ts` - GPU modelling API: primitives, booleans, offset, file in/out
 - `src/main.zig` - NanoVDB → PicoVDB converter
 - `src/stl.zig`, `src/mesh_to_grid.zig` - STL mesh → PicoVDB level set voxelizer
 
@@ -57,6 +58,39 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         &accessor, grid, ray_origin, t_near, ray_direction, t_far, &hit_t, &hit_value
     );
 }
+```
+
+## Modelling
+
+Grids can be edited with Constructive Solid Geometry (CSG). Modelling
+operations (`Op`) apply to a `Solid` within a `Space`. Build solids from
+primitives, then union, intersect, subtract, or offset them. See
+`ts/model.ts` for the API.
+
+```ts
+import { Space } from '@emcfarlane/picovdb/model';
+
+const space = new Space(device, { halfWidth: 3 });
+
+// A bolt: a ball and a cylinder with a slot cut out.
+using bolt = await space.sphere([0, 0, 0], 20)
+  .union(space.cylinder([0, -30, 0], [0, 30, 0], 6))
+  .subtract({ kind: 'box', center: [0, 0, 0], half: [30, 4, 4] });
+
+// A hollow bunny: grow by two voxels, subtract the original, and move it.
+using bunny = space.fromPvdb(await (await fetch('bunny.pvdb')).arrayBuffer());
+using shell = await bunny.offset(2).subtract(bunny).translate([0, 0, -10]);
+
+const bytes = await shell.toPvdb();
+```
+
+**Try it in the demo.** The [live demo](https://emcfarlane.github.io/picovdb/demo/)
+exposes `space` and `scene.solid` in the browser console. `scene.solid`
+is the loaded model. Assign a solid or an op to render it. This hollows
+the model and cuts away the half facing the camera, so the shell shows:
+
+```js
+scene.solid = scene.solid.offset(2).subtract(scene.solid).subtract({ kind: 'box', center: [4000, 0, 0], half: [4000, 4000, 4000] });
 ```
 
 ## Converting Files

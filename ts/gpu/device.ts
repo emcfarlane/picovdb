@@ -7,12 +7,31 @@ export async function hasWebGPU(): Promise<boolean> {
   return (await gpu.requestAdapter()) !== null;
 }
 
+/**
+ * Device limits the grid kernels need above the WebGPU defaults, raised to
+ * what the adapter supports: value slabs are 2 KB per leaf, workgroups are
+ * 256 wide, and kernels bind up to ten storage buffers, which the defaults
+ * of a compatibility mode adapter do not allow.
+ */
+export function gridLimits(adapter: GPUAdapter): Record<string, number> {
+  const l = adapter.limits;
+  return {
+    maxStorageBufferBindingSize: l.maxStorageBufferBindingSize,
+    maxBufferSize: l.maxBufferSize,
+    maxStorageBuffersPerShaderStage: l.maxStorageBuffersPerShaderStage,
+    maxComputeWorkgroupSizeX: l.maxComputeWorkgroupSizeX,
+    maxComputeInvocationsPerWorkgroup: l.maxComputeInvocationsPerWorkgroup,
+    maxComputeWorkgroupStorageSize: l.maxComputeWorkgroupStorageSize,
+    maxComputeWorkgroupsPerDimension: l.maxComputeWorkgroupsPerDimension,
+  };
+}
+
 export async function requestDevice(): Promise<GPUDevice> {
   const gpu = (globalThis as { navigator?: Navigator }).navigator?.gpu;
   if (!gpu) throw new Error('WebGPU unavailable');
   const adapter = await gpu.requestAdapter();
   if (!adapter) throw new Error('WebGPU adapter unavailable');
-  return adapter.requestDevice();
+  return adapter.requestDevice({ requiredLimits: gridLimits(adapter) });
 }
 
 export function createU32Buffer(device: GPUDevice, data: Uint32Array<ArrayBuffer>, extraUsage: GPUBufferUsageFlags = 0): GPUBuffer {
