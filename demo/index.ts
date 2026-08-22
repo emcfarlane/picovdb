@@ -4,7 +4,7 @@ import ComputeShader from "./compute.wgsl" with { type: "text" };
 import { picovdbWgsl as PicoVDBShader } from "picovdb/ts/shaders.ts";
 import { fetchPicoVDB, type PicoVDBFile, GRID_TYPE_SDF_FLOAT, PICOVDB_GRID_SIZE } from '../ts/picovdb.ts';
 import { gridLimits } from '../ts/gpu/device.ts';
-import { Space, Op, type Solid, type PicoVDBTree } from '../ts/model.ts';
+import { Space, Op, box, capsule, cylinder, sphere, type Solid, type PicoVDBTree } from '../ts/model.ts';
 import { createOrbitCamera } from './lib/camera.ts';
 import { createInputHandler } from "./lib/input.ts";
 import { initGUI } from './lib/gui.ts';
@@ -602,8 +602,9 @@ createGPUResources();
 await loadModel(initialModel);
 
 // Modelling console. Try in devtools:
-//   scene.solid = scene.solid.offset(2).subtract(scene.solid);
+//   scene.solid = scene.solid.offset(2).subtract(scene.solid).subtract(box([4000, 0, 0], [4000, 4000, 4000]));
 globalThis.space = new Space(device);
+Object.assign(globalThis, { sphere, box, capsule, cylinder });
 let sceneSolid: Solid | null = null;
 globalThis.scene = {
   /** The rendered model as a solid, loaded from the current file on first read. */
@@ -627,6 +628,10 @@ globalThis.scene = {
 declare global {
   var space: Space;
   var scene: { solid: Solid | Op };
+  var sphere: typeof import('../ts/model.ts').sphere;
+  var box: typeof import('../ts/model.ts').box;
+  var capsule: typeof import('../ts/model.ts').capsule;
+  var cylinder: typeof import('../ts/model.ts').cylinder;
 }
 
 // Wire up model switching — update URL and load

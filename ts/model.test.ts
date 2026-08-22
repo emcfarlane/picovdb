@@ -1,6 +1,6 @@
 import { hasWebGPU, requestDevice } from './gpu/device.ts';
 import { checkAnalytic, compareTreeToCpu } from './gpu/test_util.ts';
-import { Space } from './model.ts';
+import { Space, box as boxShape, sphere as sphereShape } from './model.ts';
 import { PicoVDBFile } from './picovdb.ts';
 
 const gpu = await hasWebGPU();
@@ -27,29 +27,29 @@ Deno.test({ name: 'booleans between distant solids rebase and match the SDFs', i
   // Two solids in unrelated key regions, far from any shared origin.
   const cs: P = [100.3, 97.2, 88.9];
   const cb: P = [3000, -2000.5, 500];
-  using a = await space.sphere(cs, 20);
-  using b = await space.box(cb, [12, 7, 9]);
+  using a = await space.solid(sphereShape(cs, 20));
+  using b = await space.solid(boxShape(cb, [12, 7, 9]));
   using u = await a.union(b);
   await checkAnalytic(device, u.grid, (p) => Math.min(sphere(cs, 20)(p), box(cb, [12, 7, 9])(p)), hw, 'union');
   if (!u.bounds || u.bounds.min[1] !== Math.floor((cb[1] - 7 - hw) / 8)) throw new Error(`union bounds ${JSON.stringify(u.bounds)}`);
 
   // Overlapping booleans, with solid, op, and shape operands.
   const cc: P = [cs[0] + 15, cs[1], cs[2]];
-  using c = await space.sphere(cc, 20);
+  using c = await space.solid(sphereShape(cc, 20));
   using sub = await a.subtract(c);
   await checkAnalytic(device, sub.grid, (p) => Math.max(sphere(cs, 20)(p), -sphere(cc, 20)(p)), hw, 'subtract');
-  using inter = await a.intersect(space.sphere(cc, 20));
+  using inter = await a.intersect(space.solid(sphereShape(cc, 20)));
   await checkAnalytic(device, inter.grid, (p) => Math.max(sphere(cs, 20)(p), sphere(cc, 20)(p)), hw, 'intersect');
-  using shell = await a.subtract({ kind: 'sphere', center: cs, radius: 12 });
+  using shell = await a.subtract(sphereShape(cs, 12));
   await checkAnalytic(device, shell.grid, (p) => Math.max(sphere(cs, 20)(p), -sphere(cs, 12)(p)), hw, 'shape subtract');
   // A carve clips to the solid, so a half space far beyond the key range works.
   const hs: P = [cs[0] + 4000, 0, 0];
-  using half = await a.subtract({ kind: 'box', center: hs, half: [4000, 4000, 4000] });
+  using half = await a.subtract(boxShape(hs, [4000, 4000, 4000]));
   await checkAnalytic(device, half.grid, (p) => Math.max(sphere(cs, 20)(p), -box(hs, [4000, 4000, 4000])(p)), hw, 'half space carve');
   if (!(half.leafCount < a.leafCount)) throw new Error(`half space carve should drop leaves: ${half.leafCount} vs ${a.leafCount}`);
 
   // A chain frees its intermediates and resolves to the same result.
-  using chained = await space.sphere(cs, 20).subtract(c).union({ kind: 'sphere', center: cs, radius: 12 }).intersect(a);
+  using chained = await space.solid(sphereShape(cs, 20)).subtract(c).union(sphereShape(cs, 12)).intersect(a);
   await checkAnalytic(device, chained.grid, (p) => Math.max(Math.min(Math.max(sphere(cs, 20)(p), -sphere(cc, 20)(p)), sphere(cs, 12)(p)), sphere(cs, 20)(p)), hw, 'chain');
 
   // Empty solids.

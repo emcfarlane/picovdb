@@ -7,16 +7,15 @@
 // intermediates, so only the solids you keep need destroying. All
 // coordinates are voxels.
 //
-//   import { Space } from '@emcfarlane/picovdb/model';
+//   import { Space, box, cylinder, sphere } from '@emcfarlane/picovdb/model';
 //
 //   const space = new Space(device, { halfWidth: 3 });
 //
-//   // Primitives and booleans. Shapes can stand in for solids as operands,
-//   // which stamps them directly and skips the intermediate solid.
-//   using ball = await space.sphere([0, 0, 0], 20);
-//   using bolt = await ball
-//     .union(space.cylinder([0, -30, 0], [0, 30, 0], 6))
-//     .subtract({ kind: 'box', center: [0, 0, 0], half: [30, 4, 4] });
+//   // Shapes are values. As operands they stamp straight into the solid.
+//   // space.solid makes a solid from one.
+//   using bolt = await space.solid(sphere([0, 0, 0], 20))
+//     .union(cylinder([0, -30, 0], [0, 30, 0], 6))
+//     .subtract(box([0, 0, 0], [30, 4, 4]));
 //
 //   // Edit a file: grow the bunny by two voxels, hollow it, and move it.
 //   using bunny = space.fromPvdb(bytes);
@@ -52,13 +51,33 @@ import {
 
 export type { Shape, Vec3, OpGrid };
 
+// Shapes are plain values. They stamp straight into a solid as operands,
+// or become a solid with space.solid(shape).
+
+export function sphere(center: Vec3, radius: number): Shape {
+  return { kind: 'sphere', center, radius };
+}
+
+/** Half extents per axis, edges rounded by radius. */
+export function box(center: Vec3, half: Vec3, radius = 0): Shape {
+  return { kind: 'box', center, half, radius };
+}
+
+export function capsule(a: Vec3, b: Vec3, radius: number): Shape {
+  return { kind: 'capsule', a, b, radius };
+}
+
+export function cylinder(a: Vec3, b: Vec3, radius: number): Shape {
+  return { kind: 'cylinder', a, b, radius };
+}
+
 /** The picovdb node buffers of a solid, GPU resident in the file layout. */
 export type PicoVDBTree = EmitResult;
 
 /** Inclusive leaf coordinate bounds, or null for an empty solid. */
 export type Bounds = { min: Vec3; max: Vec3 } | null;
 
-/** A boolean operand: a solid, a pending op, or a shape stamped directly. */
+/** A boolean operand: a solid, a pending op, or a shape, which stamps directly. */
 export type Operand = Solid | Op | Shape;
 
 export interface SpaceOptions {
@@ -134,8 +153,8 @@ export class Space {
     return new Solid(this, emptyOpGrid(this.device), null);
   }
 
-  /** An analytic primitive. */
-  shape(shape: Shape): Op {
+  /** A solid of one shape. */
+  solid(shape: Shape): Op {
     return new Op(this, async () => {
       const empty = this.empty();
       try {
@@ -144,23 +163,6 @@ export class Space {
         empty.destroy();
       }
     });
-  }
-
-  sphere(center: Vec3, radius: number): Op {
-    return this.shape({ kind: 'sphere', center, radius });
-  }
-
-  /** Half extents per axis, edges rounded by radius. */
-  box(center: Vec3, half: Vec3, radius = 0): Op {
-    return this.shape({ kind: 'box', center, half, radius });
-  }
-
-  capsule(a: Vec3, b: Vec3, radius: number): Op {
-    return this.shape({ kind: 'capsule', a, b, radius });
-  }
-
-  cylinder(a: Vec3, b: Vec3, radius: number): Op {
-    return this.shape({ kind: 'cylinder', a, b, radius });
   }
 
   /** Grid 0 of an f32 or u8 SDF picovdb file. Values rescale to this half width. */
