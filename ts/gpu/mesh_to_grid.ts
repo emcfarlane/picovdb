@@ -75,7 +75,7 @@ export class Binner {
     }
   }
 
-  async bin(points: Float32Array<ArrayBuffer>, triangles: Uint32Array<ArrayBuffer>, opts: BinOptions): Promise<BinResult> {
+  bin(points: Float32Array<ArrayBuffer>, triangles: Uint32Array<ArrayBuffer>, opts: BinOptions): Promise<BinResult> {
     const device = this.device;
     const invVoxelSize = Math.fround(1 / opts.voxelSize);
     const bounds = opts.bounds ?? leafBounds(points, invVoxelSize, opts.halfWidth);
