@@ -35,7 +35,7 @@ import { Signer } from './gpu/sign.ts';
 import { Emitter, type EmitResult, LOWER_U32, UPPER_U32 } from './gpu/emit.ts';
 import { LEAF_U32, emptyOpGrid, type OpGrid } from './gpu/opgrid.ts';
 import { Merger, type CsgOp } from './gpu/merge.ts';
-import { Stamper, shapeBounds, type Shape, type Vec3 } from './gpu/stamp.ts';
+import { Stamper, box, capsule, cylinder, sphere, type Shape, type Vec3 } from './gpu/stamp.ts';
 import { Remapper } from './gpu/remap.ts';
 import { Loader } from './gpu/load.ts';
 import { Scanner } from './gpu/scan.ts';
@@ -51,25 +51,11 @@ import {
 
 export type { Shape, Vec3, OpGrid };
 
-// Shapes are plain values. They stamp straight into a solid as operands,
-// or become a solid with space.solid(shape).
-
-export function sphere(center: Vec3, radius: number): Shape {
-  return { kind: 'sphere', center, radius };
-}
-
-/** Half extents per axis, edges rounded by radius. */
-export function box(center: Vec3, half: Vec3, radius = 0): Shape {
-  return { kind: 'box', center, half, radius };
-}
-
-export function capsule(a: Vec3, b: Vec3, radius: number): Shape {
-  return { kind: 'capsule', a, b, radius };
-}
-
-export function cylinder(a: Vec3, b: Vec3, radius: number): Shape {
-  return { kind: 'cylinder', a, b, radius };
-}
+// Shapes are plain values: a WGSL distance function by name, its
+// arguments, and its bounds. They stamp straight into a solid as
+// operands, or become a solid with space.solid(shape). These make the
+// built-in shapes; SpaceOptions.shapes adds your own functions.
+export { box, capsule, cylinder, sphere };
 
 /** The picovdb node buffers of a solid, GPU resident in the file layout. */
 export type PicoVDBTree = EmitResult;
@@ -83,6 +69,13 @@ export type Operand = Solid | Op | Shape;
 export interface SpaceOptions {
   /** Narrow band half width in voxels. */
   halfWidth?: number;
+  /**
+   * WGSL functions of the form `fn name(p: vec3f) -> f32` to use as
+   * shapes by name. p is in absolute voxels, `args` is the shape's
+   * arguments as an `array<vec4f, 8>`, and the result is the signed
+   * distance in voxels.
+   */
+  shapes?: string;
 }
 
 const KEY_RANGE = 1024;
@@ -103,7 +96,8 @@ function growBounds(b: Bounds, lo: Vec3, hi: Vec3): Bounds {
 
 /** Leaf bounds a shape's band can touch. */
 function shapeLeafBounds(shape: Shape, halfWidth: number): Bounds {
-  const { min, max } = shapeBounds(shape);
+  if (!shape.bounds) throw new Error(`shape ${shape.fn} needs bounds to add material`);
+  const { min, max } = shape.bounds;
   return {
     min: min.map((v) => Math.floor((v - halfWidth) / 8)) as Vec3,
     max: max.map((v) => Math.floor((v + halfWidth) / 8)) as Vec3,
@@ -143,7 +137,7 @@ export class Space {
     this.sorter = new Sorter(device, this.scanner);
     this.emitter = new Emitter(device, this.scanner, this.sorter);
     this.merger = new Merger(device, this.scanner, this.sorter);
-    this.stamper = new Stamper(device, this.scanner, this.sorter);
+    this.stamper = new Stamper(device, this.scanner, this.sorter, opts.shapes);
     this.remapper = new Remapper(device, this.scanner, this.sorter);
     this.loader = new Loader(device);
   }

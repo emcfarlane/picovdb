@@ -83,3 +83,41 @@ Deno.test({ name: 'bunny grows, hollows, moves, and emits', ignore: !gpu || !bun
   if (tree.indexBoundsMin[0] < base.indexBoundsMin[0] + 990) throw new Error(`translate did not move the bounds: ${tree.indexBoundsMin}`);
   console.log(`  bunny: ${base.leafCount} leaves -> shell ${tree.leafCount} leaves, ${tree.surfaceVoxels} surface, ${ms.toFixed(0)} ms for offset + subtract + translate + emit`);
 });
+
+Deno.test({ name: 'custom shape functions stamp by name and report compile errors', ignore: !gpu }, async () => {
+  const device = await requestDevice();
+  const space = new Space(device, {
+    shapes: /* wgsl */ `
+      // A torus in the xz plane: args[0].xyz center, args[1].x ring radius, args[1].y tube radius.
+      fn torus(p: vec3<f32>) -> f32 {
+        let d = p - args[0].xyz;
+        let q = vec2<f32>(length(d.xz) - args[1].x, d.y);
+        return length(q) - args[1].y;
+      }
+    `,
+  });
+  const hw = space.halfWidth;
+  const c: P = [100.3, 97.2, 88.9];
+  const torus = (p: P) => Math.hypot(Math.hypot(p[0] - c[0], p[2] - c[2]) - 18, p[1] - c[1]) - 6;
+  const shape = { fn: 'torus', args: [...c, 0, 18, 6], bounds: { min: [c[0] - 24, c[1] - 6, c[2] - 24] as P, max: [c[0] + 24, c[1] + 6, c[2] + 24] as P } };
+  using ring = await space.solid(shape);
+  await checkAnalytic(device, ring.grid, torus, hw, 'torus');
+  // As an operand the same function carves.
+  using ball = await space.solid(sphereShape(c, 20));
+  using notched = await ball.subtract(shape);
+  await checkAnalytic(device, notched.grid, (p) => Math.max(sphere(c, 20)(p), -torus(p)), hw, 'torus carve');
+  // Adding needs bounds; carving does not.
+  let message = '';
+  try { await space.solid({ fn: 'torus', args: shape.args }); } catch (e) { message = (e as Error).message; }
+  if (!message.includes('bounds')) throw new Error(`expected a bounds error, got: ${message}`);
+  using whole = await ball.subtract({ fn: 'torus', args: shape.args });
+  await checkAnalytic(device, whole.grid, (p) => Math.max(sphere(c, 20)(p), -torus(p)), hw, 'unbounded torus carve');
+  // An unknown function, and a library that does not compile, report the WGSL error.
+  message = '';
+  try { await ball.subtract({ fn: 'missing' }); } catch (e) { message = (e as Error).message; }
+  if (!message.includes('missing')) throw new Error(`expected an unknown function error, got: ${message}`);
+  const bad = new Space(device, { shapes: 'fn broken(p: vec3<f32>) -> f32 { return p; }' });
+  message = '';
+  try { await bad.empty().subtract({ fn: 'broken' }); } catch (e) { message = (e as Error).message; }
+  if (!message.includes('broken') || !message.includes('line')) throw new Error(`expected a compile error, got: ${message}`);
+});

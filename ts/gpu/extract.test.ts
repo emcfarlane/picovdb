@@ -1,6 +1,6 @@
 import { hasWebGPU, requestDevice, readBackU32 } from './device.ts';
 import { emptyGrid } from './test_util.ts';
-import { Stamper } from './stamp.ts';
+import { Stamper, sphere } from './stamp.ts';
 import { Extractor } from './extract.ts';
 
 const gpu = await hasWebGPU();
@@ -10,7 +10,7 @@ Deno.test({ name: 'extracted sphere mesh sits on the level set with the right ar
   const halfWidth = 3;
   const center = [100.3, 97.2, 88.9];
   const r = 20;
-  const grid = await new Stamper(device).stamp(emptyGrid(device), { shape: { kind: 'sphere', center: [center[0], center[1], center[2]], radius: r }, mode: 'add', halfWidth });
+  const grid = await new Stamper(device).stamp(emptyGrid(device), { shape: sphere([center[0], center[1], center[2]], r), mode: 'add', halfWidth });
   const mesh = await new Extractor(device).extract(grid, halfWidth);
   const pts = new Float32Array((await readBackU32(device, mesh.points, mesh.triangleCount * 9)).buffer);
   let maxDev = 0;

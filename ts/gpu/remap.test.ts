@@ -1,6 +1,6 @@
 import { hasWebGPU, requestDevice, readBackU32 } from './device.ts';
 import { checkAnalytic, emptyGrid, assertU32ArrayEqual } from './test_util.ts';
-import { Stamper } from './stamp.ts';
+import { Stamper, sphere as sphereShape } from './stamp.ts';
 import { Remapper } from './remap.ts';
 
 const gpu = await hasWebGPU();
@@ -12,7 +12,7 @@ Deno.test({ name: 'offset, translate, and rebase match the analytic sphere', ign
   const halfWidth = 3;
   const center: [number, number, number] = [100.3, 97.2, 88.9];
   const sphere = (c: number[], r: number) => (p: [number, number, number]) => Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2]) - r;
-  const base = await stamper.stamp(emptyGrid(device), { shape: { kind: 'sphere', center, radius: 20 }, mode: 'add', halfWidth });
+  const base = await stamper.stamp(emptyGrid(device), { shape: sphereShape(center, 20), mode: 'add', halfWidth });
 
   // Offsets redistance from the offset surface, exact to marching cubes
   // precision over the whole band: about a hundredth of a voxel per step

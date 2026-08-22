@@ -1,6 +1,6 @@
 import { hasWebGPU, requestDevice } from './device.ts';
 import { checkAnalytic, emptyGrid } from './test_util.ts';
-import { Stamper } from './stamp.ts';
+import { Stamper, box as boxShape, capsule as capsuleShape, cylinder as cylinderShape, sphere as sphereShape } from './stamp.ts';
 import { Emitter } from './emit.ts';
 
 const gpu = await hasWebGPU();
@@ -16,12 +16,12 @@ Deno.test({ name: 'brush stamps sculpt from an empty grid', ignore: !gpu }, asyn
     Math.hypot(p[0] - center[0], p[1] - center[1], p[2] - center[2]) - r;
 
   // Add a sphere to empty space.
-  const added = await stamper.stamp(emptyGrid(device), { shape: { kind: 'sphere', center, radius: 20 }, mode: 'add', halfWidth });
+  const added = await stamper.stamp(emptyGrid(device), { shape: sphereShape(center, 20), mode: 'add', halfWidth });
   const a = await checkAnalytic(device, added, sphere(20), halfWidth, 'add');
   if (a.band === 0) throw new Error('no band voxels after add');
 
   // Carve a concentric hole so a shell remains.
-  const carved = await stamper.stamp(added, { shape: { kind: 'sphere', center, radius: 12 }, mode: 'carve', halfWidth });
+  const carved = await stamper.stamp(added, { shape: sphereShape(center, 12), mode: 'carve', halfWidth });
   const shell = (p: [number, number, number]) => Math.max(sphere(20)(p), -sphere(12)(p));
   const c = await checkAnalytic(device, carved, shell, halfWidth, 'carve');
   if (c.band <= a.band) throw new Error(`carving should grow the band: ${c.band} <= ${a.band}`);
@@ -51,7 +51,7 @@ Deno.test({ name: 'box, capsule, and cylinder stamps match their SDFs', ignore: 
     const q = v(p, center).map((x, i) => Math.abs(x) - half[i]);
     return len(q.map((x) => Math.max(x, 0))) + Math.min(Math.max(q[0], q[1], q[2]), 0) - 1.5;
   };
-  const boxed = await stamper.stamp(emptyGrid(device), { shape: { kind: 'box', center, half, radius: 1.5 }, mode: 'add', halfWidth });
+  const boxed = await stamper.stamp(emptyGrid(device), { shape: boxShape(center, half, 1.5), mode: 'add', halfWidth });
   await checkAnalytic(device, boxed, box, halfWidth, 'box');
 
   const a: [number, number, number] = [40, 40, 40];
@@ -62,7 +62,7 @@ Deno.test({ name: 'box, capsule, and cylinder stamps match their SDFs', ignore: 
     const h = Math.max(0, Math.min(1, dot(pa, ba) / dot(ba, ba)));
     return len(pa.map((x, i) => x - ba[i] * h)) - 7;
   };
-  const capsuled = await stamper.stamp(emptyGrid(device), { shape: { kind: 'capsule', a, b, radius: 7 }, mode: 'add', halfWidth });
+  const capsuled = await stamper.stamp(emptyGrid(device), { shape: capsuleShape(a, b, 7), mode: 'add', halfWidth });
   await checkAnalytic(device, capsuled, capsule, halfWidth, 'capsule');
 
   const cylinder = (p: number[]) => {
@@ -77,6 +77,6 @@ Deno.test({ name: 'box, capsule, and cylinder stamps match their SDFs', ignore: 
     const d = Math.max(x, y) < 0 ? -Math.min(x2, y2) : (x > 0 ? x2 : 0) + (y > 0 ? y2 : 0);
     return Math.sign(d) * Math.sqrt(Math.abs(d)) / baba;
   };
-  const cylindered = await stamper.stamp(emptyGrid(device), { shape: { kind: 'cylinder', a, b, radius: 7 }, mode: 'add', halfWidth });
+  const cylindered = await stamper.stamp(emptyGrid(device), { shape: cylinderShape(a, b, 7), mode: 'add', halfWidth });
   await checkAnalytic(device, cylindered, cylinder, halfWidth, 'cylinder');
 });
