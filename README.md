@@ -16,17 +16,14 @@ Compact sparse volumetric data format optimized for WebGPU real-time rendering.
 - **32-bit addressing** for better GPU compatibility
 - **Fast traversal** with hierarchical raymarching (HDDA)
 
-This repository includes:
-- `wgsl/picovdb.wgsl` - WGSL shader library
-- `ts/picovdb.ts` - TypeScript loader
-- `src/main.zig` - NanoVDB → PicoVDB converter
-- `src/stl.zig`, `src/mesh_to_grid.zig` - STL mesh → PicoVDB level set voxelizer
+This repository includes, WGSL shader library, Typescript loader, GPU Modelling
+API, converter from NanoVDB and STL files.
 
 ## How It Works
 
 PicoVDB compresses NanoVDB files through:
 - **Rank query compression**: Bit masks + counts eliminate inactive voxel storage
-- **32-bit offsets**: Replace 64-bit pointers with computed indices (limits to 4 billion active voxels)
+- **32-bit offsets**: WebGPU compatible with 64-bit extensions
 - **GPU-aligned structs**: Minimize padding, maximize cache efficiency
 
 ## Usage
@@ -57,6 +54,66 @@ fn main(@builtin(global_invocation_id) global_id: vec3u) {
         &accessor, grid, ray_origin, t_near, ray_direction, t_far, &hit_t, &hit_value
     );
 }
+```
+
+## Modelling
+
+Grids can be edited with Constructive Solid Geometry (CSG). Modelling
+`Op`'s apply to a `Solid` within a `Space`. Build solids from
+primitives, then union, intersect, subtract, or offset them. See
+`ts/model.ts` for the API.
+
+```ts
+import { Space, box, cylinder, sphere } from '@emcfarlane/picovdb/model';
+
+const space = new Space(device, { halfWidth: 3 });
+
+// A bolt: a ball and a cylinder with a slot cut out.
+using bolt = await space.solid(sphere([0, 0, 0], 20))
+  .union(cylinder([0, -30, 0], [0, 30, 0], 6))
+  .subtract(box([0, 0, 0], [30, 4, 4]));
+
+// A hollow bunny: grow by two voxels, subtract the original, and move it.
+using bunny = space.fromPvdb(await (await fetch('bunny.pvdb')).arrayBuffer());
+using shell = await bunny.offset(2).subtract(bunny).translate([0, 0, -10]);
+
+const bytes = await shell.toPvdb();
+```
+
+Shapes are WGSL distance functions. `sphere`, `box`, `capsule`, and
+`cylinder` name the built-in ones. Add your own to a `Space` and use
+them by name:
+
+```ts
+const space = new Space(device, {
+  shapes: /* wgsl */ `
+    fn torus(p: vec3<f32>) -> f32 {
+      let d = p - args[0].xyz;
+      let q = vec2<f32>(length(d.xz) - args[1].x, d.y);
+      return length(q) - args[1].y;
+    }
+  `,
+});
+using ring = await space.solid({
+  fn: 'torus',
+  args: [0, 0, 0, 0, 18, 6], // args[0] = center, args[1].xy = ring and tube radius
+  bounds: { min: [-24, -6, -24], max: [24, 6, 24] },
+});
+```
+
+A function takes absolute voxel coordinates, reads its arguments from
+`args`, an `array<vec4f, 8>`, and returns the signed distance in voxels.
+Adding needs bounds. Carving does not.
+
+**Try it in the demo.** The [live demo](https://emcfarlane.github.io/picovdb/demo/)
+exposes `space`, `scene.solid`, and the shape functions in the browser
+console. `scene.solid` is the loaded model. Assign a solid or an op to render it. The following
+makes a half shell out of the model:
+
+```js
+scene.solid = scene.solid.offset(2)
+  .subtract(scene.solid)
+  .subtract(box([4000, 0, 0], [4000, 4000, 4000]));
 ```
 
 ## Converting Files

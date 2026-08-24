@@ -1,0 +1,207 @@
+// Host side of wgsl/mesh_to_grid.wgsl. Bins triangles into the leaf
+// blocks their dilated bounds touch, producing the sorted pair list and
+// the deduplicated leaf table, all kept on the GPU.
+
+import binWgsl from 'picovdb/wgsl/mesh_to_grid.wgsl' with { type: 'text' };
+import { Scanner } from './scan.ts';
+import { Sorter } from './radix_sort.ts';
+import { dispatch2D, readBackTotals } from './device.ts';
+
+const WG_SIZE = 256;
+
+export interface BinOptions {
+  /** World units per voxel. */
+  voxelSize: number;
+  /** Narrow band half width in voxels. */
+  halfWidth: number;
+  /**
+   * Leaf space bounds override so several grids share one key space, as
+   * merging requires. Compute with leafBounds over a combined mesh.
+   */
+  bounds?: { leafMin: [number, number, number]; leafMax: [number, number, number] };
+}
+
+export interface BinResult {
+  /** Index space vertex positions as xyz triples. */
+  pointsIndex: GPUBuffer;
+  /** Vertex index triples as uploaded. */
+  triangles: GPUBuffer;
+  /** (leaf key, triangle index) pairs sorted by key. */
+  pairKeys: GPUBuffer;
+  pairTris: GPUBuffer;
+  pairCount: number;
+  /** Sorted deduplicated leaf keys. */
+  leafKeys: GPUBuffer;
+  leafCount: number;
+  /** Leaf space bias. A leaf coordinate is the unpacked key plus leafMin. */
+  leafMin: [number, number, number];
+  /** Maximum leaf coordinate inclusive. */
+  leafMax: [number, number, number];
+}
+
+export class Binner {
+  readonly device: GPUDevice;
+  readonly scanner: Scanner;
+  readonly sorter: Sorter;
+  readonly layout: GPUBindGroupLayout;
+  private readonly pipelines: Record<string, GPUComputePipeline> = {};
+
+  constructor(device: GPUDevice, scanner = new Scanner(device), sorter = new Sorter(device, scanner)) {
+    this.device = device;
+    this.scanner = scanner;
+    this.sorter = sorter;
+    const storage = (binding: number, type: GPUBufferBindingType): GPUBindGroupLayoutEntry => ({
+      binding,
+      visibility: GPUShaderStage.COMPUTE,
+      buffer: { type },
+    });
+    this.layout = device.createBindGroupLayout({
+      entries: [
+        storage(0, 'uniform'),
+        storage(1, 'read-only-storage'),
+        storage(2, 'storage'),
+        storage(3, 'read-only-storage'),
+        storage(4, 'storage'),
+        storage(5, 'storage'),
+        storage(6, 'storage'),
+        storage(7, 'storage'),
+        storage(8, 'storage'),
+      ],
+    });
+    const module = device.createShaderModule({ code: binWgsl });
+    const layout = device.createPipelineLayout({ bindGroupLayouts: [this.layout] });
+    for (const entryPoint of ['transform_points', 'count_pairs', 'emit_pairs', 'mark_unique', 'compact_unique']) {
+      this.pipelines[entryPoint] = device.createComputePipeline({ layout, compute: { module, entryPoint } });
+    }
+  }
+
+  bin(points: Float32Array<ArrayBuffer>, triangles: Uint32Array<ArrayBuffer>, opts: BinOptions): Promise<BinResult> {
+    const device = this.device;
+    const invVoxelSize = Math.fround(1 / opts.voxelSize);
+    const bounds = opts.bounds ?? leafBounds(points, invVoxelSize, opts.halfWidth);
+    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const pointsWorld = device.createBuffer({ size: points.byteLength, usage: storage });
+    device.queue.writeBuffer(pointsWorld, 0, points);
+    const trianglesBuf = device.createBuffer({ size: triangles.byteLength, usage: storage });
+    device.queue.writeBuffer(trianglesBuf, 0, triangles);
+    return this.binBuffers(pointsWorld, points.length / 3, trianglesBuf, triangles.length / 3, { ...opts, bounds });
+  }
+
+  /** Bins a mesh already on the GPU. Bounds are required since the points are not readable. */
+  async binBuffers(
+    pointsWorld: GPUBuffer,
+    pointCount: number,
+    trianglesBuf: GPUBuffer,
+    triangleCount: number,
+    opts: BinOptions & { bounds: NonNullable<BinOptions['bounds']> }
+  ): Promise<BinResult> {
+    const device = this.device;
+    if (triangleCount === 0) throw new Error('empty mesh');
+    const invVoxelSize = Math.fround(1 / opts.voxelSize);
+    const { leafMin, leafMax } = opts.bounds;
+
+    const params = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(params, 0, new Uint32Array([pointCount, triangleCount]));
+    device.queue.writeBuffer(params, 8, new Float32Array([invVoxelSize, opts.halfWidth]));
+    device.queue.writeBuffer(params, 16, new Int32Array(leafMin));
+
+    const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const pointsIndex = device.createBuffer({ size: pointCount * 12, usage: GPUBufferUsage.STORAGE });
+    const counts = device.createBuffer({ size: (triangleCount + 1) * 4, usage: storage });
+    // Distinct placeholders: writable bindings may not alias one buffer.
+    const placeholders = [0, 1, 2, 3].map(() => device.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE }));
+
+    const bindGroup = (pairKeys: GPUBuffer, pairTris: GPUBuffer, flags: GPUBuffer, uniqueKeys: GPUBuffer) =>
+      device.createBindGroup({
+        layout: this.layout,
+        entries: [
+          { binding: 0, resource: { buffer: params } },
+          { binding: 1, resource: { buffer: pointsWorld } },
+          { binding: 2, resource: { buffer: pointsIndex } },
+          { binding: 3, resource: { buffer: trianglesBuf } },
+          { binding: 4, resource: { buffer: counts } },
+          { binding: 5, resource: { buffer: pairKeys } },
+          { binding: 6, resource: { buffer: pairTris } },
+          { binding: 7, resource: { buffer: flags } },
+          { binding: 8, resource: { buffer: uniqueKeys } },
+        ],
+      });
+
+    // Transform, count, and scan, then read the total pair count.
+    const countGroup = bindGroup(placeholders[0], placeholders[1], placeholders[2], placeholders[3]);
+    const countScan = this.scanner.plan(counts, triangleCount + 1);
+    {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setBindGroup(0, countGroup);
+      this.dispatch(pass, 'transform_points', pointCount * 3);
+      this.dispatch(pass, 'count_pairs', triangleCount + 1);
+      countScan.encode(pass);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+    const [pairCount] = await readBackTotals(device, [{ buffer: counts, index: triangleCount }]);
+    if (pairCount === 0) throw new Error('no leaves touched (degenerate mesh?)');
+
+    // Emit, sort by key, then mark and compact unique leaves.
+    device.queue.writeBuffer(params, 28, new Uint32Array([pairCount]));
+    const pairKeys = device.createBuffer({ size: pairCount * 4, usage: storage });
+    const pairTris = device.createBuffer({ size: pairCount * 4, usage: storage });
+    const flags = device.createBuffer({ size: (pairCount + 1) * 4, usage: storage });
+    const leafKeys = device.createBuffer({ size: pairCount * 4, usage: storage });
+    const pairGroup = bindGroup(pairKeys, pairTris, flags, leafKeys);
+    const sortPlan = this.sorter.plan(pairKeys, pairTris, pairCount);
+    const flagScan = this.scanner.plan(flags, pairCount + 1);
+    {
+      const encoder = device.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setBindGroup(0, pairGroup);
+      this.dispatch(pass, 'emit_pairs', triangleCount);
+      sortPlan.encode(pass);
+      pass.setBindGroup(0, pairGroup);
+      this.dispatch(pass, 'mark_unique', pairCount + 1);
+      flagScan.encode(pass);
+      pass.setBindGroup(0, pairGroup);
+      this.dispatch(pass, 'compact_unique', pairCount);
+      pass.end();
+      device.queue.submit([encoder.finish()]);
+    }
+    const [leafCount] = await readBackTotals(device, [{ buffer: flags, index: pairCount }]);
+
+    return { pointsIndex, triangles: trianglesBuf, pairKeys, pairTris, pairCount, leafKeys, leafCount, leafMin, leafMax };
+  }
+
+  private dispatch(pass: GPUComputePassEncoder, entryPoint: string, threads: number): void {
+    pass.setPipeline(this.pipelines[entryPoint]);
+    dispatch2D(pass, Math.ceil(threads / WG_SIZE));
+  }
+}
+
+/** Leaf coordinate bounds over all dilated vertices, f32 exact to the GPU math. */
+export function leafBounds(
+  points: Float32Array,
+  invVoxelSize: number,
+  halfWidth: number
+): { leafMin: [number, number, number]; leafMax: [number, number, number] } {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < points.length; i += 3) {
+    for (let axis = 0; axis < 3; axis++) {
+      const p = Math.fround(points[i + axis] * invVoxelSize);
+      if (p < min[axis]) min[axis] = p;
+      if (p > max[axis]) max[axis] = p;
+    }
+  }
+  const lo: number[] = [];
+  const hi: number[] = [];
+  for (let axis = 0; axis < 3; axis++) {
+    const loLeaf = Math.ceil(Math.fround(min[axis] - halfWidth)) >> 3;
+    const hiLeaf = Math.floor(Math.fround(max[axis] + halfWidth)) >> 3;
+    if (hiLeaf - loLeaf >= 1024) {
+      throw new Error(`grid exceeds 1024 leaves on axis ${axis}: ${loLeaf}..${hiLeaf}`);
+    }
+    lo.push(loLeaf);
+    hi.push(hiLeaf);
+  }
+  return { leafMin: lo as [number, number, number], leafMax: hi as [number, number, number] };
+}

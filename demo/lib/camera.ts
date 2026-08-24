@@ -1,6 +1,6 @@
 import type { Mat4, Vec3 } from 'wgpu-matrix';
 import { mat4, vec3 } from 'wgpu-matrix';
-import type Input from './input.js';
+import type Input from './input.ts';
 
 export interface OrbitCamera {
 	update(dt: number, input: Input): Mat4;

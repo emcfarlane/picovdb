@@ -1,0 +1,23 @@
+name: Test
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: deno lint
+      - run: deno task check
+      # GPU tests skip when no WebGPU adapter is available.
+      - run: deno task test:gpu

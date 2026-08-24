@@ -143,7 +143,7 @@ export class PicoVDBFile {
     }
 
     const baseOffset = PICOVDB_FILE_HEADER_SIZE + index * PICOVDB_GRID_SIZE;
-    let offset = baseOffset;
+    const offset = baseOffset;
 
     return {
       gridIndex: this.view.getUint32(offset + 0, true),
@@ -155,6 +155,22 @@ export class PicoVDBFile {
       gridType: this.view.getUint32(offset + 24, true),
       indexBoundsMin: new Int32Array(this.buffer, offset + 32, 3),
       indexBoundsMax: new Int32Array(this.buffer, offset + 48, 3),
+    };
+  }
+
+  /** Node and value ranges of one grid. Node indices inside a grid's nodes are relative to these starts. */
+  getGridRange(index: number): { upperStart: number; upperCount: number; lowerStart: number; lowerCount: number; leafStart: number; leafCount: number; dataStart: number; dataElemCount: number } {
+    const grid = this.getGrid(index);
+    const next = index + 1 < this.header.gridCount ? this.getGrid(index + 1) : null;
+    return {
+      upperStart: grid.upperStart,
+      upperCount: (next ? next.upperStart : this.header.upperCount) - grid.upperStart,
+      lowerStart: grid.lowerStart,
+      lowerCount: (next ? next.lowerStart : this.header.lowerCount) - grid.lowerStart,
+      leafStart: grid.leafStart,
+      leafCount: (next ? next.leafStart : this.header.leafCount) - grid.leafStart,
+      dataStart: grid.dataStart,
+      dataElemCount: grid.dataElemCount,
     };
   }
 
@@ -268,7 +284,7 @@ export class PicoVDBFile {
   }
 
   getVoxelCount(): number {
-    var count = 0
+    let count = 0
     for (let i = 0; i < this.header.gridCount; i++) {
       count += this.getGrid(i).dataElemCount - 2 // Minus background values
     }

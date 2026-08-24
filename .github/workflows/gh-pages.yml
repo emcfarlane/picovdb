@@ -19,12 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: denoland/setup-deno@v2
         with:
-          node-version: '20'
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run build:demo
+          deno-version: v2.x
+      - run: deno task build:demo
       - name: Stage site
         run: |
           mkdir -p _stage/demo

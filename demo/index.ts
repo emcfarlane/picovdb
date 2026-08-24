@@ -1,12 +1,14 @@
 import { vec3, mat4 } from 'wgpu-matrix';
-import DisplayShader from "./blit.wgsl";
-import ComputeShader from "./compute.wgsl";
-import PicoVDBShader from "../wgsl/picovdb.wgsl";
-import { fetchPicoVDB } from '../ts/picovdb.ts';
-import { createOrbitCamera } from './lib/camera';
-import { createInputHandler } from "./lib/input";
-import { initGUI } from './lib/gui';
-import type { ModelConfig } from './lib/gui';
+import DisplayShader from "./blit.wgsl" with { type: "text" };
+import ComputeShader from "./compute.wgsl" with { type: "text" };
+import { picovdbWgsl as PicoVDBShader } from "picovdb/ts/shaders.ts";
+import { fetchPicoVDB, type PicoVDBFile, GRID_TYPE_SDF_FLOAT, PICOVDB_GRID_SIZE } from '../ts/picovdb.ts';
+import { gridLimits } from '../ts/gpu/device.ts';
+import { Space, Op, box, capsule, cylinder, sphere, type Solid, type PicoVDBTree } from '../ts/model.ts';
+import { createOrbitCamera } from './lib/camera.ts';
+import { createInputHandler } from "./lib/input.ts";
+import { initGUI } from './lib/gui.ts';
+import type { ModelConfig } from './lib/gui.ts';
 
 const MODEL_BASE = './models/';
 const models: ModelConfig[] = [
@@ -18,14 +20,14 @@ const models: ModelConfig[] = [
   //{ name: 'Skeleton', url: `${MODEL_BASE}skeleton.pvdb.gz`, translation: [0, 240, 0], scale: 120 },
 ];
 
-const modelParam = new URLSearchParams(window.location.search).get('model');
+const modelParam = new URLSearchParams(globalThis.location.search).get('model');
 const initialModel = models.find(m => m.url.endsWith('/' + modelParam)) ?? models[0];
 
 const { controls, modelController, pauseController, highDPIController, rotationController } = initGUI(models, initialModel.name);
-import { createSkyState } from "./lib/hw_skymodel";
-import { computeSkyIrradianceSH } from "./lib/sky_irradiance";
-import { TimestampQueryManager } from './lib/TimestampQueryManager';
-import { Stats } from './lib/Stats';
+import { createSkyState } from "./lib/hw_skymodel.ts";
+import { computeSkyIrradianceSH } from "./lib/sky_irradiance.ts";
+import { TimestampQueryManager } from './lib/TimestampQueryManager.ts';
+import { Stats } from './lib/Stats.ts';
 
 const canvas = document.getElementById("canvas") as HTMLCanvasElement;
 const infoTextElement = document.getElementById("info-text")!;
@@ -34,7 +36,7 @@ if (!canvas) {
   throw new Error("No canvas found.");
 }
 if (!navigator.gpu) {
-  const isInsecure = window.isSecureContext === false;
+  const isInsecure = globalThis.isSecureContext === false;
   throw new Error(
     isInsecure
       ? "WebGPU requires a secure context (HTTPS or localhost). Current origin is not secure."
@@ -43,9 +45,10 @@ if (!navigator.gpu) {
 }
 console.log("WebGPU is supported!");
 
+// featureLevel is newer than Deno's bundled WebGPU types.
 const adapter = await navigator.gpu.requestAdapter({
   featureLevel: 'compatibility',
-});
+} as unknown as GPURequestAdapterOptions);
 if (!adapter) {
   throw new Error("No appropriate GPUAdapter found.");
 }
@@ -60,9 +63,9 @@ let passBindGroup: GPUBindGroup;
 
 // Set canvas to fullscreen size and recreate GPU resources
 function resizeCanvas() {
-  const pixelRatio = controls.highDPI ? window.devicePixelRatio : 1.0;
-  canvas.width = window.innerWidth * pixelRatio;
-  canvas.height = window.innerHeight * pixelRatio;
+  const pixelRatio = controls.highDPI ? globalThis.devicePixelRatio : 1.0;
+  canvas.width = globalThis.innerWidth * pixelRatio;
+  canvas.height = globalThis.innerHeight * pixelRatio;
   width = canvas.width;
   height = canvas.height;
 
@@ -74,7 +77,7 @@ function resizeCanvas() {
 }
 
 resizeCanvas();
-window.addEventListener('resize', resizeCanvas);
+globalThis.addEventListener('resize', resizeCanvas);
 
 // Update canvas size when High DPI setting changes
 highDPIController.onChange(() => {
@@ -91,18 +94,19 @@ const supportsTimestampQueries = adapter?.features.has(timestampQueryFeature);
 const requiredFeatures: GPUFeatureName[] = [];
 if (supportsTimestampQueries) { requiredFeatures.push(timestampQueryFeature); }
 
-const device = await adapter.requestDevice({ requiredFeatures: requiredFeatures });
+const device = await adapter.requestDevice({ requiredFeatures: requiredFeatures, requiredLimits: gridLimits(adapter) });
 device.addEventListener('uncapturederror', event => {
   console.log(event.error);
 });
 
-const context = canvas.getContext("webgpu");
+// The DOM lib doesn't know the "webgpu" context id.
+const context = canvas.getContext("webgpu") as unknown as GPUCanvasContext | null;
 if (!context) {
   throw new Error("No context found.");
 }
 
-var stats = new Stats();
-var gpuPanel = stats.addPanel(new Stats.Panel('GPU', '#ff8', '#221'));
+const stats = new Stats();
+const gpuPanel = stats.addPanel(new Stats.Panel('GPU', '#ff8', '#221'));
 document.body.appendChild(stats.dom);
 
 // GPU-side timer and the CPU-side counter where we accumulate statistics:
@@ -154,6 +158,7 @@ let lowersBuffer: GPUBuffer;
 let leavesBuffer: GPUBuffer;
 let dataBuffer: GPUBuffer;
 let currentModelConfig: ModelConfig = models[0];
+let currentFile: PicoVDBFile | null = null;
 
 // Create size-dependent GPU resources
 function createGPUResources() {
@@ -245,6 +250,64 @@ const displayPipeline = device.createRenderPipeline({
 
 const inputHandler = createInputHandler(window, canvas);
 
+function uploadBytes(label: string, bytes: Uint8Array<ArrayBuffer>): GPUBuffer {
+  const buffer = device.createBuffer({ label, size: bytes.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(buffer, 0, bytes);
+  return buffer;
+}
+
+// Swaps in a set of picovdb node buffers and rebuilds the data bind group.
+function setGridBuffers(b: { grids: GPUBuffer; roots: GPUBuffer; uppers: GPUBuffer; lowers: GPUBuffer; leaves: GPUBuffer; data: GPUBuffer }) {
+  if (gridsBuffer) {
+    gridsBuffer.destroy();
+    rootsBuffer.destroy();
+    uppersBuffer.destroy();
+    lowersBuffer.destroy();
+    leavesBuffer.destroy();
+    dataBuffer.destroy();
+  }
+  gridsBuffer = b.grids;
+  rootsBuffer = b.roots;
+  uppersBuffer = b.uppers;
+  lowersBuffer = b.lowers;
+  leavesBuffer = b.leaves;
+  dataBuffer = b.data;
+  dataBindGroup = device.createBindGroup({
+    label: 'Data bind group',
+    layout: dataBindGroupLayout,
+    entries: [
+      { binding: 0, resource: { buffer: gridsBuffer } },
+      { binding: 1, resource: { buffer: rootsBuffer } },
+      { binding: 2, resource: { buffer: uppersBuffer } },
+      { binding: 3, resource: { buffer: lowersBuffer } },
+      { binding: 4, resource: { buffer: leavesBuffer } },
+      { binding: 5, resource: { buffer: dataBuffer } },
+    ]
+  });
+}
+
+// Renders an emitted tree in place of the loaded model, keeping its transform.
+function showTree(tree: PicoVDBTree, name: string) {
+  const grid = new ArrayBuffer(PICOVDB_GRID_SIZE);
+  new Uint32Array(grid, 0, 8).set([0, 0, 0, 0, 0, tree.dataElemCount, GRID_TYPE_SDF_FLOAT, 0]);
+  new Int32Array(grid, 32, 3).set(tree.indexBoundsMin);
+  new Int32Array(grid, 48, 3).set(tree.indexBoundsMax);
+  setGridBuffers({
+    grids: uploadBytes('PicoVDB Grids', new Uint8Array(grid)),
+    roots: tree.roots,
+    uppers: tree.uppers,
+    lowers: tree.lowers,
+    leaves: tree.leaves,
+    data: tree.data,
+  });
+  updateObjects();
+  const size = tree.indexBoundsMax.map((v, a) => v - tree.indexBoundsMin[a]);
+  infoTextElement.textContent = `PicoVDB
+${name}
+Grid: ${size[0]} × ${size[1]} × ${size[2]} units
+Voxels: ${tree.activeVoxels}`;
+}
+
 // Load a PicoVDB model and create GPU buffers
 async function loadModel(config: ModelConfig) {
   infoTextElement.textContent = `Loading ${config.name}...`;
@@ -264,74 +327,18 @@ async function loadModel(config: ModelConfig) {
     throw new Error('PicoVDB file contains no grids');
   }
 
-  // Destroy old GPU buffers
-  if (gridsBuffer) {
-    gridsBuffer.destroy();
-    rootsBuffer.destroy();
-    uppersBuffer.destroy();
-    lowersBuffer.destroy();
-    leavesBuffer.destroy();
-    dataBuffer.destroy();
-  }
-
-  // Create new GPU buffers
-  gridsBuffer = device.createBuffer({
-    label: 'PicoVDB Grids',
-    size: picoVDBFile.gridsBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  setGridBuffers({
+    grids: uploadBytes('PicoVDB Grids', picoVDBFile.gridsBuffer),
+    roots: uploadBytes('PicoVDB Roots', picoVDBFile.rootsBuffer),
+    uppers: uploadBytes('PicoVDB Uppers', picoVDBFile.uppersBuffer),
+    lowers: uploadBytes('PicoVDB Lowers', picoVDBFile.lowersBuffer),
+    leaves: uploadBytes('PicoVDB Leaves', picoVDBFile.leavesBuffer),
+    data: uploadBytes('PicoVDB Data', picoVDBFile.dataBuffer),
   });
-  device.queue.writeBuffer(gridsBuffer, 0, picoVDBFile.gridsBuffer);
-
-  rootsBuffer = device.createBuffer({
-    label: 'PicoVDB Roots',
-    size: picoVDBFile.rootsBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(rootsBuffer, 0, picoVDBFile.rootsBuffer);
-
-  uppersBuffer = device.createBuffer({
-    label: 'PicoVDB Uppers',
-    size: picoVDBFile.uppersBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(uppersBuffer, 0, picoVDBFile.uppersBuffer);
-
-  lowersBuffer = device.createBuffer({
-    label: 'PicoVDB Lowers',
-    size: picoVDBFile.lowersBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(lowersBuffer, 0, picoVDBFile.lowersBuffer);
-
-  leavesBuffer = device.createBuffer({
-    label: 'PicoVDB Leaves',
-    size: picoVDBFile.leavesBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(leavesBuffer, 0, picoVDBFile.leavesBuffer);
-
-  dataBuffer = device.createBuffer({
-    label: 'PicoVDB Data',
-    size: picoVDBFile.dataBuffer.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-  device.queue.writeBuffer(dataBuffer, 0, picoVDBFile.dataBuffer);
-
   currentModelConfig = config;
-
-  // Recreate data bind group with new buffers
-  dataBindGroup = device.createBindGroup({
-    label: 'Data bind group',
-    layout: dataBindGroupLayout,
-    entries: [
-      { binding: 0, resource: { buffer: gridsBuffer } },
-      { binding: 1, resource: { buffer: rootsBuffer } },
-      { binding: 2, resource: { buffer: uppersBuffer } },
-      { binding: 3, resource: { buffer: lowersBuffer } },
-      { binding: 4, resource: { buffer: leavesBuffer } },
-      { binding: 5, resource: { buffer: dataBuffer } },
-    ]
-  });
+  currentFile = picoVDBFile;
+  sceneSolid?.destroy();
+  sceneSolid = null;
 
   // Update transform for new model
   updateObjects();
@@ -594,11 +601,44 @@ createGPUResources();
 // Load initial model (from URL param or first in list)
 await loadModel(initialModel);
 
+// Modelling console. Try in devtools:
+//   scene.solid = scene.solid.offset(2).subtract(scene.solid).subtract(box([4000, 0, 0], [4000, 4000, 4000]));
+globalThis.space = new Space(device);
+Object.assign(globalThis, { sphere, box, capsule, cylinder });
+let sceneSolid: Solid | null = null;
+globalThis.scene = {
+  /** The rendered model as a solid, loaded from the current file on first read. */
+  get solid(): Solid {
+    if (!currentFile) throw new Error('no model loaded');
+    return sceneSolid ??= space.fromPvdb(currentFile);
+  },
+  /** Renders a solid, or the result of an op, in place of the loaded model. */
+  set solid(value: Solid | Op) {
+    (async () => {
+      const t0 = performance.now();
+      const solid = await value;
+      const tree = await solid.toTree();
+      showTree(tree, value instanceof Op ? 'op' : 'solid');
+      if (sceneSolid && sceneSolid !== solid) sceneSolid.destroy();
+      sceneSolid = solid;
+      console.log(`scene: ${tree.leafCount} leaves, ${tree.activeVoxels} active, ${tree.surfaceVoxels} surface in ${(performance.now() - t0).toFixed(0)} ms`);
+    })().catch(console.error);
+  },
+};
+declare global {
+  var space: Space;
+  var scene: { solid: Solid | Op };
+  var sphere: typeof import('../ts/model.ts').sphere;
+  var box: typeof import('../ts/model.ts').box;
+  var capsule: typeof import('../ts/model.ts').capsule;
+  var cylinder: typeof import('../ts/model.ts').cylinder;
+}
+
 // Wire up model switching — update URL and load
 modelController.onChange(async (name: string) => {
   const config = models.find(m => m.name === name)!;
   const filename = config.url.split('/').pop()!;
-  const url = new URL(window.location.href);
+  const url = new URL(globalThis.location.href);
   url.searchParams.set('model', filename);
   history.replaceState(null, '', url);
   await loadModel(config);

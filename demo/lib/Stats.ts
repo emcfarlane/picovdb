@@ -1,3 +1,4 @@
+// deno-lint-ignore-file no-explicit-any
 // stats based on stats.js
 
 export class Panel {
@@ -9,7 +10,7 @@ export class Panel {
 	private min = Infinity;
 	private max = 0;
 	private round = Math.round;
-	private PR = Math.round(window.devicePixelRatio || 1);
+	private PR = Math.round(globalThis.devicePixelRatio || 1);
 
 	private WIDTH = 80 * this.PR;
 	private HEIGHT = 48 * this.PR;
@@ -128,10 +129,7 @@ export class Stats {
 		this.frames++;
 
 		const time = (performance || Date).now();
-		const frameTime = time - this.beginTime;
-
 		if (time >= this.prevTime + 1000) {
-			console.log(frameTime);
 			this.fpsPanel.update((this.frames * 1000) / (time - this.prevTime), 100);
 
 			this.prevTime = time;
