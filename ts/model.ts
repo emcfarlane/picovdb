@@ -159,10 +159,10 @@ export class Space {
     });
   }
 
-  /** Grid 0 of an f32 or u8 SDF picovdb file. Values rescale to this half width. */
-  fromPvdb(file: PicoVDBFile | ArrayBuffer): Solid {
-    const grid = this.loader.load(file instanceof PicoVDBFile ? file : new PicoVDBFile(file), { halfWidth: this.halfWidth });
-    return new Solid(this, grid, { min: grid.leafMin, max: grid.leafMax });
+  /** One grid of an f32 or u8 SDF picovdb file. Values rescale to this half width. */
+  fromPvdb(file: PicoVDBFile | ArrayBuffer, grid = 0): Solid {
+    const loaded = this.loader.load(file instanceof PicoVDBFile ? file : new PicoVDBFile(file), { halfWidth: this.halfWidth, grid });
+    return new Solid(this, loaded, { min: loaded.leafMin, max: loaded.leafMax });
   }
 
   /** A closed triangle mesh in world units, voxelized at voxelSize world units per voxel. */

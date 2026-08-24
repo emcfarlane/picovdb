@@ -1,7 +1,7 @@
 import { hasWebGPU, requestDevice } from './gpu/device.ts';
 import { checkAnalytic, compareTreeToCpu } from './gpu/test_util.ts';
 import { Space, box as boxShape, sphere as sphereShape } from './model.ts';
-import { PicoVDBFile } from './picovdb.ts';
+import { PICOVDB_LEAF_SIZE, PICOVDB_LOWER_SIZE, PICOVDB_MAGIC, PICOVDB_UPPER_SIZE, PicoVDBFile } from './picovdb.ts';
 
 const gpu = await hasWebGPU();
 
@@ -120,4 +120,49 @@ Deno.test({ name: 'custom shape functions stamp by name and report compile error
   message = '';
   try { await bad.empty().subtract({ fn: 'broken' }); } catch (e) { message = (e as Error).message; }
   if (!message.includes('broken') || !message.includes('line')) throw new Error(`expected a compile error, got: ${message}`);
+});
+
+/** A two grid file from two single grid files, as a multi-grid writer would lay it out. */
+function stitch(a: PicoVDBFile, b: PicoVDBFile): ArrayBuffer {
+  const ha = a.header;
+  const hb = b.header;
+  const upperCount = ha.upperCount + hb.upperCount;
+  const rootsPadded = Math.ceil(upperCount / 2) * 2;
+  const sections = [
+    [a.rootsBuffer.subarray(0, ha.upperCount * 8), b.rootsBuffer.subarray(0, hb.upperCount * 8), new Uint8Array((rootsPadded - upperCount) * 8)],
+    [a.uppersBuffer, b.uppersBuffer],
+    [a.lowersBuffer, b.lowersBuffer],
+    [a.leavesBuffer, b.leavesBuffer],
+    [a.dataBuffer, b.dataBuffer],
+  ];
+  const bodyBytes = sections.flat().reduce((n, s) => n + s.byteLength, 0);
+  const out = new Uint8Array(32 + 2 * 64 + bodyBytes);
+  new Uint32Array(out.buffer, 0, 8).set([PICOVDB_MAGIC[0], PICOVDB_MAGIC[1], 0, 2, upperCount, ha.lowerCount + hb.lowerCount, ha.leafCount + hb.leafCount, ha.dataCount + hb.dataCount]);
+  out.set(a.gridsBuffer, 32);
+  out.set(b.gridsBuffer, 96);
+  new Uint32Array(out.buffer, 96 + 4, 4).set([ha.upperCount, ha.lowerCount, ha.leafCount, ha.dataCount]);
+  let offset = 160;
+  for (const part of sections.flat()) {
+    out.set(part, offset);
+    offset += part.byteLength;
+  }
+  if (a.uppersBuffer.byteLength !== ha.upperCount * PICOVDB_UPPER_SIZE || a.lowersBuffer.byteLength !== ha.lowerCount * PICOVDB_LOWER_SIZE || a.leavesBuffer.byteLength !== ha.leafCount * PICOVDB_LEAF_SIZE) throw new Error('unexpected node buffer sizes');
+  return out.buffer;
+}
+
+Deno.test({ name: 'fromPvdb loads a chosen grid of a multi-grid file', ignore: !gpu }, async () => {
+  const device = await requestDevice();
+  const space = new Space(device);
+  const hw = space.halfWidth;
+  const cs: P = [100.3, 97.2, 88.9];
+  const cb: P = [-200, 50, 30];
+  using a = await space.solid(sphereShape(cs, 20));
+  using b = await space.solid(boxShape(cb, [12, 7, 9]));
+  const file = new PicoVDBFile(stitch(new PicoVDBFile(await a.toPvdb()), new PicoVDBFile(await b.toPvdb())));
+  if (file.header.gridCount !== 2) throw new Error(`stitched file has ${file.header.gridCount} grids`);
+  using g0 = space.fromPvdb(file, 0);
+  await checkAnalytic(device, g0.grid, sphere(cs, 20), hw, 'grid 0');
+  using g1 = space.fromPvdb(file, 1);
+  await checkAnalytic(device, g1.grid, box(cb, [12, 7, 9]), hw, 'grid 1');
+  if (g0.leafCount !== a.leafCount || g1.leafCount !== b.leafCount) throw new Error(`leaf counts ${g0.leafCount}/${g1.leafCount} vs ${a.leafCount}/${b.leafCount}`);
 });

@@ -12,21 +12,24 @@ const WG_SIZE = 256;
 export interface LoadOptions {
   /** Narrow band half width in voxels of the op layer. */
   halfWidth: number;
+  /** Grid index in the file. */
+  grid?: number;
 }
 
 /**
- * Leaf origins in voxels for every leaf of grid 0, in leaf index order.
+ * Leaf origins in voxels for every leaf of one grid, in leaf index order.
  * Walks roots, uppers, and lowers using the child counts packed per mask
  * word.
  */
-export function leafOrigins(file: PicoVDBFile): Int32Array {
+export function leafOrigins(file: PicoVDBFile, gridIndex = 0): Int32Array {
   const u32 = (bytes: Uint8Array) => new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
   const roots = u32(file.rootsBuffer);
   const uppers = u32(file.uppersBuffer);
   const lowers = u32(file.lowersBuffer);
-  const { upperCount, lowerCount, leafCount } = file.header;
-  const lowerOrigins = new Int32Array(lowerCount * 3);
-  const origins = new Int32Array(leafCount * 3);
+  const range = file.getGridRange(gridIndex);
+  const lowerOrigins = new Int32Array(range.lowerCount * 3);
+  const origins = new Int32Array(range.leafCount * 3);
+  // Child indices in a node are relative to the grid's first child node.
   const walk = (
     node: Uint32Array,
     base: number,
@@ -52,19 +55,19 @@ export function leafOrigins(file: PicoVDBFile): Int32Array {
       }
     }
   };
-  for (let u = 0; u < upperCount; u++) {
+  for (let u = 0; u < range.upperCount; u++) {
     // Mirrors picovdb coordToKey.
-    const w0 = roots[u * 2];
-    const w1 = roots[u * 2 + 1];
+    const w0 = roots[(range.upperStart + u) * 2];
+    const w1 = roots[(range.upperStart + u) * 2 + 1];
     const iu = w1 >>> 10;
     const ju = (w0 >>> 21) | ((w1 & 0x3ff) << 11);
     const ku = w0 & 0x1fffff;
     const origin: [number, number, number] = [(iu << 12) | 0, (ju << 12) | 0, (ku << 12) | 0];
-    walk(uppers, u * (PICOVDB_UPPER_SIZE / 4), 1024, 5, origin, 128, lowerOrigins);
+    walk(uppers, (range.upperStart + u) * (PICOVDB_UPPER_SIZE / 4), 1024, 5, origin, 128, lowerOrigins);
   }
-  for (let l = 0; l < lowerCount; l++) {
+  for (let l = 0; l < range.lowerCount; l++) {
     const origin: [number, number, number] = [lowerOrigins[l * 3], lowerOrigins[l * 3 + 1], lowerOrigins[l * 3 + 2]];
-    walk(lowers, l * (PICOVDB_LOWER_SIZE / 4), 128, 4, origin, 8, origins);
+    walk(lowers, (range.lowerStart + l) * (PICOVDB_LOWER_SIZE / 4), 128, 4, origin, 8, origins);
   }
   return origins;
 }
@@ -82,27 +85,29 @@ export class Loader {
   }
 
   /**
-   * Loads grid 0 of an f32 or u8 SDF file. Values scale so the file's
+   * Loads one grid of an f32 or u8 SDF file. Values scale so the file's
    * background equals the half width. That also brings world unit files
    * into voxel units. u8 values map to [-3, 3], as the renderer reads
    * them.
    */
   load(file: PicoVDBFile, opts: LoadOptions): OpGrid {
     const device = this.device;
-    const grid = file.getGrid(0);
+    const gridIndex = opts.grid ?? 0;
+    const grid = file.getGrid(gridIndex);
     if (grid.gridType !== GRID_TYPE_SDF_FLOAT && grid.gridType !== GRID_TYPE_SDF_UINT8) {
       throw new Error(`grid type ${grid.gridType} is not an SDF`);
     }
-    if (grid.dataStart !== 0) throw new Error('only grid 0 at data start 0 is supported');
-    const leafCount = file.header.leafCount;
+    const range = file.getGridRange(gridIndex);
+    const leafCount = range.leafCount;
     if (leafCount === 0) throw new Error('empty tree');
-    const background =
-      grid.gridType === GRID_TYPE_SDF_UINT8
-        ? (file.dataBuffer[0] / 127.5 - 1) * 3
-        : new Float32Array(file.dataBuffer.buffer, file.dataBuffer.byteOffset, 1)[0];
+    const u8 = grid.gridType === GRID_TYPE_SDF_UINT8;
+    // The grid's records and values. dataStart counts 16 byte units.
+    const leafBytes = file.leavesBuffer.subarray(range.leafStart * LEAF_U32 * 4, (range.leafStart + leafCount) * LEAF_U32 * 4);
+    const dataBytes = file.dataBuffer.subarray(range.dataStart * 16, range.dataStart * 16 + Math.ceil((grid.dataElemCount * (u8 ? 1 : 4)) / 4) * 4);
+    const background = u8 ? (dataBytes[0] / 127.5 - 1) * 3 : new Float32Array(dataBytes.buffer, dataBytes.byteOffset, 1)[0];
     if (!(background > 0)) throw new Error(`background ${background} is not positive`);
 
-    const origins = leafOrigins(file);
+    const origins = leafOrigins(file, gridIndex);
     const leafMin: [number, number, number] = [Infinity, Infinity, Infinity];
     const leafMax: [number, number, number] = [-Infinity, -Infinity, -Infinity];
     for (let i = 0; i < leafCount; i++) {
@@ -135,8 +140,8 @@ export class Loader {
     const storage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     const leafKeys = createU32Buffer(device, sortedKeys);
     const orderBuffer = createU32Buffer(device, Uint32Array.from(order));
-    const fileLeaves = createU32Buffer(device, new Uint32Array(file.leavesBuffer.buffer, file.leavesBuffer.byteOffset, leafCount * LEAF_U32));
-    const fileData = createU32Buffer(device, new Uint32Array(file.dataBuffer.buffer, file.dataBuffer.byteOffset, file.dataBuffer.byteLength / 4));
+    const fileLeaves = createU32Buffer(device, new Uint32Array(leafBytes.buffer, leafBytes.byteOffset, leafCount * LEAF_U32));
+    const fileData = createU32Buffer(device, new Uint32Array(dataBytes.buffer, dataBytes.byteOffset, dataBytes.byteLength / 4));
     const leaves = device.createBuffer({ size: leafCount * LEAF_U32 * 4, usage: storage });
     const data = device.createBuffer({ size: dataCount * 4, usage: storage });
 

@@ -158,6 +158,22 @@ export class PicoVDBFile {
     };
   }
 
+  /** Node and value ranges of one grid. Node indices inside a grid's nodes are relative to these starts. */
+  getGridRange(index: number): { upperStart: number; upperCount: number; lowerStart: number; lowerCount: number; leafStart: number; leafCount: number; dataStart: number; dataElemCount: number } {
+    const grid = this.getGrid(index);
+    const next = index + 1 < this.header.gridCount ? this.getGrid(index + 1) : null;
+    return {
+      upperStart: grid.upperStart,
+      upperCount: (next ? next.upperStart : this.header.upperCount) - grid.upperStart,
+      lowerStart: grid.lowerStart,
+      lowerCount: (next ? next.lowerStart : this.header.lowerCount) - grid.lowerStart,
+      leafStart: grid.leafStart,
+      leafCount: (next ? next.leafStart : this.header.leafCount) - grid.leafStart,
+      dataStart: grid.dataStart,
+      dataElemCount: grid.dataElemCount,
+    };
+  }
+
   getRootCountPadded(): number {
     return ((this.header.upperCount + 1) / 2 | 0) * 2 // Padding to even number
   }
